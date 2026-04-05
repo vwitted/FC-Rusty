@@ -1,0 +1,10 @@
+# rust-toolchain.toml
+#
+# Pins the Rust toolchain for this project.
+# Embassy works on stable Rust 1.75+.
+# We also need the thumbv7em target installed.
+
+[toolchain]
+channel = "stable"
+components = ["rust-src", "rustfmt", "llvm-tools"]
+targets = ["thumbv7em-none-eabihf"]

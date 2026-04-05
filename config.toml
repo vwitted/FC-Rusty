@@ -1,0 +1,25 @@
+# .cargo/config.toml
+#
+# This tells cargo:
+#   1. What CPU architecture to compile for (thumbv7em-none-eabihf)
+#   2. How to flash and run the firmware (probe-rs via ST-Link)
+#
+# thumbv7em-none-eabihf breakdown:
+#   thumbv7em = ARMv7E-M (Cortex-M4/M7)
+#   none      = no OS (bare metal)
+#   eabihf    = hardware floating point (the F405 has an FPU)
+
+[target.'cfg(all(target_arch = "arm", target_os = "none"))']
+# probe-rs flashes the binary and opens an RTT console for defmt logs.
+# Change the chip name if you're using a different F4 variant.
+# Run `probe-rs chip list | grep -i stm32f40` to see options.
+runner = "probe-rs run --chip STM32F407VETx"
+
+[build]
+target = "thumbv7em-none-eabihf"
+
+[env]
+# Controls which log levels defmt actually emits.
+# "trace" = everything, "info" = normal, "warn" = quiet
+# Set to "info" once things are working to reduce RTT traffic.
+DEFMT_LOG = "info"
