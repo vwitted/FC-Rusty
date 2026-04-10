@@ -14,13 +14,15 @@ name = "fc-firmware"
 path = "src/main.rs"
 required-features = ["firmware"]
 
-#[[example]]
-#name = "sim_hover"
-#path = "examples/sim_hover.rs"
+[[example]]
+name = "sim_hover"
+path = "examples/sim_hover.rs"
+required-features = []
 
-#[[example]]
-#name = "sim_mpc_hover"
-#path = "examples/sim_mpc_hover.rs"
+[[example]]
+name = "sim_mpc_hover"
+path = "examples/sim_mpc_hover.rs"
+required-features = []
 
 # ---- Features ----
 # "firmware" pulls in all Embassy/Cortex-M/defmt deps for the embedded binary.
@@ -101,9 +103,10 @@ static_cell = { version = "2", optional = true }
 # ---- Build profiles ----
 
 [profile.dev]
-opt-level = "z"
+opt-level = "s"
 debug = 2
-lto = "fat"
+strip="debuginfo"
+lto="fat"
 
 [profile.release]
 opt-level = "z"

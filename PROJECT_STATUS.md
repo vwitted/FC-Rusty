@@ -1,14 +1,50 @@
 # Rust Flight Controller — Project Status & Roadmap
 
+## Hardware Bring-Up: DONE (2025-09-03)
+
+Firmware boots on a bare STM32F407VET6 dev board via probe-rs / ST-Link,
+streams defmt logs over RTT, and runs the full 200 Hz control loop without
+peripherals attached. Measured numbers from the first successful flash:
+
+| Metric                       | Value          | Notes                          |
+|------------------------------|----------------|--------------------------------|
+| Flash footprint (text+ro+data) | ~58 KB       | 11.2% of 512 KB                |
+| RAM (bss+uninit)             | ~6.6 KB        | 5% of 128 KB                   |
+| Control loop avg             | 61 µs          | 1.2% of 5 ms budget            |
+| Control loop max             | 61 µs          | Zero overruns over 28s         |
+| Tasks spawned                | RC, IMU, GPS, control | all within 100 µs of boot |
+
+**Required file layout** (all three were wrong initially and needed fixing):
+- `build.rs` must be at repo root, NOT `src/build.rs` — otherwise `-Tdefmt.x`
+  is never passed to the linker and probe-rs errors about defmt symbols.
+- `.cargo/config.toml` (hidden dir), NOT `config.toml` at repo root — cargo
+  only reads the hidden-dir variant.
+- `~/.cargo/config.toml` must NOT contain `[build] target = ...` — that
+  poisons every cargo build on the machine, including host/sim builds.
+
+**Telemetry label gotcha:** the 2 Hz log line reports `thrust_cmd=` (the
+altitude controller's internal thrust command), NOT raw RC stick throttle.
+While disarmed, `thrust_cmd` is held at `hover_throttle` (currently 0.294),
+so seeing `thrust_cmd=29%` with `armed=false` and no RC receiver attached
+is **expected behavior**, not a bug. A separate `stick_thr=` field shows
+the raw RC input for clarity.
+
+**Failsafe path verified (in code, not yet on hardware):** `arming.rs`
+disarms within 500 ms of RC loss or 50 ms of IMU loss, and re-arming
+requires an OFF→ON switch edge (see `test_no_rearm_after_failsafe`).
+When disarmed, all four motors get `DshotFrame::disarmed()` regardless
+of internal controller state.
+
 ## What We Have
 
 ### Architecture
 - **Target platform:** STM32F407(VET6) (Cortex-M4F, 168 MHz, 192 kB SRAM, 512 Kb flash)
 - **Framework:** Embassy async executor
 - **Control strategy:** TinyMPC outer loop (50 Hz) + PID inner loop (200 Hz)
-- **IMU:** WitMotion WT901B (onboard Kalman filter, accel/gyro/mag/baro/quaternion)
-- **RC protocol:** CRSF (ExpressLRS / TBS Crossfire)
-- **ESC protocol:** DShot600
+- **IMU:** WitMotion WT901B (onboard Kalman filter, accel/gyro/mag/baro/quaternion) — *not yet physically connected*
+- **RC protocol:** CRSF (ExpressLRS / TBS Crossfire) — *not yet physically connected*
+- **ESC protocol:** DShot600 — *not yet physically connected*
+- **GPS:** NMEA over UART6 — *not yet physically connected*
 - **Task model:** async tasks communicating via lock-free Signals
 
 ### Implemented Modules (all tested, no_std compatible)
@@ -23,7 +59,7 @@
 | Main loop sketch | `main.rs` | — | Task spawning, control loop structure, arming logic, placeholder P-controller |
 | TinyMPC skeleton | `tinympc-rs/` | — | Separate crate, compiles for thumbv7em-none-eabihf, demonstrates algorithm structure |
 
-**Total: 22 passing tests, 0 dependencies beyond nalgebra (for tinympc-rs)**
+**Total: 52 passing tests on host** (`cargo test --no-default-features --target x86_64-unknown-linux-gnu`)
 
 ### Key Design Documents
 - `ARCHITECTURE.md` — module structure, task model, data flow diagrams, data types
@@ -62,10 +98,12 @@ tolerance, RC link active, optionally GPS lock. Arm/disarm via
 switch or stick gesture. Must be robust — accidental arming is
 the most dangerous failure mode.
 
-### 6. Embassy Project Setup
-Cargo.toml with embassy-stm32, embassy-executor, embassy-time,
-embassy-sync, defmt, probe-rs. Memory.x linker script for the
-F405. .cargo/config.toml for the target and runner.
+### 6. Embassy Project Setup — DONE
+Cargo.toml wires embassy-stm32/executor/time/sync, defmt-rtt, and
+panic-probe. `memory.x` at repo root defines F407VET6's 512K/128K.
+`.cargo/config.toml` sets the thumbv7em target and a `probe-rs run`
+runner. `build.rs` at repo root emits `-Tlink.x` and `-Tdefmt.x`.
+Verified: `cargo run --release --bin fc-firmware` flashes and runs.
 
 ---
 
