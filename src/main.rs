@@ -77,10 +77,10 @@ mod control {
 }
 mod rc_task;
 
-use drivers::crsf::{CrsfParser, CrsfEvent, RcChannels};
+use drivers::crsf::RcChannels;
 use drivers::dshot::{DshotFrame, DshotSpeed};
 use drivers::nmea::{NmeaParser, GpsData};
-use drivers::wt901b::{Wt901bParser, ImuData, UPDATED_GYRO, UPDATED_QUAT};
+use drivers::wt901b::{Wt901bParser, ImuData};
 use control::arming::{ArmingStateMachine, ArmState};
 use control::mixer::{ControlDemand, QUAD_X};
 use control::pid::{PidGains, PidLimits, RatePidController};
@@ -362,6 +362,21 @@ async fn control_loop() -> ! {
     let mut cycle_count: u32 = 0;
     let dt: f32 = 0.005; // 200 Hz
 
+    // ---- MPC warm-up ----
+    // Run one throwaway solve so the first in-flight solve (on arm)
+    // isn't a cold-start. This surfaces any init-time crashes here
+    // on the bench instead of at the worst possible moment, and lets
+    // `mpc_max` start counting from a representative value instead of
+    // a pathological first-call spike.
+    {
+        let warmup_start = Instant::now();
+        mpc.set_reference([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
+        let _ = mpc.solve([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
+        mpc.reset();
+        let warmup_us = warmup_start.elapsed().as_micros() as u32;
+        defmt::info!("MPC warm-up solve completed in {}us", warmup_us);
+    }
+
     defmt::info!("Control loop starting at 200 Hz (5ms budget)");
 
     loop {
@@ -509,13 +524,20 @@ async fn control_loop() -> ! {
                 0
             };
 
+            // stick_thr    = raw RC stick throttle input (0-100%)
+            // thrust_cmd   = altitude controller's current thrust command (0-100%);
+            //                while disarmed this is held at `hover_throttle`, so
+            //                seeing a non-zero value with armed=false is expected.
+            let stick_thr_pct = (throttle_raw * 100.0) as u8;
+            let thrust_cmd_pct = (current_thrust * 100.0) as u8;
             defmt::info!(
-                "armed={} roll={:?}° pitch={:?}° yaw={:?}° thr={}% sats={}",
+                "armed={} roll={:?}° pitch={:?}° yaw={:?}° stick_thr={}% thrust_cmd={}% sats={}",
                 armed,
                 last_imu.angle[0],
                 last_imu.angle[1],
                 last_imu.angle[2],
-                (current_thrust * 100.0) as u8,
+                stick_thr_pct,
+                thrust_cmd_pct,
                 last_gps.satellites,
             );
             defmt::info!(
