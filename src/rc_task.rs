@@ -23,7 +23,6 @@
 // alongside main.rs.
 
 use embassy_stm32::usart::{Config as UartConfig, UartRx};
-use embassy_stm32::peripherals;
 use embassy_sync::signal::Signal;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_time::{Duration, Instant};

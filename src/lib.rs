@@ -6,7 +6,9 @@
 // The firmware binary (main.rs) has its own module declarations
 // for drivers and embassy-specific code.
 
-#![no_std]
+// no_std for embedded builds; fall back to std during `cargo test`
+// so the test harness and panic handler are available on host.
+#![cfg_attr(not(test), no_std)]
 
 pub mod control {
     pub mod altitude;
