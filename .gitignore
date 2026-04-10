@@ -1,0 +1,13 @@
+# Rust build output
+/target
+
+# QEMU / gdb core dumps
+*.core
+
+# IDE / editor local state
+.idea/
+.vscode/
+
+# OS metadata
+.DS_Store
+Thumbs.db
