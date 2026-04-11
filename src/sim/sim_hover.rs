@@ -36,6 +36,7 @@ fn main() {
     let limits = PidLimits {
         integral_max: 0.2,
         output_max: 0.4,
+        d_lpf_tau_s: 0.008,
     };
 
     let mut rate_pid = RatePidController::new(rate_gains, rate_gains, yaw_gains, limits);

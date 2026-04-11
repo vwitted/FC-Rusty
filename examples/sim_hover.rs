@@ -48,6 +48,7 @@ fn main() {
     let limits = PidLimits {
         integral_max: 0.3,
         output_max: 0.5,
+        d_lpf_tau_s: 0.008, // ~20 Hz cutoff — smooths D term against motor-lag bang-bang
     };
     let mut rate_pid = RatePidController::new(rate_gains, rate_gains, yaw_gains, limits);
 
@@ -122,8 +123,10 @@ fn main() {
         // ---- Print state every 50ms ----
         if step % 10 == 0 {
             let alt = -sim.state.z;
+            let mean_motor = (motor_out.motors[0] + motor_out.motors[1]
+                + motor_out.motors[2] + motor_out.motors[3]) / 4.0;
             println!(
-                "{:6.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.1}% {:>10}",
+                "{:6.2} r={:>6.2} p={:>6.2} y={:>6.2} a={:>6.2} vz={:>6.2} thr={:>5.1}% rsp={:>6.1} gyro={:>6.1} pid={:>6.3} mean={:.2} {}",
                 t,
                 sim.state.roll,
                 sim.state.pitch,
@@ -131,6 +134,10 @@ fn main() {
                 alt,
                 sim.state.vz,
                 current_thrust * 100.0,
+                rate_setpoint[0],
+                imu.gyro[0],
+                pid_output[0],
+                mean_motor,
                 event,
             );
         }

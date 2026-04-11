@@ -49,6 +49,19 @@ pub struct PidLimits {
     /// Prevents the PID from demanding more than the mixer
     /// can deliver. Typically 1.0 or less.
     pub output_max: f32,
+
+    /// First-order low-pass filter time constant (seconds) for the
+    /// D term. Essential when the measurement (gyro) can change
+    /// rapidly between samples — without this filter, any large
+    /// rate-of-change in the measurement produces huge D-term spikes
+    /// that flip the PID output sign each loop tick, driving the
+    /// actuators into bang-bang oscillation. Betaflight-style flight
+    /// controllers always filter the D term for exactly this reason.
+    ///
+    /// Typical values: 0.005–0.010 s (32–16 Hz cutoff). Set to 0.0
+    /// to disable filtering (only safe when kd is very small or the
+    /// measurement is already low-noise).
+    pub d_lpf_tau_s: f32,
 }
 
 impl Default for PidLimits {
@@ -56,6 +69,7 @@ impl Default for PidLimits {
         Self {
             integral_max: 0.3,
             output_max: 1.0,
+            d_lpf_tau_s: 0.008, // ~20 Hz cutoff
         }
     }
 }
@@ -71,6 +85,10 @@ pub struct Pid {
     /// Previous measurement (for derivative-on-measurement)
     prev_measurement: f32,
 
+    /// Low-pass filtered derivative of measurement (state for the
+    /// first-order IIR filter on the D term). See `PidLimits::d_lpf_tau_s`.
+    d_filtered: f32,
+
     /// Whether we've had at least one update (to avoid a
     /// derivative spike on the very first call)
     initialised: bool,
@@ -84,6 +102,7 @@ impl Pid {
             limits,
             integral: 0.0,
             prev_measurement: 0.0,
+            d_filtered: 0.0,
             initialised: false,
         }
     }
@@ -116,13 +135,26 @@ impl Pid {
         );
         let i_term = self.gains.ki * self.integral;
 
-        // ---- Derivative term (on measurement) ----
+        // ---- Derivative term (on measurement, low-pass filtered) ----
         // Rate of change of the measurement, not the error.
         // Negative sign because if measurement is increasing,
         // we want to slow down (counteract), not speed up.
+        //
+        // The first-order IIR filter is critical: motor dynamics and
+        // discrete-time rate changes can make the raw d_measurement
+        // flip sign every loop tick, producing bang-bang output that
+        // the actuators average to an unwanted bias. Filtering it
+        // smooths the derivative estimate so kd contributes damping
+        // rather than oscillation.
         let d_term = if self.initialised {
             let d_measurement = (measurement - self.prev_measurement) / dt;
-            -self.gains.kd * d_measurement
+            if self.limits.d_lpf_tau_s > 0.0 {
+                let alpha = dt / (self.limits.d_lpf_tau_s + dt);
+                self.d_filtered += alpha * (d_measurement - self.d_filtered);
+            } else {
+                self.d_filtered = d_measurement;
+            }
+            -self.gains.kd * self.d_filtered
         } else {
             self.initialised = true;
             0.0
@@ -144,6 +176,7 @@ impl Pid {
     pub fn reset(&mut self) {
         self.integral = 0.0;
         self.prev_measurement = 0.0;
+        self.d_filtered = 0.0;
         self.initialised = false;
     }
 
@@ -226,6 +259,7 @@ mod tests {
         PidLimits {
             integral_max: 0.5,
             output_max: 1.0,
+            d_lpf_tau_s: 0.0, // disable D-LPF so unit tests see raw D-term math
         }
     }
 
@@ -287,6 +321,7 @@ mod tests {
         let limits = PidLimits {
             integral_max: 0.3,
             output_max: 1.0,
+            d_lpf_tau_s: 0.0,
         };
         let mut pid = Pid::new(gains, limits);
 
@@ -376,6 +411,7 @@ mod tests {
         let limits = PidLimits {
             integral_max: 0.3,
             output_max: 1.0,
+            d_lpf_tau_s: 0.0,
         };
         let mut ctrl = RatePidController::new(gains, gains, gains, limits);
 

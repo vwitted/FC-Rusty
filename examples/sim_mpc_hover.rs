@@ -54,7 +54,7 @@ fn main() {
     let rate_gains = PidGains {
         kp: 0.02,
         ki: 0.005,
-        kd: 0.001,
+        kd: 0.0,
     };
     let yaw_gains = PidGains {
         kp: 0.03,
@@ -64,6 +64,7 @@ fn main() {
     let limits = PidLimits {
         integral_max: 0.3,
         output_max: 0.5,
+        d_lpf_tau_s: 0.008, // ~20 Hz cutoff — smooths D term against motor-lag bang-bang
     };
     let mut rate_pid = RatePidController::new(rate_gains, rate_gains, yaw_gains, limits);
 
@@ -152,8 +153,13 @@ fn main() {
         if step % 10 == 0 {
             let alt = -sim.state.z;
             let conv_marker = if last_mpc_converged { " " } else { "!" };
+            // Mean of clamped motor outputs — this is what the airframe
+            // actually feels. If it diverges from `current_thrust`, it's
+            // evidence of asymmetric mixer clipping adding phantom thrust.
+            let mean_motor =
+                (motor_out.motors[0] + motor_out.motors[1] + motor_out.motors[2] + motor_out.motors[3]) / 4.0;
             println!(
-                "{:6.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>7.1}% {:>7.1}°  {:>3}{} {:>10}",
+                "{:6.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>7.1}% {:>7.1}°  {:>3}{} m=[{:.2} {:.2} {:.2} {:.2}] mean={:.2} {:>10}",
                 t,
                 sim.state.roll,
                 sim.state.pitch,
@@ -164,6 +170,11 @@ fn main() {
                 rate_sp_degs[0],
                 last_mpc_iters,
                 conv_marker,
+                motor_out.motors[0],
+                motor_out.motors[1],
+                motor_out.motors[2],
+                motor_out.motors[3],
+                mean_motor,
                 event,
             );
         }

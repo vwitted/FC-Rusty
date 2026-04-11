@@ -337,7 +337,7 @@ async fn control_loop() -> ! {
     // Adjust Kp/Ki/Kd during bench testing with props off first.
     let rate_gains = PidGains { kp: 0.02, ki: 0.005, kd: 0.001 };
     let yaw_gains = PidGains { kp: 0.03, ki: 0.005, kd: 0.0 };
-    let limits = PidLimits { integral_max: 0.3, output_max: 0.5 };
+    let limits = PidLimits { integral_max: 0.3, output_max: 0.5, d_lpf_tau_s: 0.008 };
     let mut rate_pid = RatePidController::new(rate_gains, rate_gains, yaw_gains, limits);
 
     // ---- Sensor state ----
