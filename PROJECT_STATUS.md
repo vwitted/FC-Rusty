@@ -38,9 +38,10 @@ of internal controller state.
 ## What We Have
 
 ### Architecture
-- **Target platform:** STM32F407(VET6) (Cortex-M4F, 168 MHz, 192 kB SRAM, 512 Kb flash)
+- **Target platform:** STM32F407(VET6) (Cortex-M4F, 168 MHz, 192 kB SRAM, 512 KB flash)
 - **Framework:** Embassy async executor
-- **Control strategy:** TinyMPC outer loop (50 Hz) + PID inner loop (200 Hz)
+- **Control strategy:** Cascaded MPC (50 Hz) + PID (200 Hz), with position PD (5 Hz) outer loop
+- **State estimation:** 6-state linear Kalman filter (position + velocity, NED)
 - **IMU:** WitMotion WT901B (onboard Kalman filter, accel/gyro/mag/baro/quaternion) — *not yet physically connected*
 - **RC protocol:** CRSF (ExpressLRS / TBS Crossfire) — *not yet physically connected*
 - **ESC protocol:** DShot600 — *not yet physically connected*
@@ -51,59 +52,100 @@ of internal controller state.
 
 | Module | File | Tests | Description |
 |--------|------|-------|-------------|
-| CRSF parser | `drivers/crsf.rs` | 5 | Streaming byte parser, 11-bit channel unpacking, link statistics, CRC8 validation |
-| CRSF UART task | `rc_task.rs` | — | Embassy async task, DMA reads, Signal publishing, failsafe timer |
-| WT901B parser | `drivers/wt901b.rs` | 8 | All packet types (accel, gyro, angle, mag, baro, quaternion), configuration commands |
+| **Control** | | | |
+| Rate PID | `control/pid.rs` | 9 | 3-axis rate controller, derivative-on-measurement, D-term LPF, integral anti-windup |
+| Attitude MPC | `control/mpc.rs` | — | 6-state [roll,pitch,yaw,p,q,r] MPC via tinympc-rs, 50 Hz, first-order rate lag model |
+| Altitude hold | `control/altitude.rs` | 4 | PID altitude controller, hover-throttle feedforward, integral anti-windup |
+| Position PD | `control/position.rs` | 7 | Horizontal position controller, world→body frame rotation, tilt-limited output |
+| Mixer | `control/mixer.rs` | 7 | Quad-X mixer with airmode and no-airmode paths, phantom-thrust prevention |
+| Arming FSM | `control/arming.rs` | 12 | Pre-arm checks, failsafe (RC/IMU loss), re-arm lockout after failsafe |
+| **Estimation** | | | |
+| Position KF | `estimation.rs` | 4 | 6-state linear KF [px,py,pz,vx,vy,vz], CWNA process noise, GPS+baro updates |
+| **Drivers** | | | |
+| CRSF parser | `drivers/crsf.rs` | 5 | Streaming byte parser, 11-bit channel unpacking, link statistics, CRC8 |
+| WT901B parser | `drivers/wt901b.rs` | 8 | All packet types (accel, gyro, angle, mag, baro, quaternion), config commands |
+| NMEA parser | `drivers/nmea.rs` | 17 | GGA/RMC/GSA/VTG sentence parsing, 3D fix detection, checksum validation |
 | DShot encoder | `drivers/dshot.rs` | 6 | Frame encoding, CRC, DMA buffer generation, speed/timing calculations |
-| Mixer | `control/mixer.rs` | 3 | Generic N-motor mixer with const mix matrices, quad-X preset |
-| Main loop sketch | `main.rs` | — | Task spawning, control loop structure, arming logic, placeholder P-controller |
-| TinyMPC skeleton | `tinympc-rs/` | — | Separate crate, compiles for thumbv7em-none-eabihf, demonstrates algorithm structure |
+| **Simulation** | | | |
+| Physics sim | `sim/sim.rs` | 5 | 6DOF rigid body, first-order motor lag (τ=30ms), NED frame, ground collision |
+| Sensor sim | `sim/sensors.rs` | 4 | GPS (10 Hz, configurable noise), baro (50 Hz, noise + OU drift), xorshift64 PRNG |
+| **Firmware** | | | |
+| Main loop | `main.rs` | — | Embassy task spawning, control loop, arming logic |
+| CRSF UART task | `rc_task.rs` | — | Embassy async task, DMA reads, Signal publishing, failsafe timer |
+| TinyMPC solver | `tinympc-rs/` | — | ADMM-based MPC solver, no_std, const-generic dimensions |
 
-**Total: 52 passing tests on host** (`cargo test --no-default-features --target x86_64-unknown-linux-gnu`)
+**Total: 70 passing tests on host** (`cargo test --no-default-features --target x86_64-unknown-linux-gnu`)
+
+### Simulation Examples
+
+All run on host with `cargo run --example <name> --no-default-features`:
+
+| Example | Description | Status |
+|---------|-------------|--------|
+| `sim_hover` | PID-only hover at 5m | Stable, ±0.02m altitude |
+| `sim_mpc_hover` | MPC+PID hover at 5m | Stable, MPC converges in 3-5 iterations |
+| `sim_kf_hover` | Full stack with noisy GPS+baro feeding KF, altitude loop on estimate | KF altitude within ~30mm of truth |
+| `sim_gps_rescue` | GPS rescue: fly from (20,10) to home (0,0) at 5m altitude | **SUCCESS** — arrives within 0.23m of home |
+
+### Control Cascade (proven in sim)
+
+```
+PosKf (6-state) ← GPS (10 Hz, noisy) + baro (50 Hz, noisy+drift)
+      │
+      ▼
+Position PD (5 Hz) → desired roll/pitch
+      │
+      ▼
+Attitude MPC (50 Hz) → rate setpoints
+      │
+      ▼
+Rate PID (200 Hz) → torque demands → mixer → motors
+```
 
 ### Key Design Documents
 - `ARCHITECTURE.md` — module structure, task model, data flow diagrams, data types
 
 ---
 
-## What's Next (Core — Required to Fly)
+## What's Done (Software)
 
-### 1. PID Controller (`control/pid.rs`)
-A proper PID with derivative-on-measurement, integral windup limits,
-and configurable gains. Runs at IMU rate (200 Hz) as the inner loop.
-Straightforward to implement — well-trodden ground.
-//Initial work done 
+| # | Item | Status | Notes |
+|---|------|--------|-------|
+| 1 | PID controller | **DONE** | 3-axis, derivative-on-measurement, D-term LPF (τ=8ms), integral anti-windup |
+| 2 | MPC integration | **DONE** | 6-state attitude model, tinympc-rs ADMM solver, warm-started, 50 Hz |
+| 3 | Altitude controller | **DONE** | PID with hover feedforward, integral anti-windup |
+| 4 | Position controller | **DONE** | PD with yaw-aware body-frame rotation, tilt limiting |
+| 5 | State estimator (KF) | **DONE** | 6-state linear KF, GPS+baro fusion, CWNA process noise |
+| 6 | GPS rescue (sim) | **DONE** | Full cascade proven: 22m → 0.23m in 30s with noisy sensors |
+| 7 | Arming FSM | **DONE** | Pre-arm checks, RC/IMU failsafe, re-arm lockout |
+| 8 | Embassy project setup | **DONE** | Flashes and runs on STM32F407VET6 via probe-rs |
+| 9 | NMEA GPS parser | **DONE** | GGA/RMC/GSA/VTG, 3D fix detection, checksum validation |
+| 10 | Sensor sim | **DONE** | GPS noise, baro noise+drift, xorshift64 PRNG (no_std) |
 
-### 2. DShot Hardware Driver
+## What's Next (Hardware Integration — Required to Fly)
+
+### 1. DShot Hardware Driver
 Wire the DShot encoder to actual STM32 timer + DMA peripherals.
 Configure TIM1 (or similar) in PWM mode, set ARR for bit period,
 DMA feeds CCR values from the buffers we already generate. This is
 the most hardware-specific piece remaining.
 
-### 3. Pin Assignment & Board Definition
+### 2. Pin Assignment & Board Definition
 Resolve the actual USART/timer/pin mapping for the target board.
-Spend time with the STM32F405 alternate function table. Key
-constraints: 4 timer channels for DShot that don't conflict with
+Key constraints: 4 timer channels for DShot that don't conflict with
 3-4 USARTs for CRSF, IMU, GPS, and telemetry.
 
-### 4. MPC Integration (`control/mpc.rs`)
-Wrap `tinympc-rs` (peterkrull's crate) as a cargo dependency.
-Define the linearised quadrotor model (A, B matrices) and cost
-weights (Q, R) in `config/vehicle.rs`. Run at 50 Hz, feeding
-rate setpoints to the PID inner loop.
+### 3. Peripheral Bring-Up
+Connect and verify each peripheral individually:
+- IMU (WT901B) — UART, verify packet rates and data quality
+- RC receiver (CRSF) — UART, verify channel data and link quality
+- GPS (NMEA) — UART, verify fix quality and update rate
+- ESCs (DShot) — timer+DMA, verify motor response
 
-### 5. Arming State Machine
-Proper pre-arm checks: throttle low, attitude level within
-tolerance, RC link active, optionally GPS lock. Arm/disarm via
-switch or stick gesture. Must be robust — accidental arming is
-the most dangerous failure mode.
-
-### 6. Embassy Project Setup — DONE
-Cargo.toml wires embassy-stm32/executor/time/sync, defmt-rtt, and
-panic-probe. `memory.x` at repo root defines F407VET6's 512K/128K.
-`.cargo/config.toml` sets the thumbv7em target and a `probe-rs run`
-runner. `build.rs` at repo root emits `-Tlink.x` and `-Tdefmt.x`.
-Verified: `cargo run --release --bin fc-firmware` flashes and runs.
+### 4. Closed-Loop on Hardware
+Wire the full control loop with real sensors and actuators.
+Start with rate-PID-only hover (no MPC) to validate gains
+transfer from sim to hardware. Then enable MPC outer loop.
 
 ---
 
@@ -196,74 +238,22 @@ With eRPM telemetry, we can close a tighter loop:
 - Phase 3: RPM → thrust estimation for model correction
 - Phase 4: Feed disturbance estimate into MPC state
 
-### 9. GPS Rescue / Return to Home
+### 9. GPS Rescue / Return to Home — DONE (sim-proven)
 
-This is where the MPC approach really shines compared to
-traditional cascaded PID. GPS rescue with PID requires multiple
-layered controllers (position → velocity → attitude → rate) each
-with separate tuning. MPC handles the entire trajectory as one
-optimisation problem.
+The full GPS rescue cascade is implemented and proven in simulation:
+Position PD (5 Hz) → Attitude MPC (50 Hz) → Rate PID (200 Hz) → Mixer.
+State estimation uses a 6-state linear Kalman filter fusing GPS (10 Hz,
+σ_h=2m) and baro (50 Hz, σ=0.3m with OU drift).
 
-**The challenge:** GPS updates at 5-10 Hz with ~2m accuracy.
-The controller needs to handle the slow, noisy position updates
-alongside the fast, accurate IMU data. This is fundamentally a
-state estimation problem as much as a control problem.
+**Sim result:** quad flies from (20, 10) m to home (0, 0) in 30s,
+arriving within 0.23m. Altitude holds at 5±0.3m throughout. Yaw stable.
 
-**Implementation outline:**
-
-```
-Phase 1 — GPS Driver & State Estimator
-├── drivers/ublox.rs        # UBX binary protocol parser
-├── state/gps_ekf.rs        # Extended Kalman Filter fusing:
-│                            #   IMU (200 Hz) + GPS (10 Hz) + Baro
-│                            #   Outputs: position, velocity, attitude
-│                            #   (replaces WT901B's onboard filter
-│                            #    for position states)
-└── state/types.rs           # Full 12-state vector:
-                             #   [x, y, z, vx, vy, vz,
-                             #    roll, pitch, yaw, p, q, r]
-
-Phase 2 — Position Control via MPC
-├── control/mpc.rs           # Extend MPC to full 12-state model
-│                            #   A, B matrices now include position
-│                            #   dynamics, not just attitude
-├── control/setpoint.rs      # GPS waypoint → reference trajectory
-│                            #   Smooth trajectory generation
-│                            #   between current position and target
-└── control/mode.rs          # New modes: PosHold, ReturnToHome,
-                             #   Waypoint following
-
-Phase 3 — GPS Rescue State Machine
-├── control/gps_rescue.rs    # Triggered by RC link loss
-│                            #   1. Climb to safe altitude
-│                            #   2. Orient toward home point
-│                            #   3. Fly toward home at safe speed
-│                            #   4. Descend and land (or loiter)
-│                            #   All via MPC reference trajectory
-│                            #   generation — the rescue IS just a
-│                            #   sequence of waypoints fed to the
-│                            #   same controller that does normal
-│                            #   position hold.
-```
-
-**Why MPC makes GPS rescue more elegant:**
-
-With PID, GPS rescue requires hand-tuned logic for each phase
-(climb rate, cruise speed, deceleration profile, landing
-detection). Each transition is a heuristic.
-
-With MPC, the rescue becomes: "generate a reference trajectory
-from current position to home at safe altitude, with velocity
-constraints." The optimiser figures out how to get there while
-respecting all constraints simultaneously. Phase transitions
-are just waypoints in the trajectory. If wind pushes you off
-course, the MPC re-plans automatically at 50 Hz.
-
-The hard part isn't the controller — it's the state estimator.
-Fusing 10 Hz GPS with 200 Hz IMU while handling GPS dropouts,
-multipath, and the ~2m noise floor is where the real engineering
-is. An EKF that trusts GPS when it's good and falls back to
-IMU-only dead reckoning when it's bad is essential.
+**Remaining for hardware:**
+- Wire the NMEA GPS parser (`drivers/nmea.rs`) to the UART6 task
+- Feed real GPS fixes into the Kalman filter
+- Tune position gains for real GPS noise characteristics
+- Add GPS rescue state machine (climb → cruise → loiter) triggered
+  by RC link loss — currently the sim just flies direct to home
 
 ### 10. Blackbox Logging
 
@@ -294,21 +284,27 @@ Some way to change parameters without recompiling. Options:
 ## Priority Order
 
 ```
-Must-have (to fly at all):
-  [1] PID controller
-  [2] DShot hardware driver
-  [3] Pin assignment
-  [4] Embassy project setup
-  [5] Arming state machine
+DONE (software validated in sim):
+  ✓ PID controller
+  ✓ MPC integration (tinympc-rs)
+  ✓ Altitude controller
+  ✓ Position controller
+  ✓ State estimator (Kalman filter)
+  ✓ GPS rescue (sim-proven)
+  ✓ Arming state machine
+  ✓ Embassy project setup
+  ✓ NMEA GPS parser
 
-Should-have (to fly well):
-  [4] MPC integration (tinympc-rs)
-  [8] ESC telemetry (RPM filtering)
-  [10] Blackbox logging
+Next (hardware integration):
+  [ ] DShot hardware driver
+  [ ] Pin assignment & board definition
+  [ ] Peripheral bring-up (IMU, RC, GPS, ESC)
+  [ ] Closed-loop hover on hardware
 
-Nice-to-have (features):
-  [7] VTX/OSD
-  [9] GPS rescue
-  [11] Configuration interface
-  [8.3-4] MPC-aware motor feedback
+Later (features):
+  [ ] ESC telemetry (RPM filtering)
+  [ ] Blackbox logging
+  [ ] VTX/OSD
+  [ ] Configuration interface
+  [ ] MPC-aware motor feedback
 ```

@@ -46,6 +46,26 @@ pub struct Mixer<const N: usize> {
 }
 
 impl<const N: usize> Mixer<N> {
+    /// Apply the mix with simple clamping (no airmode).
+    ///
+    /// Motors that would go below 0 or above 1 are hard-clamped.
+    /// This sacrifices torque fidelity but preserves commanded thrust
+    /// (no phantom-thrust leak). Appropriate for GPS rescue and other
+    /// modes where altitude accuracy matters more than attitude rate
+    /// authority.
+    pub fn apply_no_airmode(&self, demand: &ControlDemand) -> MotorOutputs<N> {
+        let mut outputs = [0.0f32; N];
+        for i in 0..N {
+            let m = &self.mix[i];
+            outputs[i] = (demand.thrust * m[0]
+                + demand.roll * m[1]
+                + demand.pitch * m[2]
+                + demand.yaw * m[3])
+            .clamp(0.0, 1.0);
+        }
+        MotorOutputs { motors: outputs }
+    }
+
     /// Apply the mix to produce motor outputs, with airmode-style
     /// saturation handling.
     ///

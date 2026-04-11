@@ -24,6 +24,16 @@ name = "sim_mpc_hover"
 path = "examples/sim_mpc_hover.rs"
 required-features = []
 
+[[example]]
+name = "sim_kf_hover"
+path = "examples/sim_kf_hover.rs"
+required-features = []
+
+[[example]]
+name = "sim_gps_rescue"
+path = "examples/sim_gps_rescue.rs"
+required-features = []
+
 # ---- Features ----
 # "firmware" pulls in all Embassy/Cortex-M/defmt deps for the embedded binary.
 # Disable it (--no-default-features) to build the library and sim examples

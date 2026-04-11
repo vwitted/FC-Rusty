@@ -44,14 +44,23 @@ pub const MPC_DT: f32 = 0.02;
 // ---- Rate tracking model ----
 // The PID inner loop doesn't track rate commands instantly.
 // We model it as a first-order lag: rate[k+1] = α·rate[k] + (1-α)·u[k]
-// α = exp(-dt_mpc / τ_pid) where τ_pid is the PID closed-loop time constant.
-// With τ_pid ≈ 0.04s (well-tuned PID at 200 Hz): α ≈ 0.6
-const RATE_ALPHA: f32 = 0.6;
+// α = exp(-dt_mpc / τ_cl) where τ_cl is the rate-loop closed-loop time
+// constant. Dominant pole is the motor/ESC lag τ_motor ≈ 30 ms, so
+// α ≈ exp(-20/30) ≈ 0.51. Slightly higher (0.55) builds in a bit of
+// margin against model error — the MPC sees a marginally *slower*
+// plant than reality and so commands a little less aggressively.
+const RATE_ALPHA: f32 = 0.55;
 
 // ---- Constraint bounds ----
 const MAX_ANGLE_RAD: f32 = 45.0 * PI / 180.0;  // ±45°
-const MAX_RATE_RAD: f32 = 800.0 * PI / 180.0;   // ±800°/s
-const MAX_CMD_RAD: f32 = 800.0 * PI / 180.0;    // ±800°/s
+const MAX_RATE_RAD: f32 = 400.0 * PI / 180.0;   // ±400°/s
+// MPC rate-command constraint. The inner PID (kp=0.02, output_max=0.5)
+// saturates at a rate error of ~25 °/s. To keep PID in its linear
+// regime we want |u_mpc - rate_actual| < 25 °/s. With Q/R tuned to
+// command ≤15 °/s for typical disturbances and rates damped aggressively,
+// 40 °/s is enough hard-limit headroom to absorb transient overshoot
+// without the constraint itself becoming the operating point.
+const MAX_CMD_RAD: f32 = 40.0 * PI / 180.0;     // ±40°/s
 
 // ---- Type aliases ----
 type MpcPolicy = FixedPolicy<f32, NX, NU>;
@@ -116,29 +125,50 @@ impl AttitudeMpc {
         ]);
 
         // ---- Cost matrices ----
-        // Q: penalise attitude errors heavily to get fast correction.
-        // Rate states penalised lightly — they're transient.
+        // Tuned against the nonlinear failure mode: if the MPC commands
+        // |u - rate| > 25 °/s, the inner PID saturates, the mixer
+        // airmode-shifts to preserve torque at the cost of thrust, and
+        // altitude control is lost. So the unconstrained LQR gain must
+        // keep normal-state commands well inside that envelope.
+        //
+        // Reduction to a 1-axis double integrator + first-order lag:
+        //   K_angle ≈ sqrt(Q_angle / R)   [rad/s per rad of angle]
+        //   K_rate  ≈ sqrt(Q_rate  / R)   [rad/s per rad/s of rate]
+        //
+        // With Q_angle=5, Q_rate=2, R=1:
+        //   K_angle ≈ 2.24  → 1° angle error    → ~2.2 °/s command
+        //   K_rate  ≈ 1.41  → 10 °/s rate error → ~14 °/s command
+        //
+        // Both branches keep the PID error inside ±25 °/s for realistic
+        // disturbances, and the rate-dominant weighting (Q_rate > Q_angle/2
+        // once you account for scaling) means the controller kills body
+        // rates first and only then drifts the angle back to zero — the
+        // same philosophy as a well-damped cascaded PD outer loop.
         let q = SMatrix::<f32, NX, NX>::from_diagonal(&SVector::from_row_slice(&[
-            100.0, 100.0, 50.0, 1.0, 1.0, 1.0,
+            5.0, 5.0, 2.0, 2.0, 2.0, 2.0,
         ]));
 
-        // R: light penalty on rate commands — allow aggressive corrections.
-        // The PID output limits (±0.4) and constraint bounds provide the
-        // real limit on how aggressive the system can be.
         let r = SMatrix::<f32, NU, NU>::from_diagonal(&SVector::from_row_slice(&[
-            0.1, 0.1, 0.2,
+            1.0, 1.0, 2.0,
         ]));
 
         let s = SMatrix::<f32, NX, NU>::zeros();
 
         // ---- Policy (precomputed LQR gain + Riccati) ----
-        let rho = 10.0;
+        // rho is the ADMM penalty weight. Too high over-regularises the
+        // problem and biases the solution; 1.0 is the tinympc-rs default
+        // and behaves well for the magnitudes we use here.
+        let rho = 1.0;
         let riccati_iters = 100;
         let policy = FixedPolicy::new(rho, riccati_iters, &a, &b, &q, &r, &s)
             .expect("MPC policy computation failed — check A, B, Q, R");
 
         let mut solver = MpcSolver::new(a, b, policy);
-        solver.config.max_iter = 20;
+        // max_iter 50 matches the tinympc-rs library default.
+        // We have plenty of timing headroom (control loop avg ~61us
+        // out of 5000us, and MPC only runs every 4th cycle at 50 Hz),
+        // so there's no reason to undercut the library default here.
+        solver.config.max_iter = 50;
         solver.config.do_check = 1;
 
         // ---- Constraints ----

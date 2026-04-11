@@ -16,14 +16,19 @@ pub mod control {
     pub mod mixer;
     pub mod pid;
     pub mod mpc;
+    pub mod position;
 }
 
 pub mod drivers {
     pub mod nmea;
 }
 
+pub mod estimation;
+
 pub mod sim {
     #[path = "sim.rs"]
     mod sim;
+    #[path = "sensors.rs"]
+    pub mod sensors;
     pub use sim::*;
 }

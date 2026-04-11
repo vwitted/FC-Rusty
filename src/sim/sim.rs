@@ -110,6 +110,10 @@ pub struct QuadSim {
     /// Actual motor output after ESC+motor lag (0.0–1.0 per motor).
     /// Commands are filtered through a first-order lag before producing thrust.
     pub motor_state: [f32; 4],
+    /// Kinematic acceleration in world NED frame [ax, ay, az] (m/s²).
+    /// Saved at the end of every `step()` so sensor simulators and the
+    /// state estimator can consume it as ground truth.
+    pub last_accel_world: [f32; 3],
 }
 
 impl QuadSim {
@@ -118,6 +122,7 @@ impl QuadSim {
             params,
             state: initial_state,
             motor_state: [0.0; 4],
+            last_accel_world: [0.0, 0.0, 0.0],
         }
     }
 
@@ -128,6 +133,9 @@ impl QuadSim {
             state: QuadState::hovering(altitude),
             motor_state: [hover; 4],
             params,
+            // In hover the net specific force in world NED is zero
+            // (thrust exactly cancels gravity). Kinematic accel is 0,0,0.
+            last_accel_world: [0.0, 0.0, 0.0],
         }
     }
 
@@ -184,8 +192,12 @@ impl QuadSim {
             - (thrust_per_motor[1] + thrust_per_motor[3]))
             * l;
 
-        let yaw_torque = ((thrust_per_motor[0] + thrust_per_motor[1])
-            - (thrust_per_motor[2] + thrust_per_motor[3]))
+        // Yaw torque from motor reaction:
+        //   CW motor → CCW reaction on frame (negative yaw)
+        //   CCW motor → CW reaction on frame (positive yaw)
+        // So: yaw_torque = (CCW_sum - CW_sum) * coeff
+        let yaw_torque = ((thrust_per_motor[2] + thrust_per_motor[3])
+            - (thrust_per_motor[0] + thrust_per_motor[1]))
             * p.yaw_torque_coeff;
 
         // ---- Angular acceleration (body frame) ----
@@ -246,12 +258,43 @@ impl QuadSim {
             self.state.z = 0.0;
             self.state.vz = 0.0_f32.min(self.state.vz); // can't go through floor
         }
+
+        // Save kinematic world-frame acceleration for sensor simulators
+        // and state estimators (ground truth for the body-frame accel
+        // that an IMU would measure: sf_body = R^T * (a_world - g)).
+        self.last_accel_world = [ax, ay, az];
     }
 
     /// What the IMU would read (for feeding back to the controller).
     ///
     /// Returns simulated sensor data matching the WT901B format.
+    ///
+    /// `accel` is the body-frame **specific force** — the thing a real
+    /// accelerometer measures — in m/s². It equals
+    /// `R^T · (a_world − g_world)` where `g_world = [0, 0, +9.81]` (NED).
+    /// At stationary hover this evaluates to `[0, 0, −9.81]` (the Z
+    /// accelerometer reads the reaction force propping the quad up).
+    ///
+    /// The world → body rotation uses `nalgebra::Rotation3::from_euler_angles`
+    /// so that a KF consumer can use the *same* call to decode it
+    /// round-trip exactly, regardless of the small-angle approximation
+    /// used inside `step()`.
     pub fn read_imu(&self) -> SimImu {
+        use nalgebra::{Rotation3, Vector3};
+        let r = self.state.roll * core::f32::consts::PI / 180.0;
+        let p = self.state.pitch * core::f32::consts::PI / 180.0;
+        let y = self.state.yaw * core::f32::consts::PI / 180.0;
+        let rot = Rotation3::from_euler_angles(r, p, y);
+
+        let a_world = Vector3::new(
+            self.last_accel_world[0],
+            self.last_accel_world[1],
+            self.last_accel_world[2],
+        );
+        let g_world = Vector3::new(0.0, 0.0, 9.81);
+        let sf_world = a_world - g_world;
+        let sf_body = rot.inverse() * sf_world;
+
         SimImu {
             gyro: [
                 self.state.roll_rate,
@@ -263,7 +306,7 @@ impl QuadSim {
                 self.state.pitch,
                 self.state.yaw,
             ],
-            accel: [0.0, 0.0, -9.81], // TODO: compute proper body-frame accel
+            accel: [sf_body.x, sf_body.y, sf_body.z],
         }
     }
 }

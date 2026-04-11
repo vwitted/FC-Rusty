@@ -51,10 +51,15 @@ fn main() {
     mpc.set_reference([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
 
     // ---- PID inner loop (200 Hz) ----
+    // These match sim_hover exactly — the PID loop is identical whether
+    // the outer loop is angle-P or MPC. kd=0.001 (with the 20 Hz D-LPF
+    // below) is critical damping against rate overshoot; zero-kd was a
+    // historical mistake that let the MPC rate commands chatter through
+    // the saturation envelope.
     let rate_gains = PidGains {
         kp: 0.02,
         ki: 0.005,
-        kd: 0.0,
+        kd: 0.001,
     };
     let yaw_gains = PidGains {
         kp: 0.03,
@@ -79,10 +84,10 @@ fn main() {
     let mut last_mpc_converged = true;
 
     println!(
-        "{:>6} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}  {:>4} {:>10}",
-        "time", "roll", "pitch", "yaw", "alt", "vz", "thr%", "p_cmd", "iter", "event"
+        "{:>6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>6} {:>7} {:>7} {:>7}  {:>4} {:>7} {:>7} {:>5}",
+        "time", "roll", "pitch", "yaw", "alt", "vz", "thr%", "p_sp", "p_gyr", "pid_r", "iter", "mmin", "mmax", "event"
     );
-    println!("{}", "-".repeat(92));
+    println!("{}", "-".repeat(120));
 
     for step in 0..steps {
         let t = step as f32 * dt;
@@ -153,13 +158,10 @@ fn main() {
         if step % 10 == 0 {
             let alt = -sim.state.z;
             let conv_marker = if last_mpc_converged { " " } else { "!" };
-            // Mean of clamped motor outputs — this is what the airframe
-            // actually feels. If it diverges from `current_thrust`, it's
-            // evidence of asymmetric mixer clipping adding phantom thrust.
-            let mean_motor =
-                (motor_out.motors[0] + motor_out.motors[1] + motor_out.motors[2] + motor_out.motors[3]) / 4.0;
+            let mmin = motor_out.motors.iter().cloned().fold(f32::INFINITY, f32::min);
+            let mmax = motor_out.motors.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             println!(
-                "{:6.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>7.1}% {:>7.1}°  {:>3}{} m=[{:.2} {:.2} {:.2} {:.2}] mean={:.2} {:>10}",
+                "{:6.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>7.2} {:>5.1}% {:>7.1} {:>7.1} {:>7.3} {:>3}{} {:>7.3} {:>7.3} {:>5}",
                 t,
                 sim.state.roll,
                 sim.state.pitch,
@@ -168,13 +170,12 @@ fn main() {
                 sim.state.vz,
                 current_thrust * 100.0,
                 rate_sp_degs[0],
+                imu.gyro[0],
+                pid_output[0],
                 last_mpc_iters,
                 conv_marker,
-                motor_out.motors[0],
-                motor_out.motors[1],
-                motor_out.motors[2],
-                motor_out.motors[3],
-                mean_motor,
+                mmin,
+                mmax,
                 event,
             );
         }
