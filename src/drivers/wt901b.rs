@@ -358,6 +358,122 @@ pub mod config {
     }
 }
 
+// ---- Startup configuration (runs once at boot over UART TX) ----
+
+/// Target baud rate after configuration.
+pub const TARGET_BAUD: u32 = 115_200;
+
+/// Send a command and wait for the WT901B to process it.
+/// The datasheet requires ~200ms between commands.
+async fn send_cmd(
+    tx: &mut embassy_stm32::usart::UartTx<'_, embassy_stm32::mode::Async>,
+    cmd: &[u8; 5],
+) {
+    let _ = tx.write(cmd).await;
+    embassy_time::Timer::after(embassy_time::Duration::from_millis(200)).await;
+}
+
+/// Configure the WT901B at boot time.
+///
+/// Auto-detects whether the IMU is already at 115200 (from a
+/// previous config+power-cycle) or still at factory 9600.
+///
+/// - If already at 115200: sends sensor config, done.
+/// - If at 9600: sends sensor config + baud change + save.
+///   The baud change takes effect after the next power cycle.
+///   Continues reading at 9600 for this session.
+///
+/// Returns the actual baud rate the UART is set to (9600 or 115200).
+pub async fn configure(
+    tx: &mut embassy_stm32::usart::UartTx<'static, embassy_stm32::mode::Async>,
+    rx: &mut embassy_stm32::usart::UartRx<'static, embassy_stm32::mode::Async>,
+) -> u32 {
+    use embassy_time::{Duration, Timer};
+
+    // Give the IMU time to boot after power-on
+    Timer::after(Duration::from_millis(500)).await;
+
+    // ---- Phase 1: try 115200 (IMU already configured from a previous boot) ----
+    tx.set_baudrate(TARGET_BAUD).unwrap();
+    rx.set_baudrate(TARGET_BAUD).unwrap();
+    Timer::after(Duration::from_millis(50)).await;
+
+    if probe_for_data(rx).await {
+        defmt::info!("WT901B: detected at 115200, sending sensor config");
+        send_sensor_config(tx).await;
+        return TARGET_BAUD;
+    }
+
+    // ---- Phase 2: fall back to 9600 (factory default) ----
+    defmt::info!("WT901B: no data at 115200, trying 9600");
+    tx.set_baudrate(9600).unwrap();
+    rx.set_baudrate(9600).unwrap();
+    Timer::after(Duration::from_millis(50)).await;
+
+    if !probe_for_data(rx).await {
+        defmt::warn!("WT901B: no data at 9600 either — check wiring!");
+        return 9600;
+    }
+
+    defmt::info!("WT901B: detected at 9600, configuring");
+
+    // Send sensor config at 9600
+    send_sensor_config(tx).await;
+
+    // Queue baud rate change + save — takes effect after power cycle
+    send_cmd(tx, &UNLOCK).await;
+    send_cmd(tx, &config::set_baud_rate(0x06)).await; // 115200
+    send_cmd(tx, &SAVE).await;
+
+    defmt::info!("WT901B: config saved. Baud→115200 takes effect after power cycle.");
+    defmt::info!("WT901B: running at 9600 for this session");
+
+    9600
+}
+
+/// Send the sensor configuration commands (output rate, content, mode, bandwidth).
+async fn send_sensor_config(
+    tx: &mut embassy_stm32::usart::UartTx<'_, embassy_stm32::mode::Async>,
+) {
+    send_cmd(tx, &UNLOCK).await;
+    // 200 Hz output rate
+    send_cmd(tx, &config::set_output_rate(0x0B)).await;
+    // Output: acc + gyro + angle + baro + quat (0x024E)
+    send_cmd(tx, &config::set_output_content(0x024E)).await;
+    // 6-axis mode: gyro-only heading, no mag influence on yaw
+    send_cmd(tx, &config::set_6axis_mode()).await;
+    // 256 Hz sensor bandwidth (let our own D-term LPF handle filtering)
+    send_cmd(tx, &config::set_bandwidth(0x00)).await;
+    send_cmd(tx, &SAVE).await;
+}
+
+/// Listen for ~300ms and return true if any valid WT901B packet arrives.
+async fn probe_for_data(
+    rx: &mut embassy_stm32::usart::UartRx<'_, embassy_stm32::mode::Async>,
+) -> bool {
+    use embassy_time::{Duration, Timer, Instant};
+
+    let mut parser = Wt901bParser::new();
+    let mut buf = [0u8; 32];
+    let deadline = Instant::now() + Duration::from_millis(300);
+
+    while Instant::now() < deadline {
+        // Use a short read with timeout so we don't block forever
+        let timeout = deadline - Instant::now();
+        match embassy_time::with_timeout(timeout, rx.read(&mut buf)).await {
+            Ok(Ok(())) => {
+                for &byte in &buf {
+                    if parser.push_byte(byte).is_some() {
+                        return true;
+                    }
+                }
+            }
+            _ => break, // timeout or error
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

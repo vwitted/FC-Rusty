@@ -51,7 +51,7 @@
 #![no_main]
 
 use embassy_executor::Spawner;
-use embassy_stm32::usart::{self, UartRx};
+use embassy_stm32::usart::{self, Uart, UartRx};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::{bind_interrupts, peripherals};
 use embassy_sync::signal::Signal;
@@ -159,24 +159,30 @@ async fn main(spawner: Spawner) {
     defmt::info!("RC task spawned");
 
     // ---- WT901B IMU on USART3 ----
-    // Currently at factory 9600 baud. Use WitMotion software to
-    // change to 115200 + do mag calibration, then update this.
+    // Start at factory 9600 baud, configure over UART, then switch to 115200.
     let imu_uart_config = {
         let mut c = usart::Config::default();
         c.baudrate = 9600;
         c
     };
 
-    let imu_rx = UartRx::new(
+    let imu_uart = Uart::new(
         p.USART3,
+        p.PB11,          // RX
+        p.PB10,          // TX
         Irqs,
-        p.PB11,
-        p.DMA1_CH1,
+        p.DMA1_CH3,      // TX DMA
+        p.DMA1_CH1,      // RX DMA
         imu_uart_config,
     ).unwrap();
 
+    // Split into TX+RX, auto-detect baud + configure, then drop TX
+    let (mut imu_tx, mut imu_rx) = imu_uart.split();
+    let imu_baud = drivers::wt901b::configure(&mut imu_tx, &mut imu_rx).await;
+    drop(imu_tx);
+
     spawner.spawn(imu_task(imu_rx)).unwrap();
-    defmt::info!("IMU task spawned");
+    defmt::info!("IMU task spawned at {} baud", imu_baud);
 
     // ---- Configure and spawn the GPS task ----
     // GPS on USART6 TX=PC6 RX=PC7, 9600 baud (NMEA default)
@@ -241,7 +247,7 @@ async fn gps_task(
 async fn imu_task(
     mut rx: UartRx<'static, embassy_stm32::mode::Async>,
 ) {
-    defmt::info!("IMU task reading at 9600");
+    defmt::info!("IMU task started");
 
     let mut parser = Wt901bParser::new();
     let mut buf = [0u8; 32];
