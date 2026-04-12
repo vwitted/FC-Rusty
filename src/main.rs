@@ -51,7 +51,7 @@
 #![no_main]
 
 use embassy_executor::Spawner;
-use embassy_stm32::usart::{self, UartRx, UartTx};
+use embassy_stm32::usart::{self, UartRx};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::{bind_interrupts, peripherals};
 use embassy_sync::signal::Signal;
@@ -158,28 +158,24 @@ async fn main(spawner: Spawner) {
     spawner.spawn(rc_task::run(rc_uart)).unwrap();
     defmt::info!("RC task spawned");
 
-    // ---- Configure and spawn the IMU task ----
-    // WT901B on USART3 TX=PB10 RX=PB11, 115200 baud
+    // ---- WT901B IMU on USART3 ----
+    // Currently at factory 9600 baud. Use WitMotion software to
+    // change to 115200 + do mag calibration, then update this.
     let imu_uart_config = {
         let mut c = usart::Config::default();
-        c.baudrate = 115200;
+        c.baudrate = 9600;
         c
     };
 
-    let (imu_tx, imu_rx) = {
-        let uart = embassy_stm32::usart::Uart::new(
-            p.USART3,
-            p.PB11,        // RX pin
-            p.PB10,        // TX pin
-            Irqs,
-            p.DMA1_CH3,   // DMA1 Stream 3 Ch 4 (TX)
-            p.DMA1_CH1,   // DMA1 Stream 1 Ch 4 (RX)
-            imu_uart_config,
-        ).unwrap();
-        uart.split()
-    };
+    let imu_rx = UartRx::new(
+        p.USART3,
+        Irqs,
+        p.PB11,
+        p.DMA1_CH1,
+        imu_uart_config,
+    ).unwrap();
 
-    spawner.spawn(imu_task(imu_tx, imu_rx)).unwrap();
+    spawner.spawn(imu_task(imu_rx)).unwrap();
     defmt::info!("IMU task spawned");
 
     // ---- Configure and spawn the GPS task ----
@@ -243,47 +239,30 @@ async fn gps_task(
 
 #[embassy_executor::task]
 async fn imu_task(
-    mut tx: UartTx<'static, embassy_stm32::mode::Async>,
     mut rx: UartRx<'static, embassy_stm32::mode::Async>,
 ) {
-    // Give the IMU a moment to boot
-    embassy_time::Timer::after(Duration::from_millis(500)).await;
+    defmt::info!("IMU task reading at 9600");
 
-    // Configure the WT901B for our needs:
-    // 1. Unlock
-    // 2. Set 200 Hz output rate
-    // 3. Set output content: accel + gyro + angle + quaternion + baro
-    // 4. Set bandwidth to 188 Hz (good for 200 Hz output)
-    // 5. Save
-
-    use drivers::wt901b::{UNLOCK, SAVE, config};
-
-    let commands: &[[u8; 5]] = &[
-        UNLOCK,
-        config::set_output_rate(0x0B),           // 200 Hz
-        config::set_output_content(0x024E),       // acc+gyro+angle+baro+quat
-        config::set_bandwidth(0x01),              // 188 Hz
-        SAVE,
-    ];
-
-    for cmd in commands {
-        let _ = tx.write(cmd).await;
-        embassy_time::Timer::after(Duration::from_millis(50)).await;
-    }
-
-    defmt::info!("WT901B configured");
-
-    // Now read data continuously
     let mut parser = Wt901bParser::new();
     let mut buf = [0u8; 32];
+    let mut pkt_count: u32 = 0;
 
     loop {
         match rx.read(&mut buf).await {
             Ok(()) => {
                 for &byte in &buf {
                     if parser.push_byte(byte).is_some() {
-                        // Publish the latest data snapshot
+                        pkt_count += 1;
                         IMU_DATA.signal(parser.data);
+
+                        // Log first successful packet so we know it's alive
+                        if pkt_count == 1 {
+                            defmt::info!(
+                                "IMU first packet! accel=[{:?},{:?},{:?}] gyro=[{:?},{:?},{:?}]",
+                                parser.data.accel[0], parser.data.accel[1], parser.data.accel[2],
+                                parser.data.gyro[0], parser.data.gyro[1], parser.data.gyro[2],
+                            );
+                        }
                     }
                 }
             }
