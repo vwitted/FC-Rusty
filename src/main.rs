@@ -225,6 +225,7 @@ async fn gps_task(
     let mut parser = UbxParser::new();
     let mut buf = [0u8; 128]; // NAV-PVT frame is ~100 bytes
     let mut pkt_count: u32 = 0;
+    let mut last_report = Instant::now();
 
     defmt::info!("GPS task started (UBX binary)");
 
@@ -244,6 +245,21 @@ async fn gps_task(
                                 parser.data.latitude as f32,
                                 parser.data.longitude as f32,
                             );
+                        }
+
+                        // Report GPS stats every 5 seconds
+                        let now = Instant::now();
+                        if now.duration_since(last_report) >= Duration::from_secs(5) {
+                            defmt::info!(
+                                "GPS: {} pkts, type={} sats={} hacc={:?}m lat={:?} lon={:?}",
+                                pkt_count,
+                                parser.data.fix_type as u8,
+                                parser.data.satellites,
+                                parser.data.h_acc_m,
+                                parser.data.latitude as f32,
+                                parser.data.longitude as f32,
+                            );
+                            last_report = now;
                         }
                     }
                 }
