@@ -66,6 +66,7 @@ mod drivers {
     pub mod crsf;
     pub mod dshot;
     pub mod nmea;
+    pub mod ubx;
     pub mod wt901b;
 }
 mod control {
@@ -79,7 +80,7 @@ mod rc_task;
 
 use drivers::crsf::RcChannels;
 use drivers::dshot::{DshotFrame, DshotSpeed};
-use drivers::nmea::{NmeaParser, GpsData};
+use drivers::ubx::{UbxParser, GpsData};
 use drivers::wt901b::{Wt901bParser, ImuData};
 use control::arming::{ArmingStateMachine, ArmState};
 use control::mixer::{ControlDemand, QUAD_X};
@@ -185,21 +186,25 @@ async fn main(spawner: Spawner) {
     defmt::info!("IMU task spawned at {} baud", imu_baud);
 
     // ---- Configure and spawn the GPS task ----
-    // GPS on USART6 TX=PC6 RX=PC7, 9600 baud (NMEA default)
+    // GPS on USART6 TX=PC6 RX=PC7
+    // WS-M181 outputs UBX binary at 115200 baud.
     let gps_uart_config = {
         let mut c = usart::Config::default();
-        c.baudrate = 9600;
+        c.baudrate = 115200;
         c
     };
 
-    let gps_rx = UartRx::new(
+    let gps_uart = Uart::new(
         p.USART6,
+        p.PC7,           // RX
+        p.PC6,           // TX
         Irqs,
-        p.PC7,           // RX pin
-        p.DMA2_CH1,      // DMA2 Stream 1 Ch 5 (RX)
+        p.DMA2_CH6,      // TX DMA
+        p.DMA2_CH1,      // RX DMA
         gps_uart_config,
     ).unwrap();
 
+    let (_gps_tx, gps_rx) = gps_uart.split();
     spawner.spawn(gps_task(gps_rx)).unwrap();
     defmt::info!("GPS task spawned");
 
@@ -211,23 +216,35 @@ async fn main(spawner: Spawner) {
 }
 
 // ---- GPS Task ----
-// Reads NMEA sentences from the GPS module, publishes via GPS_DATA signal.
+// Reads UBX binary frames from the GPS module, publishes via GPS_DATA signal.
 
 #[embassy_executor::task]
 async fn gps_task(
     mut rx: UartRx<'static, embassy_stm32::mode::Async>,
 ) {
-    let mut parser = NmeaParser::new();
-    let mut buf = [0u8; 128]; // NMEA sentences up to 82 chars
+    let mut parser = UbxParser::new();
+    let mut buf = [0u8; 128]; // NAV-PVT frame is ~100 bytes
+    let mut pkt_count: u32 = 0;
 
-    defmt::info!("GPS task started");
+    defmt::info!("GPS task started (UBX binary)");
 
     loop {
         match rx.read(&mut buf).await {
             Ok(()) => {
                 for &byte in &buf {
                     if parser.push_byte(byte).is_some() {
+                        pkt_count += 1;
                         GPS_DATA.signal(parser.data);
+
+                        if pkt_count == 1 {
+                            defmt::info!(
+                                "GPS first fix! type={} sats={} lat={:?} lon={:?}",
+                                parser.data.fix_type as u8,
+                                parser.data.satellites,
+                                parser.data.latitude as f32,
+                                parser.data.longitude as f32,
+                            );
+                        }
                     }
                 }
             }
