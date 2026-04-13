@@ -100,22 +100,41 @@ pub async fn run(
     // baud that's ~1.5ms of wire time per frame, so a 64-byte
     // buffer is plenty.
     let mut buf = [0u8; 64];
+    let mut pkt_count: u32 = 0;
+    let mut err_count: u32 = 0;
+    let mut read_count: u32 = 0;
+
+    defmt::info!("RC task started (CRSF 416666 baud)");
 
     loop {
         // Async read: this yields the task until DMA delivers
         // bytes. No CPU time wasted polling.
         match uart_rx.read(&mut buf).await {
             Ok(()) => {
+                read_count += 1;
+
+                if read_count == 1 {
+                    defmt::info!("RC: first UART read OK, {} bytes, first=[{:#x},{:#x},{:#x},{:#x}]",
+                        buf.len(), buf[0], buf[1], buf[2], buf[3]);
+                }
+
                 // read() fills the entire buffer, so process
                 // all bytes we got.
                 for &byte in &buf {
                     if let Some(event) = parser.push_byte(byte) {
+                        pkt_count += 1;
                         // Mark that we've seen a valid frame
                         RC_LAST_SEEN.signal(Instant::now());
 
                         match event {
                             CrsfEvent::Channels(ch) => {
                                 RC_CHANNELS.signal(ch);
+
+                                if pkt_count == 1 {
+                                    defmt::info!("RC first channels: [{},{},{},{},...] (raw)",
+                                        ch.channels[0], ch.channels[1],
+                                        ch.channels[2], ch.channels[3]);
+                                }
                             }
                             CrsfEvent::Link(link) => {
                                 RC_LINK.signal(link);
@@ -124,12 +143,11 @@ pub async fn run(
                     }
                 }
             }
-            Err(_e) => {
-                // UART error (framing, overrun, noise).
-                // On a real FC you'd increment an error counter.
-                // Don't panic — just keep trying. The parser
-                // will re-sync on the next valid sync byte.
-
+            Err(e) => {
+                err_count += 1;
+                if err_count <= 5 {
+                    defmt::warn!("RC UART error #{}: {:?}", err_count, e);
+                }
                 // Small delay to avoid tight-looping on persistent errors
                 embassy_time::Timer::after(Duration::from_millis(1)).await;
             }
