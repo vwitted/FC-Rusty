@@ -281,6 +281,72 @@ Some way to change parameters without recompiling. Options:
 
 ---
 
+## F722 Platform — Opportunities for the NMPC
+
+Once the port to the SpeedyBee F7V3 (STM32F722RET6) is complete, the
+extra horsepower over the F405 opens up several directions worth
+exploring. **None of these are required for first flight** — they're
+parked here so we don't lose sight of them while getting the basic
+port working.
+
+### Raw headroom on F722 vs F405
+- **Clock:** 216 MHz vs 168 MHz (~29% faster)
+- **RAM:** 256 KB contiguous vs 128 KB + 64 KB split (+CCM)
+- **FPU:** FPv5-SP vs FPv4-SP — better single-precision throughput
+  per cycle on the same instructions
+- **ITCM (16 KB) + DTCM (64 KB):** zero-wait-state tightly-coupled
+  memories for hot code/data. F4 has CCM but no ITCM.
+- **ART accelerator:** instruction prefetch/cache on flash reads,
+  effectively hides flash wait states at 216 MHz
+
+### Ideas to explore
+
+1. **Put the MPC solver hot loop in ITCM.** TinyMPC's ADMM iteration
+   is the tightest inner loop we have; running it from zero-wait
+   ITCM should measurably cut solve time. Cheap win, low risk.
+
+2. **Push MPC rate from 50 Hz → 100 Hz** (or even 200 Hz, matching
+   the PID rate loop). Reduces attitude-tracking lag. Gated on MPC
+   solve time — need to measure first. If we free up enough time
+   with (1), this becomes free.
+
+3. **Longer MPC horizon.** Currently 6-state attitude with a short
+   horizon. More RAM + faster solve means we can look further ahead,
+   which helps on aggressive manoeuvres where the short horizon
+   causes the controller to "see" constraints too late.
+
+4. **Higher-dim state — true NMPC.** Currently the attitude MPC is
+   linear (6-state, linearised rate dynamics). The F722 could
+   plausibly run a **12-state nonlinear MPC** (attitude + position
+   + velocity + rates) with a real NMPC scheme: SQP, multiple
+   shooting, or real-time iteration (RTI). This is the biggest
+   payoff — a genuine NMPC controller — but also the biggest piece
+   of work. Would need a solver that handles nonlinear dynamics
+   (acados-style), not tinympc.
+
+5. **Unified state estimator on firmware.** Currently the Kalman
+   filter only runs in sim (`sim_kf_hover`); on hardware we lean
+   on the WT901B's onboard fusion for attitude and do no position
+   estimation. A proper EKF fusing WT901B attitude + GPS + baro
+   in firmware would give us body-frame velocity estimates the
+   NMPC could use directly.
+
+6. **Bidirectional DShot + RPM feedback into the MPC model.**
+   Already listed under "ESC Telemetry" in the non-essentials
+   section — worth flagging here because on the F722 we'd have the
+   cycles to actually close the loop: use measured RPM to correct
+   the thrust-mapping term in the MPC model at runtime (adaptive
+   B matrix).
+
+### Order of attack (when the time comes)
+(1) and (2) are cheap and self-contained — measure first, tune
+second. (5) is independent and pairs well with any NMPC work.
+(4) is the headline feature and should be gated on (1)+(2)
+showing us the solve-time budget we have to play with. (3) and (6)
+slot in wherever they're convenient.
+
+---
+
 ## Priority Order
 
 ```

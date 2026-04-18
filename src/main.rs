@@ -1,49 +1,37 @@
 // main.rs — Flight controller entry point
 //
-// Target: STM32F407VET6 (168 MHz, Cortex-M4F, 100-pin LQFP)
-// Board:  WeAct-style dev board
+// Target: STM32F722RET6 (216 MHz, Cortex-M7F, 64-pin LQFP)
+// Board:  SpeedyBee F7 V3 (30×30 stack with BL32 50A 4-in-1 ESC)
 // Framework: Embassy async executor
 //
-// ========== PIN ASSIGNMENTS ==========
+// NOTE: Pin assignments below are carried over from the F405 port.
+// They compile on F722 silicon but do NOT match the F7 V3 board
+// wiring yet. Pin remap + multi-timer DShot land in follow-up commits.
+// See PROJECT_STATUS.md and the F7 V3 manual for the real mapping:
+//   UART1  PA9/PA10   → T1/R1 pads (VTX / defmt output)
+//   UART2  PA2/PA3    → T2/R2 pads (CRSF receiver)
+//   UART3  PB10/PB11  → T3/R3 pads (WT901B IMU)
+//   UART4  RX=PA1     → ESC telemetry (internal)
+//   UART6  PC6/PC7    → T6/R6 pads (GPS)
+//   Motors M1-M4      → PA15 / PB3 / PB4 / PB6
+//                       (TIM2_CH1, TIM2_CH2, TIM3_CH1, TIM4_CH1 —
+//                        three different timers → multi-timer DShot)
+//
+// Flashing: board has no SWD; use DFU over USB-C (hold BOOT, plug in,
+// then `dfu-util -a 0 -s 0x08000000:leave -D fw.bin`).
+//
+// ===== Legacy F405 pin map (UNCHANGED IN THIS COMMIT) =====
 //
 // UART peripherals:
 //   USART1  RX=PA10              → CRSF receiver (416666 baud, RX only)
-//                                  DMA: DMA2 Stream 5 Ch 4 (RX)
+//   USART3  TX=PB10  RX=PB11     → WT901B IMU (115200 baud, TX+RX)
+//   USART6  TX=PC6   RX=PC7      → GPS module (9600/115200 baud, TX+RX)
 //
-//   USART3  TX=PB10  RX=PB11    → WT901B IMU (115200 baud, TX+RX)
-//                                  DMA: DMA1 Stream 3 Ch 4 (TX)
-//                                       DMA1 Stream 1 Ch 4 (RX)
-//
-//   USART6  TX=PC6   RX=PC7     → GPS module (9600/115200 baud, TX+RX)
-//                                  DMA: DMA2 Stream 6 Ch 5 (TX)
-//                                       DMA2 Stream 1 Ch 5 (RX)
-//
-// DShot ESC outputs (TIM3, 4 channels):
-//   TIM3_CH1  PA6  → Motor 1 (front-right)
-//   TIM3_CH2  PA7  → Motor 2 (rear-left)
-//   TIM3_CH3  PB0  → Motor 3 (front-left)
-//   TIM3_CH4  PB1  → Motor 4 (rear-right)
-//                                  DMA: DMA1 Stream 4 Ch 5 (CH1)
-//                                       DMA1 Stream 5 Ch 5 (CH2)
-//                                       DMA1 Stream 7 Ch 5 (CH3)
-//                                       DMA1 Stream 2 Ch 5 (CH4)
-//
-// Reserved / board-specific:
-//   PA11, PA12  → USB (dev board)
-//   PA13, PA14  → SWD debug (ST-Link)
-//   PH0, PH1   → HSE crystal (8 MHz)
-//   PC13        → On-board LED (active low on most boards)
-//
-// Free pins for future use:
-//   PA0-PA5, PA8-PA9, PA15      → SPI sensors, buzzer, LED strip, etc.
-//   PB2-PB9, PB12-PB15          → SPI (gyro), I2C (baro/mag), etc.
-//   PC0-PC5, PC8-PC15           → ADC (battery voltage), SD card, etc.
-//   PD0-PD15, PE0-PE15          → plenty of GPIO
-//
-// DMA stream allocation (no conflicts):
-//   DMA1: S1=USART3_RX  S2=TIM3_CH4  S3=USART3_TX
-//         S4=TIM3_CH1   S5=TIM3_CH2   S7=TIM3_CH3
-//   DMA2: S1=USART6_RX  S5=USART1_RX  S6=USART6_TX
+// DShot ESC outputs (TIM3, 4 channels) — quad-X props-in layout:
+//   TIM3_CH1  PA6  → Motor 1 (rear-right,  CW)
+//   TIM3_CH2  PA7  → Motor 2 (front-right, CCW)
+//   TIM3_CH3  PB0  → Motor 3 (rear-left,   CCW)
+//   TIM3_CH4  PB1  → Motor 4 (front-left,  CW)
 //
 // =====================================
 
@@ -65,6 +53,7 @@ use panic_probe as _; // panic handler that works with probe
 mod drivers {
     pub mod crsf;
     pub mod dshot;
+    pub mod dshot_hw;
     pub mod nmea;
     pub mod ubx;
     pub mod wt901b;
@@ -80,6 +69,7 @@ mod rc_task;
 
 use drivers::crsf::RcChannels;
 use drivers::dshot::{DshotFrame, DshotSpeed};
+use drivers::dshot_hw::DshotTim3;
 use drivers::ubx::{UbxParser, GpsData};
 use drivers::wt901b::{Wt901bParser, ImuData};
 use control::arming::{ArmingStateMachine, ArmState};
@@ -113,13 +103,13 @@ static GPS_DATA: Signal<CriticalSectionRawMutex, GpsData> = Signal::new();
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     // ---- Clock configuration ----
-    // STM32F407VET6 with 8 MHz HSE crystal on the dev board.
-    //   HSE 8 MHz → PLL_M=8 → 1 MHz → PLL_N=336 → VCO 336 MHz
-    //   PLL_P=2 → SYSCLK 168 MHz
-    //   PLL_Q=7 → USB 48 MHz (not used yet, but correct for future)
-    //   AHB  = 168 MHz (prescaler 1)
-    //   APB1 = 42 MHz  (prescaler 4), APB1 timers = 84 MHz
-    //   APB2 = 84 MHz  (prescaler 2), APB2 timers = 168 MHz
+    // STM32F722RET6 with 8 MHz HSE crystal on the SpeedyBee F7 V3.
+    //   HSE 8 MHz → PLL_M=4 → 2 MHz → PLL_N=216 → VCO 432 MHz
+    //   PLL_P=2 → SYSCLK 216 MHz  (F722 max)
+    //   PLL_Q=9 → USB 48 MHz      (432/9 = 48, exact)
+    //   AHB  = 216 MHz (prescaler 1)
+    //   APB1 = 54 MHz  (prescaler 4), APB1 timers = 108 MHz
+    //   APB2 = 108 MHz (prescaler 2), APB2 timers = 216 MHz
     use embassy_stm32::rcc::{
         Hse, HseMode, Pll, PllMul, PllPreDiv, PllPDiv, PllQDiv,
         PllSource, Sysclk, APBPrescaler, AHBPrescaler,
@@ -131,16 +121,16 @@ async fn main(spawner: Spawner) {
     });
     config.rcc.pll_src = PllSource::HSE;
     config.rcc.pll = Some(Pll {
-        prediv: PllPreDiv::DIV8,    // 8 MHz / 8 = 1 MHz
-        mul: PllMul::MUL336,        // 1 MHz × 336 = 336 MHz VCO
-        divp: Some(PllPDiv::DIV2),  // 336 / 2 = 168 MHz SYSCLK
-        divq: Some(PllQDiv::DIV7),  // 336 / 7 = 48 MHz USB
+        prediv: PllPreDiv::DIV4,    // 8 MHz / 4 = 2 MHz VCO input
+        mul: PllMul::MUL216,        // 2 MHz × 216 = 432 MHz VCO
+        divp: Some(PllPDiv::DIV2),  // 432 / 2 = 216 MHz SYSCLK
+        divq: Some(PllQDiv::DIV9),  // 432 / 9 = 48 MHz USB
         divr: None,
     });
     config.rcc.sys = Sysclk::PLL1_P;
-    config.rcc.ahb_pre = AHBPrescaler::DIV1;   // 168 MHz
-    config.rcc.apb1_pre = APBPrescaler::DIV4;   // 42 MHz (timers 84 MHz)
-    config.rcc.apb2_pre = APBPrescaler::DIV2;   // 84 MHz (timers 168 MHz)
+    config.rcc.ahb_pre = AHBPrescaler::DIV1;    // 216 MHz
+    config.rcc.apb1_pre = APBPrescaler::DIV4;   // 54 MHz (timers 108 MHz)
+    config.rcc.apb2_pre = APBPrescaler::DIV2;   // 108 MHz (timers 216 MHz)
 
     let p = embassy_stm32::init(config);
 
@@ -208,11 +198,22 @@ async fn main(spawner: Spawner) {
     spawner.spawn(gps_task(gps_rx)).unwrap();
     defmt::info!("GPS task spawned");
 
+    // ---- DShot ESC outputs on TIM3 ----
+    // TIM3 CH1-4 → PA6 (M1), PA7 (M2), PB0 (M3), PB1 (M4)
+    // TIM3_UP DMA → DMA1_CH2 (stream 2, request 5)
+    let dshot = DshotTim3::new(
+        p.TIM3,
+        p.PA6, p.PA7, p.PB0, p.PB1,
+        p.DMA1_CH2,
+        DshotSpeed::Dshot600,
+    );
+    defmt::info!("DShot (TIM3, DShot600) initialised");
+
     // ---- Run the control loop on the main task ----
     // This is deliberate: the control loop is the highest priority
     // work, so it runs on the main executor rather than being
     // spawned as a separate task.
-    control_loop().await;
+    control_loop(dshot).await;
 }
 
 // ---- GPS Task ----
@@ -323,19 +324,10 @@ async fn imu_task(
 //
 // This runs as the main task — it never returns.
 
-async fn control_loop() -> ! {
+async fn control_loop(mut dshot: DshotTim3<'static>) -> ! {
     use core::f32::consts::PI;
     const DEG2RAD: f32 = PI / 180.0;
     const RAD2DEG: f32 = 180.0 / PI;
-
-    // ---- DShot setup ----
-    // TIM3 at 84 MHz (APB1 timer clock), DShot600
-    // TODO: configure TIM3 hardware + DMA channels for PA6/PA7/PB0/PB1
-    let dshot_speed = DshotSpeed::Dshot600;
-    let timer_clock = 84_000_000u32;
-    let t1h = dshot_speed.t1h_ticks(timer_clock);
-    let t0h = dshot_speed.t0h_ticks(timer_clock);
-    let mut dma_bufs = [[0u16; 18]; 4];
 
     // ---- Arming state machine ----
     let mut arming = ArmingStateMachine::new();
@@ -372,6 +364,8 @@ async fn control_loop() -> ! {
     let mut loop_time_us_sum: u32 = 0;
     let mut mpc_time_us_max: u32 = 0;
     let mut mpc_time_us_last: u32 = 0;
+    let mut mpc_iters_last: u32 = 0;
+    let mut mpc_iters_max: u32 = 0;
     let mut overrun_count: u32 = 0;
     let mut timing_sample_count: u32 = 0;
 
@@ -430,6 +424,28 @@ async fn control_loop() -> ! {
         );
         let armed = arm_state == ArmState::Armed;
 
+        // Bench diagnostic: if the switch is high but we're still disarmed,
+        // report which pre-arm check(s) failed at 1 Hz so the user can see
+        // the blocker without guessing.
+        if arm_switch && !armed && cycle_count % 200 == 0 {
+            let c = arming.run_checks(
+                throttle_raw,
+                last_imu.angle[0],
+                last_imu.angle[1],
+                imu_age_ms,
+                rc_age_ms,
+            );
+            defmt::info!(
+                "arm rejected: thr_low={} level={} imu={} rc={} | thr={}% roll={}° pitch={}° imu_age={}ms rc_age={}ms ch4={} ch5={}",
+                c.throttle_low, c.attitude_level, c.imu_fresh, c.rc_link_active,
+                (throttle_raw * 100.0) as i32,
+                last_imu.angle[0] as i32,
+                last_imu.angle[1] as i32,
+                imu_age_ms, rc_age_ms,
+                last_rc.channels[4], last_rc.channels[5],
+            );
+        }
+
         // ---- 3. Control computation ----
         if armed {
             // RC stick → desired attitude
@@ -466,6 +482,10 @@ async fn control_loop() -> ! {
                 mpc_time_us_last = mpc_start.elapsed().as_micros() as u32;
                 if mpc_time_us_last > mpc_time_us_max {
                     mpc_time_us_max = mpc_time_us_last;
+                }
+                mpc_iters_last = mpc_out.iterations as u32;
+                if mpc_iters_last > mpc_iters_max {
+                    mpc_iters_max = mpc_iters_last;
                 }
 
                 rate_sp_degs = [
@@ -505,23 +525,17 @@ async fn control_loop() -> ! {
         let motor_outputs = QUAD_X.apply(&control_demand);
 
         // ---- 5. DShot output ----
-        // TIM3 CH1-4 → PA6 (M1), PA7 (M2), PB0 (M3), PB1 (M4)
-        if armed {
-            for i in 0..4 {
-                let frame = DshotFrame::from_normalised(
-                    motor_outputs.motors[i],
-                    false,
-                );
-                frame.fill_dma_buffer(&mut dma_bufs[i], t1h, t0h);
-            }
-            // TODO: trigger DMA transfers on TIM3 channels
-            // DMA1 Stream 4 (CH1), Stream 5 (CH2), Stream 7 (CH3), Stream 2 (CH4)
+        let frames: [DshotFrame; 4] = if armed {
+            [
+                DshotFrame::from_normalised(motor_outputs.motors[0], false),
+                DshotFrame::from_normalised(motor_outputs.motors[1], false),
+                DshotFrame::from_normalised(motor_outputs.motors[2], false),
+                DshotFrame::from_normalised(motor_outputs.motors[3], false),
+            ]
         } else {
-            for i in 0..4 {
-                let frame = DshotFrame::disarmed();
-                frame.fill_dma_buffer(&mut dma_bufs[i], t1h, t0h);
-            }
-        }
+            [DshotFrame::disarmed(); 4]
+        };
+        dshot.send(frames).await;
 
         // ---- 6. Loop timing ----
         let loop_us = loop_start.elapsed().as_micros() as u32;
@@ -559,11 +573,13 @@ async fn control_loop() -> ! {
                 last_gps.satellites,
             );
             defmt::info!(
-                "loop: avg={}us max={}us mpc_max={}us mpc_last={}us overruns={}",
+                "loop: avg={}us max={}us mpc_max={}us mpc_last={}us mpc_iters={}/{} overruns={}",
                 loop_avg,
                 loop_time_us_max,
                 mpc_time_us_max,
                 mpc_time_us_last,
+                mpc_iters_last,
+                mpc_iters_max,
                 overrun_count,
             );
 
@@ -571,6 +587,7 @@ async fn control_loop() -> ! {
             loop_time_us_max = 0;
             loop_time_us_sum = 0;
             mpc_time_us_max = 0;
+            mpc_iters_max = 0;
             timing_sample_count = 0;
         }
     }

@@ -2,18 +2,26 @@
 #
 # This tells cargo:
 #   1. What CPU architecture to compile for (thumbv7em-none-eabihf)
-#   2. How to flash and run the firmware (probe-rs via ST-Link)
+#   2. How to flash and run the firmware
 #
 # thumbv7em-none-eabihf breakdown:
 #   thumbv7em = ARMv7E-M (Cortex-M4/M7)
 #   none      = no OS (bare metal)
-#   eabihf    = hardware floating point (the F405 has an FPU)
+#   eabihf    = hardware floating point (the F722 has an FPv5-SP FPU)
+#
+# Flashing on the SpeedyBee F7 V3:
+#   The board has no SWD pads, so `probe-rs run` will fail unless you
+#   solder leads onto the bare SWD pads under the MCU. Intended flow:
+#     1. Hold BOOT button while plugging USB → board enters DFU mode
+#     2. `cargo objcopy --release --bin fc-firmware -- -O binary fw.bin`
+#     3. `dfu-util -a 0 -s 0x08000000:leave -D fw.bin`
+#
+# The runner below is kept for anyone who does wire up SWD; the `chip`
+# name is correct for F722RET6 so `probe-rs attach` / chip recognition
+# still works.
 
 [target.'cfg(all(target_arch = "arm", target_os = "none"))']
-# probe-rs flashes the binary and opens an RTT console for defmt logs.
-# Change the chip name if you're using a different F4 variant.
-# Run `probe-rs chip list | grep -i stm32f40` to see options.
-runner = "probe-rs run --chip STM32F407VETx"
+runner = "probe-rs run --chip STM32F722RETx"
 
 [build]
 target = "thumbv7em-none-eabihf"
@@ -21,5 +29,5 @@ target = "thumbv7em-none-eabihf"
 [env]
 # Controls which log levels defmt actually emits.
 # "trace" = everything, "info" = normal, "warn" = quiet
-# Set to "info" once things are working to reduce RTT traffic.
+# Set to "info" once things are working to reduce log traffic.
 DEFMT_LOG = "info"
