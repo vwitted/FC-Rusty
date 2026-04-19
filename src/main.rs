@@ -46,7 +46,6 @@ use embassy_sync::signal::Signal;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_time::{Duration, Instant, Ticker};
 
-use defmt_rtt as _; // logging over RTT (debug probe)
 use panic_probe as _; // panic handler that works with probe
 
 // Our modules
@@ -65,6 +64,7 @@ mod control {
     pub mod mpc;
     pub mod pid;
 }
+mod logger;
 mod rc_task;
 
 use drivers::crsf::RcChannels;
@@ -80,8 +80,10 @@ use control::altitude::{AltitudeController, AltitudeGains};
 
 // ---- Interrupt bindings ----
 
+// USART1 is owned by `logger::init_usart1()` (raw register TX for defmt)
+// — no Embassy interrupt handler needed here.
 bind_interrupts!(struct Irqs {
-    USART1 => usart::InterruptHandler<peripherals::USART1>;
+    USART2 => usart::InterruptHandler<peripherals::USART2>;
     USART3 => usart::InterruptHandler<peripherals::USART3>;
     USART6 => usart::InterruptHandler<peripherals::USART6>;
 });
@@ -134,15 +136,19 @@ async fn main(spawner: Spawner) {
 
     let p = embassy_stm32::init(config);
 
+    // Bring up USART1 TX (PA9) for defmt output before anything else
+    // so the first defmt::info! below actually lands on the wire.
+    logger::init_usart1();
+
     defmt::info!("Flight controller starting");
 
     // ---- Configure and spawn the RC receiver task ----
-    // CRSF on USART1 RX (PA10), 416666 baud
+    // CRSF on USART2 RX (PA3), 416666 baud — T2/R2 pads on the F7 V3.
     let rc_uart = UartRx::new(
-        p.USART1,
+        p.USART2,
         Irqs,
-        p.PA10,          // RX pin
-        p.DMA2_CH5,      // DMA2 Stream 5 Ch 4
+        p.PA3,           // RX pin
+        p.DMA1_CH5,      // USART2_RX → DMA1 Stream 5
         rc_task::crsf_uart_config(),
     ).unwrap();
 
