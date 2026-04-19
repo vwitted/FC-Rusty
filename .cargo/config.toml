@@ -10,11 +10,17 @@
 #   eabihf    = hardware floating point (the F722 has an FPv5-SP FPU)
 #
 # Flashing on the SpeedyBee F7 V3:
-#   The board has no SWD pads, so `probe-rs run` will fail unless you
-#   solder leads onto the bare SWD pads under the MCU. Intended flow:
-#     1. Hold BOOT button while plugging USB → board enters DFU mode
-#     2. `cargo objcopy --release --bin fc-firmware -- -O binary fw.bin`
-#     3. `dfu-util -a 0 -s 0x08000000:leave -D fw.bin`
+#   The board exposes no SWD pads, so `probe-rs run` will fail unless
+#   you solder leads onto the bare pads under the MCU. The intended
+#   flow is USB DFU:
+#     1. Hold BOOT while plugging USB-C → board enumerates as DFU
+#        (lsusb shows 0483:df11 "STM Device in DFU Mode")
+#     2. `scripts/flash-dfu.sh`   (builds release + objcopy + dfu-util)
+#
+# One-off per machine:
+#     rustup component add llvm-tools
+#     cargo install cargo-binutils
+#     sudo apt install dfu-util       # or brew install dfu-util
 #
 # The runner below is kept for anyone who does wire up SWD; the `chip`
 # name is correct for F722RET6 so `probe-rs attach` / chip recognition

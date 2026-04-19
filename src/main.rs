@@ -18,8 +18,9 @@
 //   TIM4_CH1 → PB6  → M4 (front-left,  CW)
 //   See src/drivers/dshot_hw.rs for DMA stream / timing details.
 //
-// Flashing: board has no SWD; use DFU over USB-C (hold BOOT, plug in,
-// then `dfu-util -a 0 -s 0x08000000:leave -D fw.bin`).
+// Flashing: board has no SWD; use DFU over USB-C. Hold BOOT while
+// plugging in, then run `scripts/flash-dfu.sh` (see that script for
+// the one-off cargo-binutils / dfu-util install).
 
 #![no_std]
 #![no_main]
