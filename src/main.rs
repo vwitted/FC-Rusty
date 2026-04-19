@@ -11,12 +11,12 @@
 //   USART6  TX=PC6   RX=PC7     → T6/R6 pads, GPS (UBX binary)
 //   UART4   RX=PA1              → ESC telemetry (internal, not wired yet)
 //
-// Motors (still pending — current DshotTim3 is the F405 layout):
-//   F7 V3 M1-M4 → PA15 / PB3 / PB4 / PB6
-//   These span TIM2_CH1, TIM2_CH2, TIM3_CH1, TIM4_CH1 — three
-//   different timers, so the port to F7 V3 needs a multi-timer
-//   DShot driver. Until that lands, M1-M4 below are on the F405
-//   TIM3 pins (PA6/PA7/PB0/PB1) and will not drive the F7 V3 ESC.
+// Motors (multi-timer DShot600 via three parallel DMA streams):
+//   TIM2_CH1 → PA15 → M1 (rear-right,  CW)
+//   TIM2_CH2 → PB3  → M2 (front-right, CCW)
+//   TIM3_CH1 → PB4  → M3 (rear-left,   CCW)
+//   TIM4_CH1 → PB6  → M4 (front-left,  CW)
+//   See src/drivers/dshot_hw.rs for DMA stream / timing details.
 //
 // Flashing: board has no SWD; use DFU over USB-C (hold BOOT, plug in,
 // then `dfu-util -a 0 -s 0x08000000:leave -D fw.bin`).
@@ -55,7 +55,7 @@ mod rc_task;
 
 use drivers::crsf::RcChannels;
 use drivers::dshot::{DshotFrame, DshotSpeed};
-use drivers::dshot_hw::DshotTim3;
+use drivers::dshot_hw::DshotQuad;
 use drivers::ubx::{UbxParser, GpsData};
 use drivers::wt901b::{Wt901bParser, ImuData};
 use control::arming::{ArmingStateMachine, ArmState};
@@ -190,16 +190,18 @@ async fn main(spawner: Spawner) {
     spawner.spawn(gps_task(gps_rx)).unwrap();
     defmt::info!("GPS task spawned");
 
-    // ---- DShot ESC outputs on TIM3 ----
-    // TIM3 CH1-4 → PA6 (M1), PA7 (M2), PB0 (M3), PB1 (M4)
-    // TIM3_UP DMA → DMA1_CH2 (stream 2, request 5)
-    let dshot = DshotTim3::new(
-        p.TIM3,
-        p.PA6, p.PA7, p.PB0, p.PB1,
-        p.DMA1_CH2,
+    // ---- DShot ESC outputs (multi-timer across TIM2/TIM3/TIM4) ----
+    // M1=PA15 (TIM2_CH1), M2=PB3 (TIM2_CH2),
+    // M3=PB4  (TIM3_CH1), M4=PB6 (TIM4_CH1).
+    let dshot = DshotQuad::new(
+        p.TIM2, p.TIM3, p.TIM4,
+        p.PA15, p.PB3, p.PB4, p.PB6,
+        p.DMA1_CH7,      // TIM2_UP
+        p.DMA1_CH2,      // TIM3_UP
+        p.DMA1_CH6,      // TIM4_UP
         DshotSpeed::Dshot600,
     );
-    defmt::info!("DShot (TIM3, DShot600) initialised");
+    defmt::info!("DShot (TIM2+TIM3+TIM4, DShot600) initialised");
 
     // ---- Run the control loop on the main task ----
     // This is deliberate: the control loop is the highest priority
@@ -316,7 +318,7 @@ async fn imu_task(
 //
 // This runs as the main task — it never returns.
 
-async fn control_loop(mut dshot: DshotTim3<'static>) -> ! {
+async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
     use core::f32::consts::PI;
     const DEG2RAD: f32 = PI / 180.0;
     const RAD2DEG: f32 = 180.0 / PI;
