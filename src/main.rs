@@ -4,36 +4,22 @@
 // Board:  SpeedyBee F7 V3 (30×30 stack with BL32 50A 4-in-1 ESC)
 // Framework: Embassy async executor
 //
-// NOTE: Pin assignments below are carried over from the F405 port.
-// They compile on F722 silicon but do NOT match the F7 V3 board
-// wiring yet. Pin remap + multi-timer DShot land in follow-up commits.
-// See PROJECT_STATUS.md and the F7 V3 manual for the real mapping:
-//   UART1  PA9/PA10   → T1/R1 pads (VTX / defmt output)
-//   UART2  PA2/PA3    → T2/R2 pads (CRSF receiver)
-//   UART3  PB10/PB11  → T3/R3 pads (WT901B IMU)
-//   UART4  RX=PA1     → ESC telemetry (internal)
-//   UART6  PC6/PC7    → T6/R6 pads (GPS)
-//   Motors M1-M4      → PA15 / PB3 / PB4 / PB6
-//                       (TIM2_CH1, TIM2_CH2, TIM3_CH1, TIM4_CH1 —
-//                        three different timers → multi-timer DShot)
+// Pin map (SpeedyBee F7 V3):
+//   USART1  TX=PA9              → T1 pad, defmt output (raw-reg logger)
+//   USART2  RX=PA3              → R2 pad, CRSF receiver (416666 baud)
+//   USART3  TX=PB10  RX=PB11    → T3/R3 pads, WT901B IMU
+//   USART6  TX=PC6   RX=PC7     → T6/R6 pads, GPS (UBX binary)
+//   UART4   RX=PA1              → ESC telemetry (internal, not wired yet)
+//
+// Motors (still pending — current DshotTim3 is the F405 layout):
+//   F7 V3 M1-M4 → PA15 / PB3 / PB4 / PB6
+//   These span TIM2_CH1, TIM2_CH2, TIM3_CH1, TIM4_CH1 — three
+//   different timers, so the port to F7 V3 needs a multi-timer
+//   DShot driver. Until that lands, M1-M4 below are on the F405
+//   TIM3 pins (PA6/PA7/PB0/PB1) and will not drive the F7 V3 ESC.
 //
 // Flashing: board has no SWD; use DFU over USB-C (hold BOOT, plug in,
 // then `dfu-util -a 0 -s 0x08000000:leave -D fw.bin`).
-//
-// ===== Legacy F405 pin map (UNCHANGED IN THIS COMMIT) =====
-//
-// UART peripherals:
-//   USART1  RX=PA10              → CRSF receiver (416666 baud, RX only)
-//   USART3  TX=PB10  RX=PB11     → WT901B IMU (115200 baud, TX+RX)
-//   USART6  TX=PC6   RX=PC7      → GPS module (9600/115200 baud, TX+RX)
-//
-// DShot ESC outputs (TIM3, 4 channels) — quad-X props-in layout:
-//   TIM3_CH1  PA6  → Motor 1 (rear-right,  CW)
-//   TIM3_CH2  PA7  → Motor 2 (front-right, CCW)
-//   TIM3_CH3  PB0  → Motor 3 (rear-left,   CCW)
-//   TIM3_CH4  PB1  → Motor 4 (front-left,  CW)
-//
-// =====================================
 
 #![no_std]
 #![no_main]
