@@ -871,6 +871,9 @@ async fn pos_kf_task() {
 
         // ---- 1 Hz health log ----
         if last_report.elapsed() >= Duration::from_secs(1) {
+            let (sats, hdop, fix) = last_gps
+                .map(|g| (g.satellites, g.hdop, g.fix_mode as u8))
+                .unwrap_or((0, 99.99, 0));
             if ready && home_latched {
                 defmt::info!(
                     "PosKF ready: alt={=f32}m vz={=f32}m/s | N={=f32}m E={=f32}m | {} baro/s {} gps/s",
@@ -878,12 +881,16 @@ async fn pos_kf_task() {
                     est.position_ned[0], est.position_ned[1],
                     baro_updates_sec, gps_updates_sec,
                 );
-            } else {
-                let (sats, hdop, fix) = last_gps
-                    .map(|g| (g.satellites, g.hdop, g.fix_mode as u8))
-                    .unwrap_or((0, 99.99, 0));
+            } else if ready {
                 defmt::info!(
-                    "PosKF waiting: baro {}/{} samples | GPS sats={} hdop={=f32} fix={} | baro/s={} gps/s={}",
+                    "PosKF alt-ready: alt={=f32}m vz={=f32}m/s | awaiting GPS home (sats={} hdop={=f32} fix={}) | {} baro/s {} gps/s",
+                    est.altitude_up, est.vz_up,
+                    sats, hdop, fix,
+                    baro_updates_sec, gps_updates_sec,
+                );
+            } else {
+                defmt::info!(
+                    "PosKF waiting: baro {}/{} samples | GPS sats={} hdop={=f32} fix={} | {} baro/s {} gps/s",
                     p_ref_count, P_REF_SAMPLES,
                     sats, hdop, fix,
                     baro_updates_sec, gps_updates_sec,
