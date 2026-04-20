@@ -356,6 +356,23 @@ pub mod config {
     pub fn set_bandwidth(bw_code: u8) -> [u8; 5] {
         write_command(0x1F, bw_code as u16)
     }
+
+    /// CALSW register (0x01) — calibration mode control.
+    /// Writing 0x02 enters magnetic-field calibration mode: the IMU
+    /// accumulates mag samples while the user rotates the sensor
+    /// through all orientations. Exiting the mode (0x00) computes
+    /// and stores the bias coefficients; a subsequent SAVE persists
+    /// them to flash.
+    pub fn start_mag_calibration() -> [u8; 5] {
+        write_command(0x01, 0x0002)
+    }
+
+    /// Exit calibration mode. Computes bias from samples gathered
+    /// since `start_mag_calibration` and holds them in RAM. Send
+    /// SAVE afterwards to persist.
+    pub fn exit_calibration() -> [u8; 5] {
+        write_command(0x01, 0x0000)
+    }
 }
 
 // ---- Startup configuration (runs once at boot over UART TX) ----
@@ -447,29 +464,52 @@ async fn send_sensor_config(
     send_cmd(tx, &SAVE).await;
 }
 
-/// Listen for ~300ms and return true if any valid WT901B packet arrives.
+/// Listen for ~500ms and return true if any valid WT901B packet arrives.
+///
+/// Reads one byte at a time so that a single framing/noise error doesn't
+/// trash a 32-byte window of otherwise-good data — the parser's sync-seek
+/// (WaitSync state) recovers from stray bytes naturally. UART errors are
+/// logged but don't abort the probe; only the deadline does.
 async fn probe_for_data(
     rx: &mut embassy_stm32::usart::UartRx<'_, embassy_stm32::mode::Async>,
 ) -> bool {
-    use embassy_time::{Duration, Timer, Instant};
+    use embassy_time::{Duration, Instant};
 
     let mut parser = Wt901bParser::new();
-    let mut buf = [0u8; 32];
-    let deadline = Instant::now() + Duration::from_millis(300);
+    let mut byte = [0u8; 1];
+    let mut uart_errors: u32 = 0;
+    let mut bytes_seen: u32 = 0;
+    let deadline = Instant::now() + Duration::from_millis(500);
 
     while Instant::now() < deadline {
-        // Use a short read with timeout so we don't block forever
-        let timeout = deadline - Instant::now();
-        match embassy_time::with_timeout(timeout, rx.read(&mut buf)).await {
+        let remaining = deadline - Instant::now();
+        match embassy_time::with_timeout(remaining, rx.read(&mut byte)).await {
             Ok(Ok(())) => {
-                for &byte in &buf {
-                    if parser.push_byte(byte).is_some() {
-                        return true;
-                    }
+                bytes_seen += 1;
+                if parser.push_byte(byte[0]).is_some() {
+                    defmt::info!(
+                        "WT901B probe: valid packet after {} bytes, {} UART errors",
+                        bytes_seen, uart_errors
+                    );
+                    return true;
                 }
             }
-            _ => break, // timeout or error
+            Ok(Err(_)) => {
+                // Framing/noise/overrun — keep probing, peripheral recovers.
+                uart_errors = uart_errors.saturating_add(1);
+            }
+            Err(_) => {
+                // Deadline elapsed during this read.
+                break;
+            }
         }
+    }
+
+    if bytes_seen > 0 || uart_errors > 0 {
+        defmt::info!(
+            "WT901B probe: no valid packet — saw {} bytes, {} UART errors",
+            bytes_seen, uart_errors
+        );
     }
     false
 }

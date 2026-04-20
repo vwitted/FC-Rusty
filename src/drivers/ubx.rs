@@ -406,6 +406,164 @@ pub fn poll_msg(out: &mut [u8], class: u8, id: u8) -> usize {
     build_frame(out, class, id, &[])
 }
 
+// ---- Boot-time configuration ----
+
+/// Target UART baud after `configure()` completes.
+pub const TARGET_BAUD: u32 = 115_200;
+
+/// Factory-default baud rate for u-blox modules.
+pub const FACTORY_BAUD: u32 = 9600;
+
+/// Listen for ~500ms at the current baud and report what was seen.
+///
+/// Distinguishes three outcomes so the caller can decide what to do:
+/// - `Ubx`: a valid UBX frame parsed fully (module already UBX-configured).
+/// - `NmeaOrSync`: we saw a UBX sync byte (0xB5) or an NMEA start ($)
+///   but didn't complete a UBX frame — the module is alive at this
+///   baud but streaming NMEA (factory default on most u-blox units).
+/// - `Silent`: no recognisable GPS bytes within the window (wrong
+///   baud or module silent / misrouted).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ProbeResult { Ubx, NmeaOrSync, Silent }
+
+async fn probe_for_data(
+    rx: &mut embassy_stm32::usart::UartRx<'_, embassy_stm32::mode::Async>,
+) -> ProbeResult {
+    use embassy_time::{Duration, Instant, with_timeout};
+
+    let mut parser = UbxParser::new();
+    let mut buf = [0u8; 64];
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut saw_hint = false;
+
+    while Instant::now() < deadline {
+        let timeout = deadline - Instant::now();
+        match with_timeout(timeout, rx.read(&mut buf)).await {
+            Ok(Ok(())) => {
+                for &byte in &buf {
+                    if parser.push_byte(byte).is_some() {
+                        return ProbeResult::Ubx;
+                    }
+                    // 0xB5 = UBX sync1, '$' = NMEA sentence start.
+                    // Either is strong evidence the module is alive
+                    // at this baud; neither is likely to appear in
+                    // random noise from a baud mismatch.
+                    if byte == SYNC_1 || byte == b'$' {
+                        saw_hint = true;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    if saw_hint { ProbeResult::NmeaOrSync } else { ProbeResult::Silent }
+}
+
+/// Auto-detect the module's current baud and leave the UART at
+/// `TARGET_BAUD` if the module is alive.
+///
+/// - If the module is already at 115200 (persisted from a prior
+///   session, or for some units that ship configured higher):
+///   returns 115200 immediately.
+/// - If at factory 9600: sends CFG-PRT to switch the module to
+///   115200, then bumps the UART to match. u-blox modules change
+///   baud immediately on CFG-PRT acknowledgement (unlike WT901B
+///   which requires a power cycle), so we keep using the new rate
+///   this session. We deliberately do NOT issue CFG-CFG save,
+///   because on some modules the setting doesn't persist across
+///   cold boots reliably — configuring every boot is cheaper than
+///   debugging "why is it 9600 again after unplugging".
+/// - If no data at either baud: logs a warning and returns 0.
+pub async fn configure(
+    tx: &mut embassy_stm32::usart::UartTx<'static, embassy_stm32::mode::Async>,
+    rx: &mut embassy_stm32::usart::UartRx<'static, embassy_stm32::mode::Async>,
+) -> u32 {
+    use embassy_time::{Duration, Timer};
+
+    // Give the module time to boot and start streaming after power-on.
+    Timer::after(Duration::from_millis(500)).await;
+
+    // ---- Phase 1: try TARGET_BAUD first ----
+    tx.set_baudrate(TARGET_BAUD).unwrap();
+    rx.set_baudrate(TARGET_BAUD).unwrap();
+    Timer::after(Duration::from_millis(50)).await;
+
+    match probe_for_data(rx).await {
+        ProbeResult::Ubx => {
+            defmt::info!("GPS: detected UBX at {} baud", TARGET_BAUD);
+            return TARGET_BAUD;
+        }
+        ProbeResult::NmeaOrSync => {
+            defmt::info!(
+                "GPS: alive at {} but emitting NMEA — switching to UBX-only",
+                TARGET_BAUD,
+            );
+            // CFG-PRT carries both baud and outProtoMask; reuse it
+            // to force UBX-only output at the same rate.
+            let mut frame = [0u8; 28];
+            let n = cfg::set_uart_baud(&mut frame, TARGET_BAUD);
+            let _ = tx.write(&frame[..n]).await;
+            Timer::after(Duration::from_millis(100)).await;
+            enable_nav_pvt(tx).await;
+            return TARGET_BAUD;
+        }
+        ProbeResult::Silent => {}
+    }
+
+    // ---- Phase 2: fall back to factory 9600 ----
+    defmt::info!("GPS: no data at {}, trying {}", TARGET_BAUD, FACTORY_BAUD);
+    tx.set_baudrate(FACTORY_BAUD).unwrap();
+    rx.set_baudrate(FACTORY_BAUD).unwrap();
+    Timer::after(Duration::from_millis(50)).await;
+
+    let probe2 = probe_for_data(rx).await;
+    if probe2 == ProbeResult::Silent {
+        defmt::warn!("GPS: no data at {} either — check wiring!", FACTORY_BAUD);
+        return 0;
+    }
+
+    defmt::info!(
+        "GPS: detected at {} ({}), switching module to {} UBX-only",
+        FACTORY_BAUD,
+        if probe2 == ProbeResult::Ubx { "UBX" } else { "NMEA" },
+        TARGET_BAUD,
+    );
+
+    // Send CFG-PRT to change the module's UART1 baud AND restrict
+    // output to UBX (see `set_uart_baud` — outProtoMask = 0x0001).
+    // u-blox modules change rate as soon as the ACK is sent, so we
+    // flip our own UART immediately after.
+    let mut frame = [0u8; 28];
+    let n = cfg::set_uart_baud(&mut frame, TARGET_BAUD);
+    let _ = tx.write(&frame[..n]).await;
+
+    // Drain the ACK at the old rate, then flip our UART.
+    Timer::after(Duration::from_millis(100)).await;
+    tx.set_baudrate(TARGET_BAUD).unwrap();
+    rx.set_baudrate(TARGET_BAUD).unwrap();
+    Timer::after(Duration::from_millis(100)).await;
+
+    // Module is now silent on UBX — factory configs don't enable
+    // any UBX messages by default, only NMEA. Enable NAV-PVT (the
+    // single message our parser consumes) at 1 Hz.
+    enable_nav_pvt(tx).await;
+
+    TARGET_BAUD
+}
+
+/// Enable UBX NAV-PVT (0x01 0x07) at 1 Hz on the current UART.
+async fn enable_nav_pvt(
+    tx: &mut embassy_stm32::usart::UartTx<'static, embassy_stm32::mode::Async>,
+) {
+    use embassy_time::{Duration, Timer};
+    let mut frame = [0u8; 16];
+    // rate=1 means "once per nav solution". CFG-RATE default is 1 Hz.
+    let n = cfg::set_msg_rate(&mut frame, 0x01, 0x07, 1);
+    let _ = tx.write(&frame[..n]).await;
+    Timer::after(Duration::from_millis(50)).await;
+    defmt::info!("GPS: enabled NAV-PVT at nav-solution rate");
+}
+
 // ---- Common configuration commands ----
 
 pub mod cfg {

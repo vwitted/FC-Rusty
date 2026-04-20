@@ -135,6 +135,23 @@ pub async fn run(
                                         ch.channels[0], ch.channels[1],
                                         ch.channels[2], ch.channels[3]);
                                 }
+
+                                // AETR stick check — log ~1 Hz so the user can
+                                // wiggle each stick on the bench and confirm the
+                                // mapping. ch0=A(roll), ch1=E(pitch), ch2=T(thr),
+                                // ch3=R(yaw). Values in µs (988=low, 1500=mid,
+                                // 2012=high).
+                                if pkt_count % 150 == 0 {
+                                    defmt::info!(
+                                        "AETR us: A={} E={} T={} R={} | aux={},{}",
+                                        RcChannels::to_us(ch.channels[0]),
+                                        RcChannels::to_us(ch.channels[1]),
+                                        RcChannels::to_us(ch.channels[2]),
+                                        RcChannels::to_us(ch.channels[3]),
+                                        RcChannels::to_us(ch.channels[4]),
+                                        RcChannels::to_us(ch.channels[5]),
+                                    );
+                                }
                             }
                             CrsfEvent::Link(link) => {
                                 RC_LINK.signal(link);

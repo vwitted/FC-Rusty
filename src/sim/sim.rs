@@ -173,31 +173,31 @@ impl QuadSim {
         // Total thrust (acts along body Z axis, which is "up" in body frame)
         let total_thrust: f32 = thrust_per_motor.iter().sum();
 
-        // Torques from differential thrust (quad-X layout):
-        //   Motor layout (Betaflight):
-        //     M1 (front-right), M2 (rear-left), M3 (front-left), M4 (rear-right)
+        // Torques from differential thrust (quad-X, props-in):
+        //   M1 (rear-right, CW), M2 (front-right, CCW),
+        //   M3 (rear-left, CCW), M4 (front-left, CW)
         //
         //   Roll torque:  (left motors - right motors) * arm_length
         //   Pitch torque: (front motors - rear motors) * arm_length
-        //   Yaw torque:   from motor reaction (CW - CCW) * yaw_coeff
-        //
-        //   M1=FR(CW), M2=RL(CW), M3=FL(CCW), M4=RR(CCW)
+        //   Yaw torque:   (CCW reactions - CW reactions) * yaw_coeff
         let l = p.arm_length;
 
-        let roll_torque = ((thrust_per_motor[2] + thrust_per_motor[1])
-            - (thrust_per_motor[0] + thrust_per_motor[3]))
+        // Left = M3+M4, Right = M1+M2
+        let roll_torque = ((thrust_per_motor[2] + thrust_per_motor[3])
+            - (thrust_per_motor[0] + thrust_per_motor[1]))
             * l;
 
-        let pitch_torque = ((thrust_per_motor[0] + thrust_per_motor[2])
-            - (thrust_per_motor[1] + thrust_per_motor[3]))
+        // Front = M2+M4, Rear = M1+M3
+        let pitch_torque = ((thrust_per_motor[1] + thrust_per_motor[3])
+            - (thrust_per_motor[0] + thrust_per_motor[2]))
             * l;
 
         // Yaw torque from motor reaction:
         //   CW motor → CCW reaction on frame (negative yaw)
         //   CCW motor → CW reaction on frame (positive yaw)
-        // So: yaw_torque = (CCW_sum - CW_sum) * coeff
-        let yaw_torque = ((thrust_per_motor[2] + thrust_per_motor[3])
-            - (thrust_per_motor[0] + thrust_per_motor[1]))
+        // CCW motors = M2 (FR) + M3 (RL); CW motors = M1 (RR) + M4 (FL)
+        let yaw_torque = ((thrust_per_motor[1] + thrust_per_motor[2])
+            - (thrust_per_motor[0] + thrust_per_motor[3]))
             * p.yaw_torque_coeff;
 
         // ---- Angular acceleration (body frame) ----
@@ -376,9 +376,9 @@ mod tests {
             QuadState::hovering(10.0),
         );
 
-        // More thrust on left motors (M2=RL, M3=FL) than right (M1=FR, M4=RR)
+        // More thrust on left motors (M3=RL, M4=FL) than right (M1=RR, M2=FR)
         let roll_right = MotorForces {
-            motors: [0.2, 0.4, 0.4, 0.2],
+            motors: [0.2, 0.2, 0.4, 0.4],
         };
 
         // Run for 0.5 seconds

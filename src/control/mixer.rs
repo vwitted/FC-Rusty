@@ -142,28 +142,36 @@ impl<const N: usize> Mixer<N> {
 
 // ---- Common frame geometries ----
 
-/// Standard quad-X layout (Betaflight motor ordering):
+/// Quad-X, "props-in" (reversed) spin directions, clockwise-from-rear-right numbering:
 ///
 /// ```text
-///     Front
-///   3 (CCW)  1 (CW)
-///       \  /
-///        \/
-///        /\
-///       /  \
-///   2 (CW)  4 (CCW)
-///     Rear
+///       Front
+///   M4 (CW)   M2 (CCW)
+///       \      /
+///        \    /
+///         \  /
+///          \/
+///          /\
+///         /  \
+///        /    \
+///       /      \
+///   M3 (CCW)  M1 (CW)
+///       Rear
 /// ```
 ///
-/// Motor order: [rear-right, front-right, rear-left, front-left]
-/// (Betaflight convention)
+/// Motor order: [rear-right (M1), front-right (M2), rear-left (M3), front-left (M4)]
+///
+/// Yaw sign convention: CW motor → yaw coeff -1, CCW motor → yaw coeff +1.
+/// Positive yaw command rotates airframe CW (viewed from above), which requires
+/// boosting the CCW-spinning motors (their CW reaction torque on the frame drives
+/// positive yaw).
 pub const QUAD_X: Mixer<4> = Mixer {
     //             thrust  roll    pitch   yaw
     mix: [
-        /* M1 FR */ [1.0,  -1.0,   1.0,  -1.0],
-        /* M2 RL */ [1.0,   1.0,  -1.0,  -1.0],
-        /* M3 FL */ [1.0,   1.0,   1.0,   1.0],
-        /* M4 RR */ [1.0,  -1.0,  -1.0,   1.0],
+        /* M1 RR CW  */ [1.0,  -1.0,  -1.0,  -1.0],
+        /* M2 FR CCW */ [1.0,  -1.0,   1.0,   1.0],
+        /* M3 RL CCW */ [1.0,   1.0,  -1.0,   1.0],
+        /* M4 FL CW  */ [1.0,   1.0,   1.0,  -1.0],
     ],
 };
 
@@ -194,10 +202,10 @@ mod tests {
             yaw: 0.0,
         };
         let out = QUAD_X.apply(&demand);
-        // Roll positive: left motors higher, right motors lower
-        // M3 (FL) and M2 (RL) should be > M1 (FR) and M4 (RR)
-        assert!(out.motors[2] > out.motors[0]); // FL > FR
-        assert!(out.motors[1] > out.motors[3]); // RL > RR
+        // Roll positive: left motors higher, right motors lower.
+        // M3 (RL) and M4 (FL) should be > M1 (RR) and M2 (FR).
+        assert!(out.motors[2] > out.motors[0]); // RL > RR
+        assert!(out.motors[3] > out.motors[1]); // FL > FR
     }
 
     #[test]
@@ -228,18 +236,18 @@ mod tests {
         };
         let out = QUAD_X.apply(&demand);
 
-        // QUAD_X roll coefficients: M1/M4 have roll=-1, M2/M3 have roll=+1.
+        // QUAD_X roll coefficients: M1/M2 (right) have roll=-1, M3/M4 (left) have roll=+1.
         // Raw values would be:
-        //   M1 FR = 0.1 - 0.3 = -0.2
-        //   M2 RL = 0.1 + 0.3 = +0.4
-        //   M3 FL = 0.1 + 0.3 = +0.4
-        //   M4 RR = 0.1 - 0.3 = -0.2
+        //   M1 RR = 0.1 - 0.3 = -0.2
+        //   M2 FR = 0.1 - 0.3 = -0.2
+        //   M3 RL = 0.1 + 0.3 = +0.4
+        //   M4 FL = 0.1 + 0.3 = +0.4
         // range = 0.4 - (-0.2) = 0.6, fits in [0, 1].
         // Airmode shifts by +0.2 so min = 0.0:
-        //   M1 = 0.0, M2 = 0.6, M3 = 0.6, M4 = 0.0
-        // Differential M2 - M1 should still be exactly 0.6, the original
-        // torque signal.
-        let differential = out.motors[1] - out.motors[0];
+        //   M1 = 0.0, M2 = 0.0, M3 = 0.6, M4 = 0.6
+        // Left-right differential (M3 - M1) should still be exactly 0.6,
+        // the original torque signal.
+        let differential = out.motors[2] - out.motors[0];
         assert!(
             (differential - 0.6).abs() < 1e-5,
             "roll differential should be preserved at 0.6, got {}",
@@ -264,17 +272,17 @@ mod tests {
         let out = QUAD_X.apply(&demand);
         let mean: f32 = out.motors.iter().sum::<f32>() / (out.motors.len() as f32);
 
-        // With the raw motors at [-0.4, +0.6, +0.6, -0.4], airmode shifts
-        // by +0.4 to make the min 0. New outputs: [0.0, 1.0, 1.0, 0.0],
-        // mean = 0.5. That's larger than the commanded thrust of 0.1, but
-        // it's the unavoidable consequence of demanding 100% torque
-        // authority on an axis — the point is that the torque differential
-        // (1.0) is preserved, which is what airmode prioritises. A test
-        // with a smaller torque demand shows the effect more cleanly.
+        // With the raw motors at [-0.4, -0.4, +0.6, +0.6] (right, right,
+        // left, left), airmode shifts by +0.4 to make the min 0. New
+        // outputs: [0.0, 0.0, 1.0, 1.0], mean = 0.5. That's larger than
+        // the commanded thrust of 0.1, but it's the unavoidable consequence
+        // of demanding 100% torque authority on an axis — the point is
+        // that the torque differential (1.0) is preserved, which is what
+        // airmode prioritises.
         assert!(
-            (out.motors[1] - out.motors[0] - 1.0).abs() < 1e-5,
+            (out.motors[2] - out.motors[0] - 1.0).abs() < 1e-5,
             "full-authority roll torque should be preserved, got {}",
-            out.motors[1] - out.motors[0],
+            out.motors[2] - out.motors[0],
         );
         // Sanity: mean motor output fits inside [0, 1] and nothing is NaN
         assert!(mean >= 0.0 && mean <= 1.0);

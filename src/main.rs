@@ -1,15 +1,21 @@
 // main.rs — Flight controller entry point
 //
 // Target: STM32F722RET6 (216 MHz, Cortex-M7F, 64-pin LQFP)
-// Board:  SpeedyBee F7 V3 (30×30 stack with BL32 50A 4-in-1 ESC)
+// Board:  Radiolink F722 (after the SpeedyBee F7 V3 suffered a dead
+//         5V BEC during IMU rework — see git log for context)
 // Framework: Embassy async executor
 //
-// Pin map (SpeedyBee F7 V3):
-//   USART1  TX=PA9              → T1 pad, defmt output (raw-reg logger)
+// Pin map (Radiolink F722):
+//   USART1  TX=PA9   RX=PA10    → T1/R1 pads, WT901B IMU (full duplex)
 //   USART2  RX=PA3              → R2 pad, CRSF receiver (416666 baud)
-//   USART3  TX=PB10  RX=PB11    → T3/R3 pads, WT901B IMU
+//   USART3  TX=PB10             → T3 pad, defmt output (raw-reg logger, 115200)
 //   USART6  TX=PC6   RX=PC7     → T6/R6 pads, GPS (UBX binary)
 //   UART4   RX=PA1              → ESC telemetry (internal, not wired yet)
+//
+// The onboard ICM-42688P (SPI1) and baro (BMP280 on I2C1) are unused
+// for now; WT901B over UART remains the primary IMU. Moving to the
+// SPI IMU is a post-Alpha optimisation (would need a new driver plus
+// an AHRS filter to recover Euler angles).
 //
 // Motors (multi-timer DShot600 via three parallel DMA streams):
 //   TIM2_CH1 → PA15 → M1 (rear-right,  CW)
@@ -57,7 +63,7 @@ mod rc_task;
 use drivers::crsf::RcChannels;
 use drivers::dshot::{DshotFrame, DshotSpeed};
 use drivers::dshot_hw::DshotQuad;
-use drivers::ubx::{UbxParser, GpsData};
+use drivers::nmea::{NmeaParser, GpsData};
 use drivers::wt901b::{Wt901bParser, ImuData};
 use control::arming::{ArmingStateMachine, ArmState};
 use control::mixer::{ControlDemand, QUAD_X};
@@ -67,11 +73,11 @@ use control::altitude::{AltitudeController, AltitudeGains};
 
 // ---- Interrupt bindings ----
 
-// USART1 is owned by `logger::init_usart1()` (raw register TX for defmt)
+// USART3 is owned by `logger::init_usart3()` (raw register TX for defmt)
 // — no Embassy interrupt handler needed here.
 bind_interrupts!(struct Irqs {
+    USART1 => usart::InterruptHandler<peripherals::USART1>;
     USART2 => usart::InterruptHandler<peripherals::USART2>;
-    USART3 => usart::InterruptHandler<peripherals::USART3>;
     USART6 => usart::InterruptHandler<peripherals::USART6>;
 });
 
@@ -83,6 +89,20 @@ static IMU_DATA: Signal<CriticalSectionRawMutex, ImuData> = Signal::new();
 
 /// Latest GPS data from the GPS task
 static GPS_DATA: Signal<CriticalSectionRawMutex, GpsData> = Signal::new();
+
+/// Commands from the control loop to the IMU command task (TX side).
+/// Used for in-field magnetometer calibration via AUX channel.
+#[derive(Clone, Copy)]
+enum ImuCommand {
+    /// Enter mag-field calibration mode (CALSW=0x02, unlocked).
+    StartMagCal,
+    /// Exit calibration mode and persist bias to flash.
+    SaveMagCal,
+    /// Exit calibration mode without saving.
+    AbortMagCal,
+}
+
+static IMU_COMMAND: Signal<CriticalSectionRawMutex, ImuCommand> = Signal::new();
 
 // RC signals are defined in rc_task.rs:
 // rc_task::RC_CHANNELS, rc_task::RC_LINK, rc_task::RC_LAST_SEEN
@@ -123,14 +143,14 @@ async fn main(spawner: Spawner) {
 
     let p = embassy_stm32::init(config);
 
-    // Bring up USART1 TX (PA9) for defmt output before anything else
+    // Bring up USART3 TX (PB10) for defmt output before anything else
     // so the first defmt::info! below actually lands on the wire.
-    logger::init_usart1();
+    logger::init_usart3();
 
     defmt::info!("Flight controller starting");
 
     // ---- Configure and spawn the RC receiver task ----
-    // CRSF on USART2 RX (PA3), 416666 baud — T2/R2 pads on the F7 V3.
+    // CRSF on USART2 RX (PA3), 416666 baud — R2 pad on the Radiolink F722.
     let rc_uart = UartRx::new(
         p.USART2,
         Irqs,
@@ -142,8 +162,9 @@ async fn main(spawner: Spawner) {
     spawner.spawn(rc_task::run(rc_uart)).unwrap();
     defmt::info!("RC task spawned");
 
-    // ---- WT901B IMU on USART3 ----
-    // Start at factory 9600 baud, configure over UART, then switch to 115200.
+    // ---- WT901B IMU on USART1 (full duplex) ----
+    // Start at factory 9600 baud, configure over UART, then switch
+    // to 115200. TX=PA9 (T1 pad), RX=PA10 (R1 pad).
     let imu_uart_config = {
         let mut c = usart::Config::default();
         c.baudrate = 9600;
@@ -151,29 +172,32 @@ async fn main(spawner: Spawner) {
     };
 
     let imu_uart = Uart::new(
-        p.USART3,
-        p.PB11,          // RX
-        p.PB10,          // TX
+        p.USART1,
+        p.PA10,          // RX
+        p.PA9,           // TX
         Irqs,
-        p.DMA1_CH3,      // TX DMA
-        p.DMA1_CH1,      // RX DMA
+        p.DMA2_CH7,      // USART1_TX → DMA2 Stream 7
+        p.DMA2_CH2,      // USART1_RX → DMA2 Stream 2
         imu_uart_config,
     ).unwrap();
 
-    // Split into TX+RX, auto-detect baud + configure, then drop TX
+    // Split into TX+RX, auto-detect baud + configure. Hand TX to a
+    // dedicated command task so the control loop can trigger in-field
+    // mag calibration over AUX channel 7 (see imu_command_task).
     let (mut imu_tx, mut imu_rx) = imu_uart.split();
     let imu_baud = drivers::wt901b::configure(&mut imu_tx, &mut imu_rx).await;
-    drop(imu_tx);
 
     spawner.spawn(imu_task(imu_rx)).unwrap();
+    spawner.spawn(imu_command_task(imu_tx)).unwrap();
     defmt::info!("IMU task spawned at {} baud", imu_baud);
 
     // ---- Configure and spawn the GPS task ----
-    // GPS on USART6 TX=PC6 RX=PC7
-    // WS-M181 outputs UBX binary at 115200 baud.
+    // GPS on USART6 TX=PC6 RX=PC7 at factory 9600 baud, speaking
+    // factory-default NMEA. We parse NMEA directly — no module
+    // reconfiguration required. See `drivers::nmea`.
     let gps_uart_config = {
         let mut c = usart::Config::default();
-        c.baudrate = 115200;
+        c.baudrate = 9600;
         c
     };
 
@@ -189,7 +213,7 @@ async fn main(spawner: Spawner) {
 
     let (_gps_tx, gps_rx) = gps_uart.split();
     spawner.spawn(gps_task(gps_rx)).unwrap();
-    defmt::info!("GPS task spawned");
+    defmt::info!("GPS task spawned (NMEA at 9600)");
 
     // ---- DShot ESC outputs (multi-timer across TIM2/TIM3/TIM4) ----
     // M1=PA15 (TIM2_CH1), M2=PB3 (TIM2_CH2),
@@ -212,48 +236,48 @@ async fn main(spawner: Spawner) {
 }
 
 // ---- GPS Task ----
-// Reads UBX binary frames from the GPS module, publishes via GPS_DATA signal.
+// Reads NMEA sentences from the GPS module, publishes via GPS_DATA signal.
 
 #[embassy_executor::task]
 async fn gps_task(
     mut rx: UartRx<'static, embassy_stm32::mode::Async>,
 ) {
-    let mut parser = UbxParser::new();
-    let mut buf = [0u8; 128]; // NAV-PVT frame is ~100 bytes
-    let mut pkt_count: u32 = 0;
+    let mut parser = NmeaParser::new();
+    let mut buf = [0u8; 128];
+    let mut sentence_count: u32 = 0;
     let mut last_report = Instant::now();
+    let mut announced_first = false;
 
-    defmt::info!("GPS task started (UBX binary)");
+    defmt::info!("GPS task started (NMEA)");
 
     loop {
         match rx.read(&mut buf).await {
             Ok(()) => {
                 for &byte in &buf {
                     if parser.push_byte(byte).is_some() {
-                        pkt_count += 1;
+                        sentence_count += 1;
                         GPS_DATA.signal(parser.data);
 
-                        if pkt_count == 1 {
+                        if !announced_first {
                             defmt::info!(
-                                "GPS first fix! type={} sats={} lat={:?} lon={:?}",
-                                parser.data.fix_type as u8,
-                                parser.data.satellites,
-                                parser.data.latitude as f32,
-                                parser.data.longitude as f32,
+                                "GPS: first NMEA sentence parsed — stream is alive"
                             );
+                            announced_first = true;
                         }
 
-                        // Report GPS stats every 5 seconds
+                        // Report GPS stats every 5 seconds, regardless of fix.
                         let now = Instant::now();
                         if now.duration_since(last_report) >= Duration::from_secs(5) {
                             defmt::info!(
-                                "GPS: {} pkts, type={} sats={} hacc={:?}m lat={:?} lon={:?}",
-                                pkt_count,
-                                parser.data.fix_type as u8,
+                                "GPS: {} sentences, fix={} mode={} sats={} hdop={:?} lat={:?} lon={:?} alt={:?}m",
+                                sentence_count,
+                                parser.data.fix as u8,
+                                parser.data.fix_mode as u8,
                                 parser.data.satellites,
-                                parser.data.h_acc_m,
+                                parser.data.hdop,
                                 parser.data.latitude as f32,
                                 parser.data.longitude as f32,
+                                parser.data.altitude_m,
                             );
                             last_report = now;
                         }
@@ -282,12 +306,32 @@ async fn imu_task(
     let mut buf = [0u8; 32];
     let mut pkt_count: u32 = 0;
 
+    // =========================================================================
+    // TEMP DEBUG — IMU framing diagnosis on Radiolink F722 (2026-04-20)
+    // Remove this entire block once soldering / framing is confirmed good.
+    // Look for: `// END TEMP DEBUG` marker below.
+    // =========================================================================
+    let mut read_count: u32 = 0;
+    let mut bytes_since_report: u32 = 0;
+    let mut pkts_since_report: u32 = 0;
+    let mut last_report = embassy_time::Instant::now();
+    // END TEMP DEBUG (part 1/3)
+
     loop {
         match rx.read(&mut buf).await {
             Ok(()) => {
+                // TEMP DEBUG (part 2/3) — remove with part 1 & 3
+                read_count += 1;
+                bytes_since_report += buf.len() as u32;
+                if read_count % 50 == 0 {
+                    defmt::info!("[IMU-DEBUG] raw[0..16]: {=[u8]:02x}", buf[..16]);
+                }
+                // END TEMP DEBUG (part 2/3)
+
                 for &byte in &buf {
                     if parser.push_byte(byte).is_some() {
                         pkt_count += 1;
+                        pkts_since_report += 1; // TEMP DEBUG
                         IMU_DATA.signal(parser.data);
 
                         // Log first successful packet so we know it's alive
@@ -300,10 +344,65 @@ async fn imu_task(
                         }
                     }
                 }
+
+                // TEMP DEBUG (part 3/3) — remove with part 1 & 2
+                if last_report.elapsed() >= Duration::from_secs(1) {
+                    defmt::info!(
+                        "[IMU-DEBUG] 1s window: {} bytes, {} pkts parsed (total {})",
+                        bytes_since_report, pkts_since_report, pkt_count
+                    );
+                    bytes_since_report = 0;
+                    pkts_since_report = 0;
+                    last_report = embassy_time::Instant::now();
+                }
+                // END TEMP DEBUG (part 3/3)
             }
             Err(e) => {
                 defmt::warn!("IMU UART error: {:?}", e);
                 embassy_time::Timer::after(Duration::from_millis(1)).await;
+            }
+        }
+    }
+}
+
+// ---- IMU Command Task ----
+// Owns the WT901B's UART TX half and dispatches mag-cal commands
+// posted to IMU_COMMAND from the control loop. Each command waits
+// 200 ms between bytes (WT901B datasheet requirement) before
+// returning, so this task must NOT be on the control-loop's
+// critical path — which is why it lives here, not inline.
+
+#[embassy_executor::task]
+async fn imu_command_task(
+    mut tx: usart::UartTx<'static, embassy_stm32::mode::Async>,
+) {
+    use drivers::wt901b::{config, SAVE, UNLOCK};
+    use embassy_time::Timer;
+
+    let step = Duration::from_millis(200);
+
+    loop {
+        let cmd = IMU_COMMAND.wait().await;
+        match cmd {
+            ImuCommand::StartMagCal => {
+                let _ = tx.write(&UNLOCK).await;
+                Timer::after(step).await;
+                let _ = tx.write(&config::start_mag_calibration()).await;
+                Timer::after(step).await;
+            }
+            ImuCommand::SaveMagCal => {
+                let _ = tx.write(&UNLOCK).await;
+                Timer::after(step).await;
+                let _ = tx.write(&config::exit_calibration()).await;
+                Timer::after(step).await;
+                let _ = tx.write(&SAVE).await;
+                Timer::after(step).await;
+            }
+            ImuCommand::AbortMagCal => {
+                let _ = tx.write(&UNLOCK).await;
+                Timer::after(step).await;
+                let _ = tx.write(&config::exit_calibration()).await;
+                Timer::after(step).await;
             }
         }
     }
@@ -351,6 +450,16 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
     let mut last_gps = GpsData::new();
     let mut imu_last_seen = Instant::now();
     let mut control_demand = ControlDemand::default();
+
+    // ---- Magnetometer calibration state (AUX ch7) ----
+    // Switch high = enter cal mode; switch low = save if held >10s,
+    // otherwise abort. `ch7_seen_low` guards against accidental start
+    // when the user boots with the switch already high.
+    const MAG_CAL_CH7_HI: u16 = 1500;
+    const MAG_CAL_MIN_SECS: u64 = 10;
+    let mut last_ch7_high = false;
+    let mut ch7_seen_low = false;
+    let mut mag_cal_start: Option<Instant> = None;
 
     // ---- Loop timing instrumentation ----
     // Tracks how long each control loop iteration takes.
@@ -439,6 +548,49 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
                 imu_age_ms, rc_age_ms,
                 last_rc.channels[4], last_rc.channels[5],
             );
+        }
+
+        // ---- 2b. Mag calibration edge detection on AUX ch7 ----
+        let ch7_high = last_rc.channels[6] > MAG_CAL_CH7_HI;
+        if !ch7_high {
+            ch7_seen_low = true;
+        }
+        let ch7_rising = ch7_high && !last_ch7_high && ch7_seen_low;
+        let ch7_falling = !ch7_high && last_ch7_high;
+        last_ch7_high = ch7_high;
+
+        if ch7_rising && mag_cal_start.is_none() {
+            if armed {
+                defmt::warn!("MAG CAL: ignored — disarm first");
+            } else if throttle_raw > 0.05 {
+                defmt::warn!("MAG CAL: ignored — throttle not idle");
+            } else {
+                mag_cal_start = Some(Instant::now());
+                defmt::info!(
+                    "MAG CAL: START — rotate through all axes for >{}s, flip ch7 low to save",
+                    MAG_CAL_MIN_SECS,
+                );
+                IMU_COMMAND.signal(ImuCommand::StartMagCal);
+            }
+        }
+
+        if ch7_falling {
+            if let Some(start) = mag_cal_start.take() {
+                let secs = start.elapsed().as_secs();
+                if secs >= MAG_CAL_MIN_SECS {
+                    defmt::info!("MAG CAL: saved after {}s", secs);
+                    IMU_COMMAND.signal(ImuCommand::SaveMagCal);
+                } else {
+                    defmt::warn!("MAG CAL: too short ({}s), not saved", secs);
+                    IMU_COMMAND.signal(ImuCommand::AbortMagCal);
+                }
+            }
+        }
+
+        if let Some(start) = mag_cal_start {
+            if cycle_count % 200 == 0 {
+                defmt::info!("MAG CAL: rotating... {}s", start.elapsed().as_secs());
+            }
         }
 
         // ---- 3. Control computation ----

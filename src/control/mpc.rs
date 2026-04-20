@@ -164,11 +164,14 @@ impl AttitudeMpc {
             .expect("MPC policy computation failed — check A, B, Q, R");
 
         let mut solver = MpcSolver::new(a, b, policy);
-        // max_iter 50 matches the tinympc-rs library default.
-        // We have plenty of timing headroom (control loop avg ~61us
-        // out of 5000us, and MPC only runs every 4th cycle at 50 Hz),
-        // so there's no reason to undercut the library default here.
-        solver.config.max_iter = 50;
+        // On the STM32F407 (168 MHz, no SIMD, software sqrt), each
+        // ADMM iteration costs ~240us. 50 iters = 12ms, blowing the
+        // 5ms 200Hz budget on cycles where MPC runs. 10 caps solve
+        // time at ~2.5ms, which leaves room for PID + mixer on the
+        // same cycle. Attitude tracking is ~100Hz bandwidth so partial
+        // convergence is fine — the next solve 20ms later continues
+        // from a warm start anyway.
+        solver.config.max_iter = 10;
         solver.config.do_check = 1;
 
         // ---- Constraints ----
