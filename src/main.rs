@@ -46,6 +46,7 @@ mod drivers {
     pub mod crsf;
     pub mod dshot;
     pub mod dshot_hw;
+    pub mod icm42688;
     pub mod nmea;
     pub mod ubx;
     pub mod wt901b;
@@ -57,14 +58,20 @@ mod control {
     pub mod mpc;
     pub mod pid;
 }
+mod attitude_mekf;
 mod logger;
 mod rc_task;
 
 use drivers::crsf::RcChannels;
 use drivers::dshot::{DshotFrame, DshotSpeed};
 use drivers::dshot_hw::DshotQuad;
+use drivers::icm42688::RawImu;
 use drivers::nmea::{NmeaParser, GpsData};
-use drivers::wt901b::{Wt901bParser, ImuData};
+use drivers::wt901b::{
+    Wt901bParser, ImuData,
+    UPDATED_ACCEL, UPDATED_GYRO, UPDATED_ANGLE, UPDATED_QUAT,
+};
+use attitude_mekf::{AttitudeMekf, MekfParams, G_MPS2};
 use control::arming::{ArmingStateMachine, ArmState};
 use control::mixer::{ControlDemand, QUAD_X};
 use control::pid::{PidGains, PidLimits, RatePidController};
@@ -84,8 +91,19 @@ bind_interrupts!(struct Irqs {
 // ---- Shared state between tasks ----
 // Signals are "latest value wins" — perfect for real-time sensor data.
 
-/// Latest IMU data from the WT901B task
+/// Latest IMU data from the WT901B task (fused angles + raw rates).
 static IMU_DATA: Signal<CriticalSectionRawMutex, ImuData> = Signal::new();
+
+/// Latest raw samples from the ICM-42688P task (body-frame NED).
+/// Phase 2: populated at ~8 kHz, not yet consumed by the control loop.
+/// Phase 3 (MEKF) will consume this and republish to IMU_DATA.
+static RAW_IMU: Signal<CriticalSectionRawMutex, RawImu> = Signal::new();
+
+/// Counters for the ICM monitor task. Live regardless of whether the
+/// read task is making progress, so a silent INT pin still shows up
+/// as `0 samples/s, 0 errors/s` instead of no log at all.
+static ICM_SAMPLES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static ICM_ERRORS:  core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Latest GPS data from the GPS task
 static GPS_DATA: Signal<CriticalSectionRawMutex, GpsData> = Signal::new();
@@ -190,6 +208,44 @@ async fn main(spawner: Spawner) {
     spawner.spawn(imu_task(imu_rx)).unwrap();
     spawner.spawn(imu_command_task(imu_tx)).unwrap();
     defmt::info!("IMU task spawned at {} baud", imu_baud);
+
+    // ---- ICM-42688P on SPI1 (Phase 2: 8 kHz INT-driven reads) ----
+    // SCK=PA5, MISO=PA6, MOSI=PA7, CS=PB2, INT1=PC4.
+    // SPI @ 10 MHz target (embassy picks nearest ≤: 6.75 MHz on APB2).
+    {
+        use embassy_stm32::spi::{Config as SpiConfig, Spi};
+        use embassy_stm32::gpio::{Level, Output, Pull, Speed};
+        use embassy_stm32::exti::ExtiInput;
+        use embassy_stm32::time::Hertz;
+
+        let mut spi_cfg = SpiConfig::default();
+        spi_cfg.frequency = Hertz(10_000_000);
+
+        let spi = Spi::new(
+            p.SPI1,
+            p.PA5,           // SCK
+            p.PA7,           // MOSI
+            p.PA6,           // MISO
+            p.DMA2_CH3,      // SPI1_TX (ch3)
+            p.DMA2_CH0,      // SPI1_RX (ch3)
+            spi_cfg,
+        );
+
+        let cs   = Output::new(p.PB2, Level::High, Speed::VeryHigh);
+        let drdy = ExtiInput::new(p.PC4, p.EXTI4, Pull::None);
+
+        match drivers::icm42688::Icm42688::new(spi, cs).await {
+            Ok(imu) => {
+                defmt::info!("ICM-42688P initialised OK");
+                spawner.spawn(icm_read_task(imu, drdy)).unwrap();
+                spawner.spawn(icm_monitor_task()).unwrap();
+                spawner.spawn(mekf_task()).unwrap();
+            }
+            Err(e) => {
+                defmt::error!("ICM-42688P init failed: {:?}", e);
+            }
+        }
+    }
 
     // ---- Configure and spawn the GPS task ----
     // GPS on USART6 TX=PC6 RX=PC7 at factory 9600 baud, speaking
@@ -361,6 +417,199 @@ async fn imu_task(
                 defmt::warn!("IMU UART error: {:?}", e);
                 embassy_time::Timer::after(Duration::from_millis(1)).await;
             }
+        }
+    }
+}
+
+// ---- ICM-42688P Read Task (Phase 2: INT-driven 8 kHz) ----
+// Waits on rising edge of DRDY (INT1 → PC4), reads the 14-byte data
+// block, and publishes the RawImu to RAW_IMU. Not yet wired into the
+// control loop — Phase 3 (MEKF) will consume RAW_IMU.
+//
+// Logs sample rate + one representative packet every second so we
+// can see the INT pipeline is alive and hitting the expected ~8 kHz.
+
+#[embassy_executor::task]
+async fn icm_read_task(
+    mut imu:  drivers::icm42688::Icm42688<'static>,
+    mut drdy: embassy_stm32::exti::ExtiInput<'static>,
+) {
+    use core::sync::atomic::Ordering;
+    defmt::info!("ICM read task started (INT-driven)");
+
+    loop {
+        drdy.wait_for_rising_edge().await;
+        match imu.read_raw().await {
+            Ok(r) => {
+                RAW_IMU.signal(r);
+                ICM_SAMPLES.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                ICM_ERRORS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+// ---- ICM Monitor Task ----
+// Runs on a 1 Hz ticker independently of the read task, so we see
+// sample/error counters even if the read task is stuck (e.g. INT pin
+// not firing). Also logs one representative sample from RAW_IMU so
+// the scaled values can be eyeballed without interleaving with reads.
+
+#[embassy_executor::task]
+async fn icm_monitor_task() {
+    use core::sync::atomic::Ordering;
+    let mut ticker = Ticker::every(Duration::from_secs(1));
+    loop {
+        ticker.next().await;
+        let s = ICM_SAMPLES.swap(0, Ordering::Relaxed);
+        let e = ICM_ERRORS.swap(0, Ordering::Relaxed);
+        match RAW_IMU.try_take() {
+            Some(r) => {
+                let a = r.accel_g();
+                let g = r.gyro_dps();
+                defmt::info!(
+                    "ICM {} samples/s, {} errors/s — a=[{=f32},{=f32},{=f32}]g g=[{=f32},{=f32},{=f32}]dps T={=f32}C",
+                    s, e, a[0], a[1], a[2], g[0], g[1], g[2], r.temp_c(),
+                );
+            }
+            None => {
+                defmt::info!("ICM {} samples/s, {} errors/s — no RAW_IMU payload", s, e);
+            }
+        }
+    }
+}
+
+// ---- MEKF Task (Phase 3) ----
+// Consumes ICM-42688P raw samples at 8 kHz, runs the 6-state error-state
+// Kalman filter (3 attitude + 3 gyro bias), and republishes the fused
+// result to IMU_DATA so the existing control loop picks it up with no
+// consumer-side changes. See src/attitude_mekf.rs for the math.
+//
+// Rate scheduling:
+//   - Predict runs every sample (8 kHz, ~125 µs) using RAW_IMU gyro.
+//   - Accel gravity update runs every `ACCEL_DECIMATION`-th sample
+//     (default 80 → 100 Hz). Accel is noisy and low-bandwidth; updating
+//     at full rate wastes cycles and amplifies vibration-induced drift.
+//
+// Output conventions match the old WT901B producer so the control loop
+// is agnostic to which sensor is driving IMU_DATA:
+//   - ImuData.accel  in m/s² (ICM g × 9.80665 at the boundary)
+//   - ImuData.gyro   in °/s, bias-corrected
+//   - ImuData.angle  Euler roll/pitch/yaw in degrees, from the filter
+//   - ImuData.quaternion as [w, x, y, z], body→nav
+//   - ImuData.altitude_cm / pressure / mag are zero — baro will be
+//     fused in a separate task (Phase 4); mag is unused for now.
+
+#[embassy_executor::task]
+async fn mekf_task() {
+    use core::f32::consts::PI;
+    const DEG2RAD: f32 = PI / 180.0;
+    const RAD2DEG: f32 = 180.0 / PI;
+    // 8 kHz predict / 100 Hz update → 80:1 decimation. Tune if accel
+    // vibration at ODR aliases into the update band.
+    const ACCEL_DECIMATION: u32 = 80;
+
+    defmt::info!("MEKF task started — waiting for first RAW_IMU sample");
+
+    let mut mekf = AttitudeMekf::new(MekfParams::default());
+
+    // Seed attitude from the first accel reading (assumes the board
+    // is stationary at boot — a 50 ms power-on settle inside the
+    // ICM driver plus the tasks-spawning delay covers this in practice).
+    let first = RAW_IMU.wait().await;
+    mekf.initialize_from_accel(first.accel_g());
+    defmt::info!(
+        "MEKF seeded: euler=[{=f32},{=f32},{=f32}]deg",
+        mekf.euler()[0] * RAD2DEG,
+        mekf.euler()[1] * RAD2DEG,
+        mekf.euler()[2] * RAD2DEG,
+    );
+
+    let mut last_predict = Instant::now();
+    let mut sample_count: u32 = 0;
+    let mut last_report = Instant::now();
+    let mut updates_applied: u32 = 0;
+    let mut updates_rejected: u32 = 0;
+
+    loop {
+        let raw = RAW_IMU.wait().await;
+
+        let now = Instant::now();
+        // Clamp dt to sane bounds — a missed sample stretches dt to
+        // ~250 µs which the filter handles; anything beyond 2 ms is a
+        // stall we shouldn't integrate through.
+        let dt_us = (now - last_predict).as_micros() as f32;
+        let dt = (dt_us * 1.0e-6).clamp(50.0e-6, 2.0e-3);
+        last_predict = now;
+
+        let g_dps = raw.gyro_dps();
+        let gyro_rad = [
+            g_dps[0] * DEG2RAD,
+            g_dps[1] * DEG2RAD,
+            g_dps[2] * DEG2RAD,
+        ];
+        mekf.predict(gyro_rad, dt);
+
+        if sample_count % ACCEL_DECIMATION == 0 {
+            if mekf.update_accel(raw.accel_g()) {
+                updates_applied = updates_applied.wrapping_add(1);
+            } else {
+                updates_rejected = updates_rejected.wrapping_add(1);
+            }
+        }
+        sample_count = sample_count.wrapping_add(1);
+
+        // Bias-corrected gyro in °/s — this is what downstream PID expects.
+        let bias_rad = mekf.bias();
+        let gyro_corr_dps = [
+            (gyro_rad[0] - bias_rad[0]) * RAD2DEG,
+            (gyro_rad[1] - bias_rad[1]) * RAD2DEG,
+            (gyro_rad[2] - bias_rad[2]) * RAD2DEG,
+        ];
+
+        let a_g = raw.accel_g();
+        let euler_rad = mekf.euler();
+        let imu = ImuData {
+            accel: [a_g[0] * G_MPS2, a_g[1] * G_MPS2, a_g[2] * G_MPS2],
+            temperature: raw.temp_c(),
+            gyro: gyro_corr_dps,
+            angle: [
+                euler_rad[0] * RAD2DEG,
+                euler_rad[1] * RAD2DEG,
+                euler_rad[2] * RAD2DEG,
+            ],
+            mag: [0; 3],
+            pressure: 0,
+            altitude_cm: 0,
+            quaternion: mekf.quaternion(),
+            updated: UPDATED_ACCEL | UPDATED_GYRO | UPDATED_ANGLE | UPDATED_QUAT,
+        };
+        IMU_DATA.signal(imu);
+
+        // 1 Hz health log. Includes sample count (should be ~8000),
+        // fused Euler so we can see tilt test output live, and bias
+        // magnitude so we can watch bias converge.
+        if (now - last_report) >= Duration::from_secs(1) {
+            let b_dps_mag = libm::sqrtf(
+                (bias_rad[0] * RAD2DEG) * (bias_rad[0] * RAD2DEG)
+              + (bias_rad[1] * RAD2DEG) * (bias_rad[1] * RAD2DEG)
+              + (bias_rad[2] * RAD2DEG) * (bias_rad[2] * RAD2DEG),
+            );
+            defmt::info!(
+                "MEKF {} samples/s, upd={}/{}rej, euler=[{=f32},{=f32},{=f32}]deg, |bias|={=f32}dps",
+                sample_count,
+                updates_applied, updates_rejected,
+                euler_rad[0] * RAD2DEG,
+                euler_rad[1] * RAD2DEG,
+                euler_rad[2] * RAD2DEG,
+                b_dps_mag,
+            );
+            sample_count = 0;
+            updates_applied = 0;
+            updates_rejected = 0;
+            last_report = now;
         }
     }
 }

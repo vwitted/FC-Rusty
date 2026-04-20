@@ -25,6 +25,8 @@ pub mod drivers {
 
 pub mod estimation;
 
+pub mod attitude_mekf;
+
 pub mod sim {
     #[path = "sim.rs"]
     mod sim;
