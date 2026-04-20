@@ -43,6 +43,7 @@ use panic_probe as _; // panic handler that works with probe
 
 // Our modules
 mod drivers {
+    pub mod baro;
     pub mod crsf;
     pub mod dshot;
     pub mod dshot_hw;
@@ -72,6 +73,7 @@ use drivers::wt901b::{
     UPDATED_ACCEL, UPDATED_GYRO, UPDATED_ANGLE, UPDATED_QUAT,
 };
 use attitude_mekf::{AttitudeMekf, MekfParams, G_MPS2};
+use drivers::baro::BaroSample;
 use control::arming::{ArmingStateMachine, ArmState};
 use control::mixer::{ControlDemand, QUAD_X};
 use control::pid::{PidGains, PidLimits, RatePidController};
@@ -107,6 +109,11 @@ static ICM_ERRORS:  core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU3
 
 /// Latest GPS data from the GPS task
 static GPS_DATA: Signal<CriticalSectionRawMutex, GpsData> = Signal::new();
+
+/// Latest baro sample (pressure_pa + temperature_c) from the baro task.
+/// Not yet consumed by the control loop — altitude conversion + KF
+/// integration lands in a follow-up commit once the raw values look sane.
+static BARO_DATA: Signal<CriticalSectionRawMutex, BaroSample> = Signal::new();
 
 /// Commands from the control loop to the IMU command task (TX side).
 /// Used for in-field magnetometer calibration via AUX channel.
@@ -245,6 +252,28 @@ async fn main(spawner: Spawner) {
                 defmt::error!("ICM-42688P init failed: {:?}", e);
             }
         }
+    }
+
+    // ---- Baro on I2C1 (DPS310 or BMP280, auto-detected) ----
+    // SCL=PB8, SDA=PB9. Blocking mode — DMA1 CH6/CH7 (the only I2C1
+    // TX options on F722) are already claimed by DShot, and baro I/O
+    // is ~6 bytes per read so blocking costs <0.1% CPU at 25 Hz.
+    {
+        use embassy_stm32::i2c::{Config as I2cConfig, I2c};
+        use embassy_stm32::time::Hertz;
+
+        let mut i2c_cfg = I2cConfig::default();
+        i2c_cfg.frequency = Hertz(400_000);   // 400 kHz fast mode
+        i2c_cfg.timeout = Duration::from_millis(10);
+
+        let i2c = I2c::new_blocking(
+            p.I2C1,
+            p.PB8,           // SCL
+            p.PB9,           // SDA
+            i2c_cfg,
+        );
+
+        spawner.spawn(baro_task(i2c)).unwrap();
     }
 
     // ---- Configure and spawn the GPS task ----
@@ -610,6 +639,78 @@ async fn mekf_task() {
             updates_applied = 0;
             updates_rejected = 0;
             last_report = now;
+        }
+    }
+}
+
+// ---- Baro Task (Phase 4) ----
+// Owns I2C1. Runs WHO_AM_I detect, dispatches to a chip-specific driver
+// (DPS310 today; BMP280 driver would slot in the same match), then
+// reads compensated pressure + temperature on a 25 Hz ticker and
+// publishes via BARO_DATA. Downstream KF integration is deliberately
+// separate — this task stays driver-only so a bad altitude fusion
+// never knocks out the raw-value diagnostic.
+
+#[embassy_executor::task]
+async fn baro_task(
+    mut i2c: embassy_stm32::i2c::I2c<'static, embassy_stm32::mode::Blocking, embassy_stm32::i2c::Master>,
+) {
+    use drivers::baro::{self, BaroChip, Dps310};
+
+    let chip = match baro::detect(&mut i2c) {
+        Ok(c) => {
+            defmt::info!("Baro detected: {} ({:?})", baro::name(c), c);
+            c
+        }
+        Err(e) => {
+            defmt::warn!("Baro detect failed: {:?} — baro task exiting", e);
+            return;
+        }
+    };
+
+    // Chip-specific init + read loop. Each driver handles its own
+    // compensation math and publishes the unified `BaroSample`.
+    match chip {
+        BaroChip::Dps310 { addr } => {
+            let dps = match Dps310::init(&mut i2c, addr).await {
+                Ok(d) => d,
+                Err(e) => {
+                    defmt::error!("DPS310 init failed: {:?}", e);
+                    return;
+                }
+            };
+
+            let mut ticker = Ticker::every(Duration::from_millis(40)); // 25 Hz
+            let mut reads: u32 = 0;
+            let mut errs:  u32 = 0;
+            let mut last_report = Instant::now();
+            let mut last_sample = BaroSample { pressure_pa: 0.0, temperature_c: 0.0 };
+
+            loop {
+                ticker.next().await;
+                match dps.read(&mut i2c) {
+                    Ok(s) => {
+                        last_sample = s;
+                        BARO_DATA.signal(s);
+                        reads = reads.wrapping_add(1);
+                    }
+                    Err(_) => { errs = errs.wrapping_add(1); }
+                }
+
+                if Instant::now() - last_report >= Duration::from_secs(1) {
+                    defmt::info!(
+                        "Baro {} reads/s, {} errs — P={=f32}Pa T={=f32}C",
+                        reads, errs,
+                        last_sample.pressure_pa, last_sample.temperature_c,
+                    );
+                    reads = 0;
+                    errs = 0;
+                    last_report = Instant::now();
+                }
+            }
+        }
+        BaroChip::Bmp280 { addr: _ } => {
+            defmt::warn!("BMP280 detected but driver not yet implemented");
         }
     }
 }
