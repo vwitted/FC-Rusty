@@ -68,14 +68,14 @@ use drivers::crsf::RcChannels;
 use drivers::dshot::{DshotFrame, DshotSpeed};
 use drivers::dshot_hw::DshotQuad;
 use drivers::icm42688::RawImu;
-use drivers::nmea::{NmeaParser, GpsData};
+use drivers::nmea::{NmeaParser, GpsData, FixMode};
 use drivers::wt901b::{
     Wt901bParser, ImuData,
     UPDATED_ACCEL, UPDATED_GYRO, UPDATED_ANGLE, UPDATED_QUAT,
 };
 use attitude_mekf::{AttitudeMekf, MekfParams, G_MPS2};
 use drivers::baro::{self, BaroSample};
-use estimation::PosKf;
+use estimation::{PosKf, geodetic_to_local_ned};
 use control::arming::{ArmingStateMachine, ArmState};
 use control::mixer::{ControlDemand, QUAD_X};
 use control::pid::{PidGains, PidLimits, RatePidController};
@@ -112,6 +112,11 @@ static ICM_ERRORS:  core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU3
 /// Latest GPS data from the GPS task
 static GPS_DATA: Signal<CriticalSectionRawMutex, GpsData> = Signal::new();
 
+/// Parallel GPS signal dedicated to `pos_kf_task`. The NMEA task
+/// publishes to both so the 200 Hz control loop and the KF task don't
+/// race each other for the same single-shot sample.
+static GPS_DATA_FOR_KF: Signal<CriticalSectionRawMutex, GpsData> = Signal::new();
+
 /// Latest baro sample (pressure_pa + temperature_c) from the baro task.
 /// Consumed by `pos_kf_task` to drive the position-KF `update_baro`.
 static BARO_DATA: Signal<CriticalSectionRawMutex, BaroSample> = Signal::new();
@@ -126,7 +131,10 @@ static IMU_DATA_FOR_KF: Signal<CriticalSectionRawMutex, ImuData> = Signal::new()
 /// Fused position / velocity estimate published by `pos_kf_task`.
 #[derive(Clone, Copy, Debug, defmt::Format)]
 struct PosEstimate {
-    /// Position in NED world frame (m).
+    /// Position in NED world frame (m), relative to the home point once
+    /// the GPS home latch completes. Before home latch the horizontal
+    /// components are from dead-reckoning the accel since boot — only
+    /// useful once `home_latched` is true.
     position_ned: [f32; 3],
     /// Velocity in NED world frame (m/s).
     velocity_ned: [f32; 3],
@@ -142,6 +150,11 @@ struct PosEstimate {
     /// False until the p_ref latch completes and the first update_baro
     /// has fired. Control loop altitude hold should gate on this.
     ready: bool,
+    /// True once a sufficiently good GPS fix has been captured as the
+    /// home origin. Horizontal `position_ned` is meaningful only when
+    /// this is true; any GPS-rescue or position-hold behaviour must
+    /// gate on it.
+    home_latched: bool,
 }
 
 static POS_ESTIMATE: Signal<CriticalSectionRawMutex, PosEstimate> = Signal::new();
@@ -374,6 +387,10 @@ async fn gps_task(
                     if parser.push_byte(byte).is_some() {
                         sentence_count += 1;
                         GPS_DATA.signal(parser.data);
+                        // Second consumer: `pos_kf_task` needs GPS
+                        // updates too and can't share a single-shot
+                        // signal with the 200 Hz control loop.
+                        GPS_DATA_FOR_KF.signal(parser.data);
 
                         if !announced_first {
                             defmt::info!(
@@ -681,22 +698,25 @@ async fn mekf_task() {
     }
 }
 
-// ---- Position KF Task (Phase 4b) ----
+// ---- Position KF Task (Phase 4b + 4c.1) ----
 // 6-state position/velocity Kalman filter driven by:
 //   - IMU prediction at 100 Hz (matches the MEKF accel-update cadence
 //     so every prediction uses a gravity-corrected attitude).
-//   - Baro altitude updates at ~25 Hz (natural rate — we `try_take`
-//     every tick and only fuse when a fresh sample arrives).
+//   - Baro altitude updates at ~25 Hz — only fuses after the p_ref
+//     latch completes.
+//   - GPS position updates at ~1 Hz (NMEA default) — only fuses after
+//     the home latch completes.
 //
 // Reference pressure: the first `P_REF_SAMPLES` baro readings at boot
-// are averaged to form ground pressure. Altitude is then reported AGL
-// (positive-up) relative to that reference. Until the latch completes
-// `PosEstimate.ready = false` and the control loop must not close the
-// altitude hold.
+// are averaged to form ground pressure. Altitude is reported AGL
+// (positive-up) relative to that reference.
 //
-// GPS is intentionally not yet fused here — the signal exists and the
-// KF has `update_gps()` ready, but wiring lat/lon → local NED + first-
-// fix origin is a Phase 4c concern. Altitude hold works baro-only.
+// Home origin (GPS): latches on the first fix that clears `FIX3D`,
+// `≥ MIN_SATS_FOR_LATCH` satellites, and `HDOP < MAX_HDOP_FOR_LATCH`.
+// Once latched, lat/lon deltas are converted to local NED via
+// `geodetic_to_local_ned` and fused with `update_gps`. The home point
+// is never re-latched — GPS rescue has to return to the *original*
+// origin, not wherever the receiver sees us now.
 
 #[embassy_executor::task]
 async fn pos_kf_task() {
@@ -710,14 +730,21 @@ async fn pos_kf_task() {
     // default for bench bring-up.
     const P_REF_SAMPLES: u32 = 25;
 
+    // GPS home-latch gates. Conservative — a bad home point is a lot
+    // worse than waiting a few extra seconds for a better fix.
+    const MIN_SATS_FOR_LATCH: u8 = 6;
+    const MAX_HDOP_FOR_LATCH: f32 = 2.0;
+
     // σ_a = 0.5 m/s² matches the sim tuning — loose enough to track
     // gust transients without treating baro noise as truth. σ_baro =
     // 0.3 m is the DPS310 spec at 16× OSR plus a bit of headroom.
+    // σ_gps_h / σ_gps_v are typical consumer-module noise; the KF will
+    // rightly let baro dominate altitude via the much-smaller σ_baro.
     let mut kf = PosKf::new_at(
         [0.0, 0.0, 0.0],
         0.5,  // σ_a
-        2.0,  // σ_gps_h  (unused until GPS is wired)
-        5.0,  // σ_gps_v  (unused)
+        2.0,  // σ_gps_h
+        5.0,  // σ_gps_v
         0.3,  // σ_baro
     );
 
@@ -726,14 +753,23 @@ async fn pos_kf_task() {
     let mut p_ref_pa: f32 = 0.0;
     let mut ready = false;
 
+    // Home-origin latch state. Stored as f64 for lat/lon to preserve
+    // sub-metre resolution; the geodetic helper handles the cast.
+    let mut home_lat: f64 = 0.0;
+    let mut home_lon: f64 = 0.0;
+    let mut home_alt_msl: f32 = 0.0;
+    let mut home_latched = false;
+
     let mut last_imu: Option<ImuData> = None;
     let mut last_baro_t = Instant::now();
     let mut baro_updates_sec: u32 = 0;
+    let mut gps_updates_sec: u32 = 0;
+    let mut last_gps: Option<GpsData> = None;
 
     let mut ticker = Ticker::every(Duration::from_millis(PERIOD_MS));
     let mut last_report = Instant::now();
 
-    defmt::info!("PosKF task started (100 Hz predict, baro on BARO_DATA)");
+    defmt::info!("PosKF task started (100 Hz predict; baro + GPS fusion)");
 
     loop {
         ticker.next().await;
@@ -757,6 +793,47 @@ async fn pos_kf_task() {
             kf.predict(a_world, DT);
         } else {
             kf.predict([0.0, 0.0, 0.0], DT);
+        }
+
+        // ---- GPS update (sensor-driven; None on non-1-Hz ticks) ----
+        // Home-point latch fires once on the first fix that clears the
+        // quality gates; subsequent fixes get converted to local NED
+        // and fused. No re-latch — the original origin is authoritative
+        // for anything that ever needs to return to it.
+        if let Some(gps) = GPS_DATA_FOR_KF.try_take() {
+            last_gps = Some(gps);
+            let good_fix = gps.fix_mode == FixMode::Fix3D
+                && gps.satellites >= MIN_SATS_FOR_LATCH
+                && gps.hdop > 0.0
+                && gps.hdop < MAX_HDOP_FOR_LATCH;
+
+            if !home_latched {
+                if good_fix {
+                    home_lat = gps.latitude;
+                    home_lon = gps.longitude;
+                    home_alt_msl = gps.altitude_m;
+                    home_latched = true;
+                    defmt::info!(
+                        "PosKF home latched: lat={=f32} lon={=f32} alt_msl={=f32}m | sats={} hdop={=f32}",
+                        gps.latitude as f32,
+                        gps.longitude as f32,
+                        gps.altitude_m,
+                        gps.satellites,
+                        gps.hdop,
+                    );
+                }
+            } else if good_fix {
+                // Convert to local NED and fuse. Z-channel uses
+                // GPS altitude (σ=5 m) so baro still dominates the
+                // short-term; the GPS keeps altitude honest over the
+                // long term via cross-covariance.
+                let ned = geodetic_to_local_ned(
+                    gps.latitude, gps.longitude, gps.altitude_m,
+                    home_lat,      home_lon,      home_alt_msl,
+                );
+                kf.update_gps(ned);
+                gps_updates_sec = gps_updates_sec.wrapping_add(1);
+            }
         }
 
         // ---- Baro update (sensor-driven; None on non-25-Hz ticks) ----
@@ -790,16 +867,33 @@ async fn pos_kf_task() {
             p_ref_pa,
             baro_age_ms: last_baro_t.elapsed().as_millis() as u32,
             ready,
+            home_latched,
         };
         POS_ESTIMATE.signal(est);
 
         // ---- 1 Hz health log ----
         if last_report.elapsed() >= Duration::from_secs(1) {
             if ready {
-                defmt::info!(
-                    "PosKF ready: alt={=f32}m vz={=f32}m/s p_ref={=f32}Pa | {} baro/s",
-                    est.altitude_up, est.vz_up, p_ref_pa, baro_updates_sec,
-                );
+                if home_latched {
+                    defmt::info!(
+                        "PosKF ready: alt={=f32}m vz={=f32}m/s | N={=f32}m E={=f32}m | {} baro/s {} gps/s",
+                        est.altitude_up, est.vz_up,
+                        est.position_ned[0], est.position_ned[1],
+                        baro_updates_sec, gps_updates_sec,
+                    );
+                } else if let Some(g) = last_gps {
+                    defmt::info!(
+                        "PosKF ready: alt={=f32}m vz={=f32}m/s | waiting for GPS home (sats={} hdop={=f32} fix_mode={}) | {} baro/s",
+                        est.altitude_up, est.vz_up,
+                        g.satellites, g.hdop, g.fix_mode as u8,
+                        baro_updates_sec,
+                    );
+                } else {
+                    defmt::info!(
+                        "PosKF ready: alt={=f32}m vz={=f32}m/s | no GPS data yet | {} baro/s",
+                        est.altitude_up, est.vz_up, baro_updates_sec,
+                    );
+                }
             } else {
                 defmt::info!(
                     "PosKF latching p_ref: {}/{} baro samples",
@@ -807,6 +901,7 @@ async fn pos_kf_task() {
                 );
             }
             baro_updates_sec = 0;
+            gps_updates_sec = 0;
             last_report = Instant::now();
         }
     }

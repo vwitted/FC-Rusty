@@ -268,6 +268,45 @@ impl PosKf {
     }
 }
 
+// ---- Geodetic → local NED ----
+
+/// Convert a WGS84 geodetic fix to a local NED offset from a reference
+/// ("home") point using the equirectangular flat-earth approximation.
+/// Accuracy is sub-metre out to ~1 km from the reference, which covers
+/// every sane GPS-rescue scenario — for longer ranges this biases
+/// east-west distance via the meridian-convergence cosine.
+///
+/// Inputs in degrees (lat/lon) and metres above MSL (alt). The returned
+/// triple is `[north, east, down]` in metres — ready to hand to
+/// `PosKf::update_gps`. Down is `-(alt - alt_ref)` so that the baro's
+/// positive-up boot reference and the GPS's MSL reference stay
+/// consistent when `alt_ref` is latched at the same instant as the home
+/// point.
+pub fn geodetic_to_local_ned(
+    lat: f64,
+    lon: f64,
+    alt_msl: f32,
+    lat_ref: f64,
+    lon_ref: f64,
+    alt_ref_msl: f32,
+) -> [f32; 3] {
+    // WGS84 equatorial radius. Using a single-radius spherical model
+    // (vs the full ellipsoid) leaves ~0.2 % error in N at mid-latitudes
+    // — well below GPS noise at rescue ranges.
+    const R_EARTH: f64 = 6_378_137.0;
+    const DEG2RAD: f64 = core::f64::consts::PI / 180.0;
+
+    let lat_ref_rad = lat_ref * DEG2RAD;
+    let dlat = (lat - lat_ref) * DEG2RAD;
+    let dlon = (lon - lon_ref) * DEG2RAD;
+
+    let north = (dlat * R_EARTH) as f32;
+    let east = (dlon * R_EARTH * libm::cos(lat_ref_rad)) as f32;
+    let down = -(alt_msl - alt_ref_msl);
+
+    [north, east, down]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +355,67 @@ mod tests {
         // Expected: vx = 1.0 m/s, px = 0.5 m
         assert!((kf.x[3] - 1.0).abs() < 1e-3, "vx={}", kf.x[3]);
         assert!((kf.x[0] - 0.5).abs() < 1e-3, "px={}", kf.x[0]);
+    }
+
+    /// Home reference returns exactly zero NED.
+    #[test]
+    fn geodetic_at_home_is_zero() {
+        let ned = geodetic_to_local_ned(
+            51.5074, -0.1278, 50.0,   // London
+            51.5074, -0.1278, 50.0,
+        );
+        assert!(ned[0].abs() < 1e-3);
+        assert!(ned[1].abs() < 1e-3);
+        assert!(ned[2].abs() < 1e-3);
+    }
+
+    /// A 1° latitude step is ~111 km north.
+    #[test]
+    fn geodetic_lat_step_is_111km_north() {
+        let ned = geodetic_to_local_ned(
+            52.5074, -0.1278, 50.0,
+            51.5074, -0.1278, 50.0,
+        );
+        // R_earth * 1° = 111_319 m, roughly.
+        assert!(ned[0] > 110_000.0 && ned[0] < 112_000.0, "n={}", ned[0]);
+        assert!(ned[1].abs() < 1.0, "e={}", ned[1]);
+    }
+
+    /// At latitude 60° a 1° longitude step is ~55 km (cos(60°) scaling).
+    #[test]
+    fn geodetic_lon_step_scales_by_cos_lat() {
+        // Move 1° east of a reference at 60°N.
+        let ned = geodetic_to_local_ned(
+            60.0, 11.0, 0.0,
+            60.0, 10.0, 0.0,
+        );
+        // 111_319 · cos(60°) ≈ 55_659 m.
+        assert!(ned[1] > 55_000.0 && ned[1] < 56_500.0, "e={}", ned[1]);
+        assert!(ned[0].abs() < 1.0, "n={}", ned[0]);
+    }
+
+    /// Altitude delta maps to −(alt − alt_ref) in the z channel.
+    #[test]
+    fn geodetic_alt_goes_to_ned_down() {
+        let ned = geodetic_to_local_ned(
+            51.5074, -0.1278, 60.0,   // 10 m above ref
+            51.5074, -0.1278, 50.0,
+        );
+        assert!((ned[2] - (-10.0)).abs() < 0.01, "d={}", ned[2]);
+    }
+
+    /// Small-offset round-trip sanity at a typical GPS rescue range.
+    #[test]
+    fn geodetic_100m_range_is_accurate() {
+        // ~100 m north, ~100 m east at equator.
+        let dlat_deg = 100.0 / 111_319.0;
+        let dlon_deg = 100.0 / 111_319.0; // cos(0) = 1 at equator
+        let ned = geodetic_to_local_ned(
+            dlat_deg, dlon_deg, 0.0,
+            0.0, 0.0, 0.0,
+        );
+        assert!((ned[0] - 100.0).abs() < 0.1, "n={}", ned[0]);
+        assert!((ned[1] - 100.0).abs() < 0.1, "e={}", ned[1]);
     }
 
     /// Covariance must stay positive semi-definite after updates (diag ≥ 0).
