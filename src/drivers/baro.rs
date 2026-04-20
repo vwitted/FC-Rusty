@@ -110,6 +110,29 @@ pub struct BaroSample {
     pub temperature_c: f32,
 }
 
+// ---- Pressure → altitude ----
+
+/// Convert pressure to altitude in metres using the US Standard
+/// Atmosphere 1976 hypsometric formula (troposphere, valid to 11 km):
+///
+///     h = 44330.77 · (1 − (P / P₀)^(1 / 5.2558))
+///
+/// `p_ref_pa` is the reference pressure. Pass the pressure latched at
+/// ground level on boot for AGL altitude (positive-up), or 101325.0 for
+/// absolute-ish altitude referenced to ISA sea level.
+///
+/// Near the reference (|h| ≲ 1 km) the formula is smooth and monotonic;
+/// at low altitudes a 1 Pa pressure change is ~8.3 cm, matching what
+/// we get out of the DPS310 at 16× OSR. Below ground (P > P_ref) the
+/// result goes negative as expected.
+pub fn pressure_to_altitude_m(p_pa: f32, p_ref_pa: f32) -> f32 {
+    if p_ref_pa <= 0.0 || p_pa <= 0.0 {
+        return 0.0;
+    }
+    let ratio = p_pa / p_ref_pa;
+    44330.77_f32 * (1.0 - libm::powf(ratio, 1.0 / 5.2558))
+}
+
 // ---- DPS310 ----
 
 // Register map (see Infineon DPS310 datasheet rev 1.2, §7)
@@ -425,5 +448,37 @@ mod tests {
         assert_eq!(sign_extend_24(0x7FFFFF),  8388607);
         assert_eq!(sign_extend_24(0x800000), -8388608);
         assert_eq!(sign_extend_24(0xFFFFFF), -1);
+    }
+
+    #[test]
+    fn altitude_is_zero_at_reference() {
+        let h = pressure_to_altitude_m(101325.0, 101325.0);
+        assert!(h.abs() < 0.01, "h={h}");
+    }
+
+    #[test]
+    fn altitude_sign_convention_is_positive_up() {
+        // Lower pressure → higher altitude (positive).
+        let h_hi = pressure_to_altitude_m(95_000.0, 101_325.0);
+        assert!(h_hi > 0.0 && h_hi < 1000.0, "h_hi={h_hi}");
+        // Higher pressure → below reference (negative).
+        let h_lo = pressure_to_altitude_m(103_000.0, 101_325.0);
+        assert!(h_lo < 0.0 && h_lo > -500.0, "h_lo={h_lo}");
+    }
+
+    #[test]
+    fn altitude_small_step_matches_8_3_cm_per_pa() {
+        // Near the reference, dh/dP ≈ −8.3 cm/Pa. A 10 Pa drop should
+        // show ~83 cm of climb within loose bounds.
+        let h0 = pressure_to_altitude_m(101_325.0, 101_325.0);
+        let h1 = pressure_to_altitude_m(101_315.0, 101_325.0);
+        let dh = h1 - h0;
+        assert!(dh > 0.70 && dh < 0.95, "dh={dh}");
+    }
+
+    #[test]
+    fn altitude_clamps_on_bad_ref() {
+        assert_eq!(pressure_to_altitude_m(100_000.0, 0.0), 0.0);
+        assert_eq!(pressure_to_altitude_m(0.0, 101_325.0), 0.0);
     }
 }

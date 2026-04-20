@@ -60,6 +60,7 @@ mod control {
     pub mod pid;
 }
 mod attitude_mekf;
+mod estimation;
 mod logger;
 mod rc_task;
 
@@ -73,7 +74,8 @@ use drivers::wt901b::{
     UPDATED_ACCEL, UPDATED_GYRO, UPDATED_ANGLE, UPDATED_QUAT,
 };
 use attitude_mekf::{AttitudeMekf, MekfParams, G_MPS2};
-use drivers::baro::BaroSample;
+use drivers::baro::{self, BaroSample};
+use estimation::PosKf;
 use control::arming::{ArmingStateMachine, ArmState};
 use control::mixer::{ControlDemand, QUAD_X};
 use control::pid::{PidGains, PidLimits, RatePidController};
@@ -111,9 +113,38 @@ static ICM_ERRORS:  core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU3
 static GPS_DATA: Signal<CriticalSectionRawMutex, GpsData> = Signal::new();
 
 /// Latest baro sample (pressure_pa + temperature_c) from the baro task.
-/// Not yet consumed by the control loop — altitude conversion + KF
-/// integration lands in a follow-up commit once the raw values look sane.
+/// Consumed by `pos_kf_task` to drive the position-KF `update_baro`.
 static BARO_DATA: Signal<CriticalSectionRawMutex, BaroSample> = Signal::new();
+
+/// Latest fused IMU data intended for the position KF (*separate* from
+/// `IMU_DATA`, which the control loop already consumes). Signalled by
+/// `mekf_task` on its 100 Hz accel-update branch — paying one extra
+/// signal-write every 80th sample is cheap and avoids consumer
+/// contention with the control loop on `IMU_DATA`.
+static IMU_DATA_FOR_KF: Signal<CriticalSectionRawMutex, ImuData> = Signal::new();
+
+/// Fused position / velocity estimate published by `pos_kf_task`.
+#[derive(Clone, Copy, Debug, defmt::Format)]
+struct PosEstimate {
+    /// Position in NED world frame (m).
+    position_ned: [f32; 3],
+    /// Velocity in NED world frame (m/s).
+    velocity_ned: [f32; 3],
+    /// Altitude above boot reference (m, positive up).
+    altitude_up: f32,
+    /// Vertical velocity (m/s, positive up).
+    vz_up: f32,
+    /// Reference pressure latched from the first seconds of boot baro
+    /// readings (Pa). 0.0 until latching completes.
+    p_ref_pa: f32,
+    /// Milliseconds since the last baro update was applied.
+    baro_age_ms: u32,
+    /// False until the p_ref latch completes and the first update_baro
+    /// has fired. Control loop altitude hold should gate on this.
+    ready: bool,
+}
+
+static POS_ESTIMATE: Signal<CriticalSectionRawMutex, PosEstimate> = Signal::new();
 
 /// Commands from the control loop to the IMU command task (TX side).
 /// Used for in-field magnetometer calibration via AUX channel.
@@ -274,6 +305,7 @@ async fn main(spawner: Spawner) {
         );
 
         spawner.spawn(baro_task(i2c)).unwrap();
+        spawner.spawn(pos_kf_task()).unwrap();
     }
 
     // ---- Configure and spawn the GPS task ----
@@ -581,7 +613,8 @@ async fn mekf_task() {
         ];
         mekf.predict(gyro_rad, dt);
 
-        if sample_count % ACCEL_DECIMATION == 0 {
+        let on_kf_tick = sample_count % ACCEL_DECIMATION == 0;
+        if on_kf_tick {
             if mekf.update_accel(raw.accel_g()) {
                 updates_applied = updates_applied.wrapping_add(1);
             } else {
@@ -616,6 +649,11 @@ async fn mekf_task() {
             updated: UPDATED_ACCEL | UPDATED_GYRO | UPDATED_ANGLE | UPDATED_QUAT,
         };
         IMU_DATA.signal(imu);
+        // Feed the position KF at 100 Hz — matches the accel-update
+        // cadence so the signalled sample is the freshest fused one.
+        if on_kf_tick {
+            IMU_DATA_FOR_KF.signal(imu);
+        }
 
         // 1 Hz health log. Includes sample count (should be ~8000),
         // fused Euler so we can see tilt test output live, and bias
@@ -639,6 +677,137 @@ async fn mekf_task() {
             updates_applied = 0;
             updates_rejected = 0;
             last_report = now;
+        }
+    }
+}
+
+// ---- Position KF Task (Phase 4b) ----
+// 6-state position/velocity Kalman filter driven by:
+//   - IMU prediction at 100 Hz (matches the MEKF accel-update cadence
+//     so every prediction uses a gravity-corrected attitude).
+//   - Baro altitude updates at ~25 Hz (natural rate — we `try_take`
+//     every tick and only fuse when a fresh sample arrives).
+//
+// Reference pressure: the first `P_REF_SAMPLES` baro readings at boot
+// are averaged to form ground pressure. Altitude is then reported AGL
+// (positive-up) relative to that reference. Until the latch completes
+// `PosEstimate.ready = false` and the control loop must not close the
+// altitude hold.
+//
+// GPS is intentionally not yet fused here — the signal exists and the
+// KF has `update_gps()` ready, but wiring lat/lon → local NED + first-
+// fix origin is a Phase 4c concern. Altitude hold works baro-only.
+
+#[embassy_executor::task]
+async fn pos_kf_task() {
+    use nalgebra::{Quaternion, UnitQuaternion, Vector3};
+
+    const HZ: u64 = 100;
+    const PERIOD_MS: u64 = 1000 / HZ;
+    const DT: f32 = 1.0 / HZ as f32;
+    // 1 s at the baro task's 25 Hz. A longer latch averages out more
+    // noise but delays when altitude hold can engage; 1 s is a sensible
+    // default for bench bring-up.
+    const P_REF_SAMPLES: u32 = 25;
+
+    // σ_a = 0.5 m/s² matches the sim tuning — loose enough to track
+    // gust transients without treating baro noise as truth. σ_baro =
+    // 0.3 m is the DPS310 spec at 16× OSR plus a bit of headroom.
+    let mut kf = PosKf::new_at(
+        [0.0, 0.0, 0.0],
+        0.5,  // σ_a
+        2.0,  // σ_gps_h  (unused until GPS is wired)
+        5.0,  // σ_gps_v  (unused)
+        0.3,  // σ_baro
+    );
+
+    let mut p_ref_accum: f32 = 0.0;
+    let mut p_ref_count: u32 = 0;
+    let mut p_ref_pa: f32 = 0.0;
+    let mut ready = false;
+
+    let mut last_imu: Option<ImuData> = None;
+    let mut last_baro_t = Instant::now();
+    let mut baro_updates_sec: u32 = 0;
+
+    let mut ticker = Ticker::every(Duration::from_millis(PERIOD_MS));
+    let mut last_report = Instant::now();
+
+    defmt::info!("PosKF task started (100 Hz predict, baro on BARO_DATA)");
+
+    loop {
+        ticker.next().await;
+
+        // ---- Pull latest IMU for predict ----
+        if let Some(imu) = IMU_DATA_FOR_KF.try_take() {
+            last_imu = Some(imu);
+        }
+
+        // ---- Predict with world-frame kinematic accel ----
+        // Rotate body specific force by the MEKF quaternion (body→nav),
+        // then add gravity to recover inertial accel in NED world.
+        // If we haven't seen an IMU yet, coast with zero accel.
+        if let Some(imu) = last_imu {
+            let [qw, qx, qy, qz] = imu.quaternion;
+            let q = UnitQuaternion::from_quaternion(Quaternion::new(qw, qx, qy, qz));
+            let sf_body = Vector3::new(imu.accel[0], imu.accel[1], imu.accel[2]);
+            let sf_world = q * sf_body;
+            // NED: +Z down, so kinematic = specific force + [0, 0, +g].
+            let a_world = [sf_world.x, sf_world.y, sf_world.z + G_MPS2];
+            kf.predict(a_world, DT);
+        } else {
+            kf.predict([0.0, 0.0, 0.0], DT);
+        }
+
+        // ---- Baro update (sensor-driven; None on non-25-Hz ticks) ----
+        if let Some(baro) = BARO_DATA.try_take() {
+            if p_ref_count < P_REF_SAMPLES {
+                p_ref_accum += baro.pressure_pa;
+                p_ref_count += 1;
+                if p_ref_count == P_REF_SAMPLES {
+                    p_ref_pa = p_ref_accum / P_REF_SAMPLES as f32;
+                    ready = true;
+                    defmt::info!(
+                        "PosKF ref latched: p_ref={=f32}Pa after {} samples",
+                        p_ref_pa, P_REF_SAMPLES,
+                    );
+                }
+            } else {
+                let alt_up = baro::pressure_to_altitude_m(baro.pressure_pa, p_ref_pa);
+                kf.update_baro(alt_up);
+                last_baro_t = Instant::now();
+                baro_updates_sec = baro_updates_sec.wrapping_add(1);
+            }
+        }
+
+        // ---- Publish estimate ----
+        let s = kf.state();
+        let est = PosEstimate {
+            position_ned: [s[0], s[1], s[2]],
+            velocity_ned: [s[3], s[4], s[5]],
+            altitude_up: kf.altitude_up(),
+            vz_up: kf.vz_up(),
+            p_ref_pa,
+            baro_age_ms: last_baro_t.elapsed().as_millis() as u32,
+            ready,
+        };
+        POS_ESTIMATE.signal(est);
+
+        // ---- 1 Hz health log ----
+        if last_report.elapsed() >= Duration::from_secs(1) {
+            if ready {
+                defmt::info!(
+                    "PosKF ready: alt={=f32}m vz={=f32}m/s p_ref={=f32}Pa | {} baro/s",
+                    est.altitude_up, est.vz_up, p_ref_pa, baro_updates_sec,
+                );
+            } else {
+                defmt::info!(
+                    "PosKF latching p_ref: {}/{} baro samples",
+                    p_ref_count, P_REF_SAMPLES,
+                );
+            }
+            baro_updates_sec = 0;
+            last_report = Instant::now();
         }
     }
 }
@@ -798,6 +967,7 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
     let mut last_rc = RcChannels { channels: [992; 16] };
     let mut last_imu = ImuData::new();
     let mut last_gps = GpsData::new();
+    let mut last_pos_est: Option<PosEstimate> = None;
     let mut imu_last_seen = Instant::now();
     let mut control_demand = ControlDemand::default();
 
@@ -857,6 +1027,9 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
         }
         if let Some(gps) = GPS_DATA.try_take() {
             last_gps = gps;
+        }
+        if let Some(est) = POS_ESTIMATE.try_take() {
+            last_pos_est = Some(est);
         }
         if let Some(rc) = rc_task::RC_CHANNELS.try_take() {
             last_rc = rc;
@@ -991,12 +1164,24 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
                     mpc_out.rate_setpoints_rads[2] * RAD2DEG,
                 ];
 
-                // Altitude hold (uses barometric altitude from IMU or GPS)
-                // TODO: fuse baro + GPS altitude for better estimate
-                let alt_m = last_imu.altitude_cm as f32 / 100.0;
-                let vz_up = 0.0; // TODO: estimate from baro rate or GPS vz
-                let target_alt = alt_m; // hold current altitude for now
-                current_thrust = alt_ctrl.update(target_alt, alt_m, vz_up, dt * 4.0);
+                // Altitude hold — closes on the PosKF estimate (baro-fused
+                // today, baro+GPS once `update_gps` is wired in Phase 4c).
+                // Gated on `ready`: the p_ref latch takes ~1 s from first
+                // baro sample, and closing the loop before then would
+                // chase garbage. While not ready, fall back to the
+                // hover_throttle bias so the drone hovers-ish but doesn't
+                // actively try to hold altitude.
+                if let Some(est) = last_pos_est.filter(|e| e.ready) {
+                    let target_alt = est.altitude_up; // hold current altitude
+                    current_thrust = alt_ctrl.update(
+                        target_alt,
+                        est.altitude_up,
+                        est.vz_up,
+                        dt * 4.0,
+                    );
+                } else {
+                    current_thrust = hover_throttle;
+                }
             }
 
             // ---- 200 Hz PID rate inner loop ----
