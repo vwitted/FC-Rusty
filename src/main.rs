@@ -845,6 +845,16 @@ async fn pos_kf_task() {
             }
         }
 
+        // ---- GPS-only readiness fallback ----
+        // With the onboard baro dead (2026-04-20), GPS is the only thing
+        // anchoring the vertical axis until the external baro is wired in.
+        // Mark `ready` on home-latch so altitude hold can engage off GPS
+        // altitude (noisier, but adequate for bring-up).
+        if !ready && home_latched {
+            ready = true;
+            defmt::info!("PosKF ready via GPS home latch (no baro)");
+        }
+
         // ---- Publish estimate ----
         let s = kf.state();
         let est = PosEstimate {
@@ -861,31 +871,22 @@ async fn pos_kf_task() {
 
         // ---- 1 Hz health log ----
         if last_report.elapsed() >= Duration::from_secs(1) {
-            if ready {
-                if home_latched {
-                    defmt::info!(
-                        "PosKF ready: alt={=f32}m vz={=f32}m/s | N={=f32}m E={=f32}m | {} baro/s {} gps/s",
-                        est.altitude_up, est.vz_up,
-                        est.position_ned[0], est.position_ned[1],
-                        baro_updates_sec, gps_updates_sec,
-                    );
-                } else if let Some(g) = last_gps {
-                    defmt::info!(
-                        "PosKF ready: alt={=f32}m vz={=f32}m/s | waiting for GPS home (sats={} hdop={=f32} fix_mode={}) | {} baro/s",
-                        est.altitude_up, est.vz_up,
-                        g.satellites, g.hdop, g.fix_mode as u8,
-                        baro_updates_sec,
-                    );
-                } else {
-                    defmt::info!(
-                        "PosKF ready: alt={=f32}m vz={=f32}m/s | no GPS data yet | {} baro/s",
-                        est.altitude_up, est.vz_up, baro_updates_sec,
-                    );
-                }
-            } else {
+            if ready && home_latched {
                 defmt::info!(
-                    "PosKF latching p_ref: {}/{} baro samples",
+                    "PosKF ready: alt={=f32}m vz={=f32}m/s | N={=f32}m E={=f32}m | {} baro/s {} gps/s",
+                    est.altitude_up, est.vz_up,
+                    est.position_ned[0], est.position_ned[1],
+                    baro_updates_sec, gps_updates_sec,
+                );
+            } else {
+                let (sats, hdop, fix) = last_gps
+                    .map(|g| (g.satellites, g.hdop, g.fix_mode as u8))
+                    .unwrap_or((0, 99.99, 0));
+                defmt::info!(
+                    "PosKF waiting: baro {}/{} samples | GPS sats={} hdop={=f32} fix={} | baro/s={} gps/s={}",
                     p_ref_count, P_REF_SAMPLES,
+                    sats, hdop, fix,
+                    baro_updates_sec, gps_updates_sec,
                 );
             }
             baro_updates_sec = 0;
@@ -902,21 +903,35 @@ async fn pos_kf_task() {
 // F722: runs clean for ~60 s then dies with a steady stream of
 // timeouts at the 25 Hz tick rate (≈25 errs/s), no reads.
 //
-// Recovery sequence (triggered after `ERR_STREAK_RECOVERY` consecutive
-// errors, ~0.4 s at 25 Hz):
+// Recovery sequence:
 //   1. Drop the `I2c` — this disconnects pins and disables I2C1 RCC.
-//   2. Drive SCL as push-pull output, toggle 9× at ~100 kHz. Slave
-//      finishes whatever partial byte it was holding SDA low for.
+//   2. Drive SCL as **open-drain** output (never push-pull!), toggle 9×
+//      at ~100 kHz. Slave finishes whatever partial byte it was holding
+//      SDA low for.
 //   3. Manual STOP: drive SDA low then release high, both with SCL
-//      high. Slave returns to idle.
+//      high — also open-drain. Slave returns to idle.
 //   4. Rebuild I2c, rerun detect + DPS310 init.
 //
-// The outer loop keeps trying forever — a dead bus shouldn't take the
-// flight controller down, and the pos_kf_task handles missing baro
-// samples by coasting on IMU-only prediction.
+// !! SAFETY: open-drain is NOT optional. Slaves are allowed to clock-
+// stretch (hold SCL low) and to drive SDA low during a transaction. A
+// push-pull output fighting that short-circuits the MCU's PMOS through
+// the slave's NMOS — that killed the onboard DPS310 on this board on
+// 2026-04-20. Never `Output::new` on an I2C pin; always
+// `OutputOpenDrain::new`.
+//
+// The bitbang runs on *every* rebuild after the first, not just the
+// read-streak path — field-observed second hang had detect pass and
+// init fail with I2C error, and without bitbanging between retry
+// attempts the rebuild would just re-hang indefinitely.
+//
+// The outer loop gives up after `MAX_INIT_ATTEMPTS` failures so a
+// totally absent baro stops spamming the log — reboot after the
+// external baro is wired in. A dead bus should not take the FC down,
+// and pos_kf_task handles missing baro via GPS-only altitude.
 
 const BARO_ERR_STREAK_RECOVERY: u32 = 10;   // ~0.4 s at 25 Hz
 const BARO_TIMEOUT_MS: u64 = 5;             // shorter wastes less CPU when stuck
+const BARO_MAX_INIT_ATTEMPTS: u32 = 5;      // give up after this many detect/init failures
 
 #[embassy_executor::task]
 async fn baro_task(
@@ -925,7 +940,7 @@ async fn baro_task(
     mut sda:     embassy_stm32::Peri<'static, embassy_stm32::peripherals::PB9>,
 ) {
     use drivers::baro::{self, BaroChip, Dps310};
-    use embassy_stm32::gpio::{Level, Output, Speed};
+    use embassy_stm32::gpio::{Level, OutputOpenDrain, Speed};
     use embassy_stm32::i2c::{Config as I2cConfig, I2c};
     use embassy_stm32::time::Hertz;
     use embassy_time::Timer;
@@ -938,11 +953,52 @@ async fn baro_task(
     };
 
     let mut recovery_count: u32 = 0;
+    let mut init_failures: u32 = 0;
+    let mut first_iter = true;
 
     // Outer loop: (re)build I2c, detect + init, run read loop until it
     // asks for recovery. The reborrow()s keep ownership of the raw Peris
     // here so we can drop the I2c and bitbang SCL directly.
     loop {
+        if init_failures >= BARO_MAX_INIT_ATTEMPTS {
+            defmt::warn!(
+                "Baro: {} consecutive init failures — giving up (reboot after wiring external baro)",
+                init_failures,
+            );
+            return;
+        }
+
+        // Always bitbang before rebuild (except on the very first boot
+        // build). Cheap (~100 µs), idempotent when the bus is already
+        // idle, essential when detect/init failed and left it stuck.
+        //
+        // Both SCL and SDA use OutputOpenDrain — slaves are allowed to
+        // drive either line low, and a push-pull output fighting that
+        // shorts the MCU output stage through the slave's NMOS. See the
+        // safety note on this task.
+        if !first_iter {
+            Timer::after(Duration::from_millis(2)).await;
+            {
+                let mut scl_out = OutputOpenDrain::new(
+                    scl.reborrow(), Level::High, Speed::Low,
+                );
+                for _ in 0..9 {
+                    scl_out.set_low();
+                    Timer::after(Duration::from_micros(5)).await;
+                    scl_out.set_high();
+                    Timer::after(Duration::from_micros(5)).await;
+                }
+                let mut sda_out = OutputOpenDrain::new(
+                    sda.reborrow(), Level::Low, Speed::Low,
+                );
+                Timer::after(Duration::from_micros(5)).await;
+                sda_out.set_high();
+                Timer::after(Duration::from_micros(5)).await;
+            }
+            Timer::after(Duration::from_millis(10)).await;
+        }
+        first_iter = false;
+
         let mut i2c = I2c::new_blocking(
             i2c_per.reborrow(),
             scl.reborrow(),
@@ -956,7 +1012,11 @@ async fn baro_task(
                 c
             }
             Err(e) => {
-                defmt::warn!("Baro detect failed: {:?} — retrying in 1 s", e);
+                init_failures = init_failures.saturating_add(1);
+                defmt::warn!(
+                    "Baro detect failed: {:?} ({}/{}) — bitbang + retry in 1 s",
+                    e, init_failures, BARO_MAX_INIT_ATTEMPTS,
+                );
                 drop(i2c);
                 Timer::after(Duration::from_secs(1)).await;
                 continue;
@@ -974,12 +1034,21 @@ async fn baro_task(
         let dps = match Dps310::init(&mut i2c, addr).await {
             Ok(d) => d,
             Err(e) => {
-                defmt::error!("DPS310 init failed: {:?} — retrying in 1 s", e);
+                init_failures = init_failures.saturating_add(1);
+                defmt::error!(
+                    "DPS310 init failed: {:?} ({}/{}) — bitbang + retry in 1 s",
+                    e, init_failures, BARO_MAX_INIT_ATTEMPTS,
+                );
                 drop(i2c);
                 Timer::after(Duration::from_secs(1)).await;
                 continue;
             }
         };
+
+        // A successful init means the chip is healthy; reset the
+        // give-up counter so a later bus-stuck recovery doesn't count
+        // against the boot-time init budget.
+        init_failures = 0;
 
         // ---- Read loop ----
         let mut ticker = Ticker::every(Duration::from_millis(40)); // 25 Hz
@@ -1039,39 +1108,11 @@ async fn baro_task(
         if recover {
             recovery_count = recovery_count.saturating_add(1);
             defmt::warn!(
-                "Baro: I2C bus stuck ({} consecutive errs), running bus recovery (n={})",
+                "Baro: I2C bus stuck ({} consecutive errs), recovering (n={})",
                 streak, recovery_count,
             );
-
-            // Drop the I2c first — this releases pins (set_as_disconnected)
-            // and disables I2C1 RCC via the drop guard.
             drop(i2c);
-
-            // Bitbang SCL 9× at ~100 kHz with SDA tri-stated. Any slave
-            // mid-byte finishes its transaction after at most 8 extra
-            // clocks; the 9th is the ACK bit which the slave releases.
-            {
-                let mut scl_out = Output::new(scl.reborrow(), Level::High, Speed::Low);
-                // SDA is left floating here (external pull-up holds it high);
-                // we don't drive it during the 9 pulses.
-                for _ in 0..9 {
-                    scl_out.set_low();
-                    Timer::after(Duration::from_micros(5)).await;
-                    scl_out.set_high();
-                    Timer::after(Duration::from_micros(5)).await;
-                }
-
-                // Manual STOP: SDA low → high while SCL is high.
-                let mut sda_out = Output::new(sda.reborrow(), Level::Low, Speed::Low);
-                Timer::after(Duration::from_micros(5)).await;
-                sda_out.set_high();
-                Timer::after(Duration::from_micros(5)).await;
-                // scl_out and sda_out dropped here — pins disconnected,
-                // ready for the I2c rebuild on the next outer iteration.
-            }
-
-            Timer::after(Duration::from_millis(10)).await;
-            // Fall through to the top of the outer loop and rebuild.
+            // Fall through — top of outer loop runs the bitbang + rebuild.
         }
     }
 }
