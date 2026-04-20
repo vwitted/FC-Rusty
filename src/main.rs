@@ -302,24 +302,12 @@ async fn main(spawner: Spawner) {
     // SCL=PB8, SDA=PB9. Blocking mode — DMA1 CH6/CH7 (the only I2C1
     // TX options on F722) are already claimed by DShot, and baro I/O
     // is ~6 bytes per read so blocking costs <0.1% CPU at 25 Hz.
-    {
-        use embassy_stm32::i2c::{Config as I2cConfig, I2c};
-        use embassy_stm32::time::Hertz;
-
-        let mut i2c_cfg = I2cConfig::default();
-        i2c_cfg.frequency = Hertz(400_000);   // 400 kHz fast mode
-        i2c_cfg.timeout = Duration::from_millis(10);
-
-        let i2c = I2c::new_blocking(
-            p.I2C1,
-            p.PB8,           // SCL
-            p.PB9,           // SDA
-            i2c_cfg,
-        );
-
-        spawner.spawn(baro_task(i2c)).unwrap();
-        spawner.spawn(pos_kf_task()).unwrap();
-    }
+    //
+    // The task owns the raw peripherals (not a pre-built I2c) so it can
+    // drop the driver and bitbang SCL to unstick the bus when the STM32
+    // I2C peripheral latches BUSY/ARLO — observed mid-run in the field.
+    spawner.spawn(baro_task(p.I2C1, p.PB8, p.PB9)).unwrap();
+    spawner.spawn(pos_kf_task()).unwrap();
 
     // ---- Configure and spawn the GPS task ----
     // GPS on USART6 TX=PC6 RX=PC7 at factory 9600 baud, speaking
@@ -908,73 +896,182 @@ async fn pos_kf_task() {
 }
 
 // ---- Baro Task (Phase 4) ----
-// Owns I2C1. Runs WHO_AM_I detect, dispatches to a chip-specific driver
-// (DPS310 today; BMP280 driver would slot in the same match), then
-// reads compensated pressure + temperature on a 25 Hz ticker and
-// publishes via BARO_DATA. Downstream KF integration is deliberately
-// separate — this task stays driver-only so a bad altitude fusion
-// never knocks out the raw-value diagnostic.
+// Owns I2C1 + SCL/SDA pins directly (not a pre-built I2c) so it can
+// drop the driver and bitbang SCL to unstick the bus when the STM32
+// I2C peripheral latches BUSY/ARLO. Observed mid-run on the Radiolink
+// F722: runs clean for ~60 s then dies with a steady stream of
+// timeouts at the 25 Hz tick rate (≈25 errs/s), no reads.
+//
+// Recovery sequence (triggered after `ERR_STREAK_RECOVERY` consecutive
+// errors, ~0.4 s at 25 Hz):
+//   1. Drop the `I2c` — this disconnects pins and disables I2C1 RCC.
+//   2. Drive SCL as push-pull output, toggle 9× at ~100 kHz. Slave
+//      finishes whatever partial byte it was holding SDA low for.
+//   3. Manual STOP: drive SDA low then release high, both with SCL
+//      high. Slave returns to idle.
+//   4. Rebuild I2c, rerun detect + DPS310 init.
+//
+// The outer loop keeps trying forever — a dead bus shouldn't take the
+// flight controller down, and the pos_kf_task handles missing baro
+// samples by coasting on IMU-only prediction.
+
+const BARO_ERR_STREAK_RECOVERY: u32 = 10;   // ~0.4 s at 25 Hz
+const BARO_TIMEOUT_MS: u64 = 5;             // shorter wastes less CPU when stuck
 
 #[embassy_executor::task]
 async fn baro_task(
-    mut i2c: embassy_stm32::i2c::I2c<'static, embassy_stm32::mode::Blocking, embassy_stm32::i2c::Master>,
+    mut i2c_per: embassy_stm32::Peri<'static, embassy_stm32::peripherals::I2C1>,
+    mut scl:     embassy_stm32::Peri<'static, embassy_stm32::peripherals::PB8>,
+    mut sda:     embassy_stm32::Peri<'static, embassy_stm32::peripherals::PB9>,
 ) {
     use drivers::baro::{self, BaroChip, Dps310};
+    use embassy_stm32::gpio::{Level, Output, Speed};
+    use embassy_stm32::i2c::{Config as I2cConfig, I2c};
+    use embassy_stm32::time::Hertz;
+    use embassy_time::Timer;
 
-    let chip = match baro::detect(&mut i2c) {
-        Ok(c) => {
-            defmt::info!("Baro detected: {} ({:?})", baro::name(c), c);
-            c
-        }
-        Err(e) => {
-            defmt::warn!("Baro detect failed: {:?} — baro task exiting", e);
-            return;
-        }
+    let make_cfg = || {
+        let mut c = I2cConfig::default();
+        c.frequency = Hertz(400_000);
+        c.timeout = Duration::from_millis(BARO_TIMEOUT_MS);
+        c
     };
 
-    // Chip-specific init + read loop. Each driver handles its own
-    // compensation math and publishes the unified `BaroSample`.
-    match chip {
-        BaroChip::Dps310 { addr } => {
-            let dps = match Dps310::init(&mut i2c, addr).await {
-                Ok(d) => d,
-                Err(e) => {
-                    defmt::error!("DPS310 init failed: {:?}", e);
-                    return;
+    let mut recovery_count: u32 = 0;
+
+    // Outer loop: (re)build I2c, detect + init, run read loop until it
+    // asks for recovery. The reborrow()s keep ownership of the raw Peris
+    // here so we can drop the I2c and bitbang SCL directly.
+    loop {
+        let mut i2c = I2c::new_blocking(
+            i2c_per.reborrow(),
+            scl.reborrow(),
+            sda.reborrow(),
+            make_cfg(),
+        );
+
+        let chip = match baro::detect(&mut i2c) {
+            Ok(c) => {
+                defmt::info!("Baro detected: {} ({:?})", baro::name(c), c);
+                c
+            }
+            Err(e) => {
+                defmt::warn!("Baro detect failed: {:?} — retrying in 1 s", e);
+                drop(i2c);
+                Timer::after(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+
+        let addr = match chip {
+            BaroChip::Dps310 { addr } => addr,
+            BaroChip::Bmp280 { addr: _ } => {
+                defmt::warn!("BMP280 detected but driver not yet implemented");
+                return;
+            }
+        };
+
+        let dps = match Dps310::init(&mut i2c, addr).await {
+            Ok(d) => d,
+            Err(e) => {
+                defmt::error!("DPS310 init failed: {:?} — retrying in 1 s", e);
+                drop(i2c);
+                Timer::after(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+
+        // ---- Read loop ----
+        let mut ticker = Ticker::every(Duration::from_millis(40)); // 25 Hz
+        let mut reads: u32 = 0;
+        let mut errs:  u32 = 0;
+        let mut streak: u32 = 0;
+        let mut last_report = Instant::now();
+        let mut last_sample: Option<(BaroSample, Instant)> = None;
+
+        let recover = loop {
+            ticker.next().await;
+            match dps.read(&mut i2c) {
+                Ok(s) => {
+                    last_sample = Some((s, Instant::now()));
+                    BARO_DATA.signal(s);
+                    reads = reads.wrapping_add(1);
+                    streak = 0;
                 }
-            };
-
-            let mut ticker = Ticker::every(Duration::from_millis(40)); // 25 Hz
-            let mut reads: u32 = 0;
-            let mut errs:  u32 = 0;
-            let mut last_report = Instant::now();
-            let mut last_sample = BaroSample { pressure_pa: 0.0, temperature_c: 0.0 };
-
-            loop {
-                ticker.next().await;
-                match dps.read(&mut i2c) {
-                    Ok(s) => {
-                        last_sample = s;
-                        BARO_DATA.signal(s);
-                        reads = reads.wrapping_add(1);
-                    }
-                    Err(_) => { errs = errs.wrapping_add(1); }
-                }
-
-                if Instant::now() - last_report >= Duration::from_secs(1) {
-                    defmt::info!(
-                        "Baro {} reads/s, {} errs — P={=f32}Pa T={=f32}C",
-                        reads, errs,
-                        last_sample.pressure_pa, last_sample.temperature_c,
-                    );
-                    reads = 0;
-                    errs = 0;
-                    last_report = Instant::now();
+                Err(_) => {
+                    errs = errs.wrapping_add(1);
+                    streak = streak.saturating_add(1);
                 }
             }
-        }
-        BaroChip::Bmp280 { addr: _ } => {
-            defmt::warn!("BMP280 detected but driver not yet implemented");
+
+            if Instant::now() - last_report >= Duration::from_secs(1) {
+                match (reads, last_sample) {
+                    (0, Some((s, t))) => {
+                        let age_ms = (Instant::now() - t).as_millis() as u32;
+                        defmt::info!(
+                            "Baro 0 reads/s, {} errs — bus stuck (last P={=f32}Pa T={=f32}C age={=u32}ms)",
+                            errs, s.pressure_pa, s.temperature_c, age_ms,
+                        );
+                    }
+                    (0, None) => {
+                        defmt::info!("Baro 0 reads/s, {} errs — bus stuck (no sample yet)", errs);
+                    }
+                    _ => {
+                        let (p, t) = last_sample
+                            .map(|(s, _)| (s.pressure_pa, s.temperature_c))
+                            .unwrap_or((0.0, 0.0));
+                        defmt::info!(
+                            "Baro {} reads/s, {} errs — P={=f32}Pa T={=f32}C",
+                            reads, errs, p, t,
+                        );
+                    }
+                }
+                reads = 0;
+                errs = 0;
+                last_report = Instant::now();
+            }
+
+            if streak >= BARO_ERR_STREAK_RECOVERY {
+                break true;
+            }
+        };
+
+        if recover {
+            recovery_count = recovery_count.saturating_add(1);
+            defmt::warn!(
+                "Baro: I2C bus stuck ({} consecutive errs), running bus recovery (n={})",
+                streak, recovery_count,
+            );
+
+            // Drop the I2c first — this releases pins (set_as_disconnected)
+            // and disables I2C1 RCC via the drop guard.
+            drop(i2c);
+
+            // Bitbang SCL 9× at ~100 kHz with SDA tri-stated. Any slave
+            // mid-byte finishes its transaction after at most 8 extra
+            // clocks; the 9th is the ACK bit which the slave releases.
+            {
+                let mut scl_out = Output::new(scl.reborrow(), Level::High, Speed::Low);
+                // SDA is left floating here (external pull-up holds it high);
+                // we don't drive it during the 9 pulses.
+                for _ in 0..9 {
+                    scl_out.set_low();
+                    Timer::after(Duration::from_micros(5)).await;
+                    scl_out.set_high();
+                    Timer::after(Duration::from_micros(5)).await;
+                }
+
+                // Manual STOP: SDA low → high while SCL is high.
+                let mut sda_out = Output::new(sda.reborrow(), Level::Low, Speed::Low);
+                Timer::after(Duration::from_micros(5)).await;
+                sda_out.set_high();
+                Timer::after(Duration::from_micros(5)).await;
+                // scl_out and sda_out dropped here — pins disconnected,
+                // ready for the I2c rebuild on the next outer iteration.
+            }
+
+            Timer::after(Duration::from_millis(10)).await;
+            // Fall through to the top of the outer loop and rebuild.
         }
     }
 }
