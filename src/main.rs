@@ -690,20 +690,31 @@ async fn mekf_task() {
 // 6-state position/velocity Kalman filter driven by:
 //   - IMU prediction at 100 Hz (matches the MEKF accel-update cadence
 //     so every prediction uses a gravity-corrected attitude).
-//   - Baro altitude updates at ~25 Hz — only fuses after the p_ref
-//     latch completes.
-//   - GPS position updates at ~1 Hz (NMEA default) — only fuses after
-//     the home latch completes.
+//   - GPS position updates at ~1 Hz (NMEA default) — fuses once home
+//     is latched.
+//   - Baro altitude updates at ~25 Hz — fuses only after GPS has
+//     anchored the filter and baro has self-calibrated (see below).
 //
-// Reference pressure: the first `P_REF_SAMPLES` baro readings at boot
-// are averaged to form ground pressure. Altitude is reported AGL
-// (positive-up) relative to that reference.
+// Altitude frame = GPS. The original design averaged the first N baro
+// readings at boot as ground pressure and let altitude hold engage
+// baro-only. That was abandoned after the onboard DPS310 proved
+// intermittent (2026-04-20): a drone that arms and takes off on a
+// sensor that might vanish mid-flight is unsafe. The current design
+// is:
+//   1. Home origin latches on the first GPS fix clearing `FIX3D`,
+//      `≥ MIN_SATS_FOR_LATCH`, and `HDOP < MAX_HDOP_FOR_LATCH`.
+//   2. Subsequent GPS fixes fuse as local NED (home_lat/lon/alt_msl
+//      as the reference). KF altitude converges toward home = 0 m AGL.
+//   3. Once at least `MIN_GPS_FUSES_FOR_BARO_CAL` GPS updates have
+//      fused, the *next* baro sample triggers p_ref self-calibration:
+//      compute the reference pressure that makes baro altitude agree
+//      with the KF's current altitude. From that sample forward, baro
+//      fuses normally (and its σ=0.3 m dominates the altitude axis
+//      over GPS σ=5 m).
+//   4. If baro is never alive, the filter runs GPS-only — noisier
+//      vertical but safe.
 //
-// Home origin (GPS): latches on the first fix that clears `FIX3D`,
-// `≥ MIN_SATS_FOR_LATCH` satellites, and `HDOP < MAX_HDOP_FOR_LATCH`.
-// Once latched, lat/lon deltas are converted to local NED via
-// `geodetic_to_local_ned` and fused with `update_gps`. The home point
-// is never re-latched — GPS rescue has to return to the *original*
+// Home is never re-latched — GPS rescue has to return to the *original*
 // origin, not wherever the receiver sees us now.
 
 #[embassy_executor::task]
@@ -713,15 +724,19 @@ async fn pos_kf_task() {
     const HZ: u64 = 100;
     const PERIOD_MS: u64 = 1000 / HZ;
     const DT: f32 = 1.0 / HZ as f32;
-    // 1 s at the baro task's 25 Hz. A longer latch averages out more
-    // noise but delays when altitude hold can engage; 1 s is a sensible
-    // default for bench bring-up.
-    const P_REF_SAMPLES: u32 = 25;
 
     // GPS home-latch gates. Conservative — a bad home point is a lot
     // worse than waiting a few extra seconds for a better fix.
     const MIN_SATS_FOR_LATCH: u8 = 6;
     const MAX_HDOP_FOR_LATCH: f32 = 2.0;
+
+    // Wait for at least this many GPS fuses (post-home) before
+    // self-calibrating the baro. Each fuse pulls KF altitude closer to
+    // truth; one is technically enough since the init covariance (2 m)
+    // puts a single σ_gps_v=5 m fix at Kalman gain ~0.14 — but two
+    // fuses get us well inside σ_gps_v before we lock in the baro
+    // reference, which is cheap insurance against a one-off noisy fix.
+    const MIN_GPS_FUSES_FOR_BARO_CAL: u32 = 2;
 
     // σ_a = 0.5 m/s² matches the sim tuning — loose enough to track
     // gust transients without treating baro noise as truth. σ_baro =
@@ -736,10 +751,13 @@ async fn pos_kf_task() {
         0.3,  // σ_baro
     );
 
-    let mut p_ref_accum: f32 = 0.0;
-    let mut p_ref_count: u32 = 0;
+    // Baro self-calibration state. p_ref is the pressure that, if
+    // plugged into the hypsometric formula with the baro's current
+    // reading, yields the KF altitude at the moment of calibration.
+    // `baro_calibrated` gates baro fusion — before it flips true,
+    // baro samples are ignored.
     let mut p_ref_pa: f32 = 0.0;
-    let mut ready = false;
+    let mut baro_calibrated = false;
 
     // Home-origin latch state. Stored as f64 for lat/lon to preserve
     // sub-metre resolution; the geodetic helper handles the cast.
@@ -747,6 +765,10 @@ async fn pos_kf_task() {
     let mut home_lon: f64 = 0.0;
     let mut home_alt_msl: f32 = 0.0;
     let mut home_latched = false;
+    // How many GPS updates have fused since home latched. Gates baro
+    // self-calibration so we don't lock in the reference against a
+    // wildly noisy first fix.
+    let mut gps_fuses_post_home: u32 = 0;
 
     let mut last_imu: Option<ImuData> = None;
     let mut last_baro_t = Instant::now();
@@ -813,30 +835,42 @@ async fn pos_kf_task() {
             } else if good_fix {
                 // Convert to local NED and fuse. Z-channel uses
                 // GPS altitude (σ=5 m) so baro still dominates the
-                // short-term; the GPS keeps altitude honest over the
-                // long term via cross-covariance.
+                // short-term once calibrated; the GPS keeps altitude
+                // honest over the long term via cross-covariance.
                 let ned = geodetic_to_local_ned(
                     gps.latitude, gps.longitude, gps.altitude_m,
                     home_lat,      home_lon,      home_alt_msl,
                 );
                 kf.update_gps(ned);
                 gps_updates_sec = gps_updates_sec.wrapping_add(1);
+                gps_fuses_post_home = gps_fuses_post_home.saturating_add(1);
             }
         }
 
         // ---- Baro update (sensor-driven; None on non-25-Hz ticks) ----
+        // Two-phase: self-calibrate once GPS has anchored the KF, then
+        // fuse as an altitude sensor. No boot-time averaging — the
+        // reference pressure is whatever makes baro altitude agree with
+        // the GPS-anchored KF at the moment of calibration.
         if let Some(baro) = BARO_DATA.try_take() {
-            if p_ref_count < P_REF_SAMPLES {
-                p_ref_accum += baro.pressure_pa;
-                p_ref_count += 1;
-                if p_ref_count == P_REF_SAMPLES {
-                    p_ref_pa = p_ref_accum / P_REF_SAMPLES as f32;
-                    ready = true;
-                    defmt::info!(
-                        "PosKF ref latched: p_ref={=f32}Pa after {} samples",
-                        p_ref_pa, P_REF_SAMPLES,
-                    );
+            if !baro_calibrated {
+                if home_latched && gps_fuses_post_home >= MIN_GPS_FUSES_FOR_BARO_CAL {
+                    // p_ref = p_now / (1 - kf_alt_up/44330.77)^5.2558
+                    let kf_alt_up = kf.altitude_up();
+                    let ratio_base = 1.0 - kf_alt_up / 44330.77_f32;
+                    // Guard the pow() against a nonsensical KF alt
+                    // (shouldn't happen post-fuse, but cheap to check).
+                    if ratio_base > 0.0 && baro.pressure_pa > 0.0 {
+                        p_ref_pa = baro.pressure_pa / libm::powf(ratio_base, 5.2558);
+                        baro_calibrated = true;
+                        last_baro_t = Instant::now();
+                        defmt::info!(
+                            "PosKF baro self-cal: p_ref={=f32}Pa @ kf_alt={=f32}m (p_now={=f32}Pa)",
+                            p_ref_pa, kf_alt_up, baro.pressure_pa,
+                        );
+                    }
                 }
+                // Pre-calibration: don't fuse, don't count toward baro_updates_sec.
             } else {
                 let alt_up = baro::pressure_to_altitude_m(baro.pressure_pa, p_ref_pa);
                 kf.update_baro(alt_up);
@@ -845,15 +879,13 @@ async fn pos_kf_task() {
             }
         }
 
-        // ---- GPS-only readiness fallback ----
-        // With the onboard baro dead (2026-04-20), GPS is the only thing
-        // anchoring the vertical axis until the external baro is wired in.
-        // Mark `ready` on home-latch so altitude hold can engage off GPS
-        // altitude (noisier, but adequate for bring-up).
-        if !ready && home_latched {
-            ready = true;
-            defmt::info!("PosKF ready via GPS home latch (no baro)");
-        }
+        // ---- Readiness ----
+        // GPS home latch is the sole gate. Altitude is GPS-anchored from
+        // that point; baro is a nice-to-have that tightens the estimate
+        // once it self-calibrates. Arming requires `home_latched` too
+        // (see `ArmingStateMachine`) — so the control loop never sees
+        // `ready` and `home_latched` disagree at arm time.
+        let ready = home_latched;
 
         // ---- Publish estimate ----
         let s = kf.state();
@@ -874,26 +906,19 @@ async fn pos_kf_task() {
             let (sats, hdop, fix) = last_gps
                 .map(|g| (g.satellites, g.hdop, g.fix_mode as u8))
                 .unwrap_or((0, 99.99, 0));
-            if ready && home_latched {
+            if ready {
                 defmt::info!(
-                    "PosKF ready: alt={=f32}m vz={=f32}m/s | N={=f32}m E={=f32}m | {} baro/s {} gps/s",
+                    "PosKF ready: alt={=f32}m vz={=f32}m/s | N={=f32}m E={=f32}m | baro_cal={} | {} baro/s {} gps/s",
                     est.altitude_up, est.vz_up,
                     est.position_ned[0], est.position_ned[1],
-                    baro_updates_sec, gps_updates_sec,
-                );
-            } else if ready {
-                defmt::info!(
-                    "PosKF alt-ready: alt={=f32}m vz={=f32}m/s | awaiting GPS home (sats={} hdop={=f32} fix={}) | {} baro/s {} gps/s",
-                    est.altitude_up, est.vz_up,
-                    sats, hdop, fix,
+                    baro_calibrated,
                     baro_updates_sec, gps_updates_sec,
                 );
             } else {
                 defmt::info!(
-                    "PosKF waiting: baro {}/{} samples | GPS sats={} hdop={=f32} fix={} | {} baro/s {} gps/s",
-                    p_ref_count, P_REF_SAMPLES,
+                    "PosKF waiting: GPS sats={} hdop={=f32} fix={} | {} gps/s",
                     sats, hdop, fix,
-                    baro_updates_sec, gps_updates_sec,
+                    gps_updates_sec,
                 );
             }
             baro_updates_sec = 0;
@@ -1280,6 +1305,9 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
         let throttle_raw = RcChannels::to_unit(last_rc.channels[2]);
         let imu_age_ms = imu_last_seen.elapsed().as_millis() as u32;
         let rc_age_ms = rc_task::rc_last_seen_ms();
+        // GPS-home is a hard arm-time gate (see arming.rs comments).
+        // Before the PosKF has published anything, treat as not-ready.
+        let gps_home_ready = last_pos_est.map(|e| e.home_latched).unwrap_or(false);
 
         let arm_state = arming.update(
             arm_switch,
@@ -1288,6 +1316,7 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
             last_imu.angle[1],  // pitch deg
             imu_age_ms,
             rc_age_ms,
+            gps_home_ready,
         );
         let armed = arm_state == ArmState::Armed;
 
@@ -1301,10 +1330,11 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
                 last_imu.angle[1],
                 imu_age_ms,
                 rc_age_ms,
+                gps_home_ready,
             );
             defmt::info!(
-                "arm rejected: thr_low={} level={} imu={} rc={} | thr={}% roll={}° pitch={}° imu_age={}ms rc_age={}ms ch4={} ch5={}",
-                c.throttle_low, c.attitude_level, c.imu_fresh, c.rc_link_active,
+                "arm rejected: thr_low={} level={} imu={} rc={} gps={} | thr={}% roll={}° pitch={}° imu_age={}ms rc_age={}ms ch4={} ch5={}",
+                c.throttle_low, c.attitude_level, c.imu_fresh, c.rc_link_active, c.gps_home_ready,
                 (throttle_raw * 100.0) as i32,
                 last_imu.angle[0] as i32,
                 last_imu.angle[1] as i32,
