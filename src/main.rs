@@ -725,10 +725,10 @@ async fn pos_kf_task() {
     const PERIOD_MS: u64 = 1000 / HZ;
     const DT: f32 = 1.0 / HZ as f32;
 
-    // GPS home-latch gates. Conservative — a bad home point is a lot
-    // worse than waiting a few extra seconds for a better fix.
-    const MIN_SATS_FOR_LATCH: u8 = 6;
-    const MAX_HDOP_FOR_LATCH: f32 = 2.0;
+    // GPS home-latch gates. Relaxed for Alpha testing in poor-signal
+    // environments. Post-Alpha: tighten to 6 sats / HDOP < 2.5 or lower.
+    const MIN_SATS_FOR_LATCH: u8 = 5;
+    const MAX_HDOP_FOR_LATCH: f32 = 3.5;
 
     // Wait for at least this many GPS fuses (post-home) before
     // self-calibrating the baro. Each fuse pulls KF altitude closer to

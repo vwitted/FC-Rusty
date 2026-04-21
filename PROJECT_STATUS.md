@@ -20,15 +20,16 @@ whenever a material hardware or design change lands (see `CLAUDE.md`).
 | USART2 RX (PA3)   | CRSF RC receiver (R2, 416666)  | ✅ verified — 6 channels parsing                   |
 | USART6 (PC6/PC7)  | GPS (NMEA, 9600, T6/R6)        | ✅ verified — 3D fix, home latches at ≥6 sats      |
 | SPI1 + PB2 + PC4  | ICM-42688P IMU (onboard)       | ✅ verified — 8 kHz reads, MEKF fusing             |
-| I2C1 (PB8/PB9)    | DPS310 barometer (onboard)     | ❌ **dead 2026-04-20** (push-pull bitbang killed it) |
+| I2C1 (PB8/PB9)    | DPS310 barometer (onboard)     | ⚠️ working again — was intermittent, monitoring     |
 | USART1 (PA9/PA10) | WT901B IMU (external, T1/R1)   | ⚠️ deprioritised — driver retained as fallback     |
 | UART4 RX (PA1)    | ESC telemetry                  | ⚪ not wired                                       |
 | Motors PA15/PB3/PB4/PB6 | DShot600 (TIM2/3/4)      | ⚪ **never driven a real ESC**                    |
 | W25Nx1G on SPI3   | Blackbox flash                 | ⚪ post-Alpha                                     |
 
-An identical external DPS310 is on hand for replacement when the user
-solders it to the I2C bus; the firmware is agnostic to baro presence
-and runs GPS-only if it is absent.
+The onboard DPS310 has resumed working (2026-04-21) after the
+intermittency observed on 2026-04-20. An external spare is on hand if
+it dies again. The firmware is agnostic to baro presence and runs
+GPS-only if it is absent.
 
 ### Why Radiolink and not the prior boards
 
@@ -48,7 +49,8 @@ and runs GPS-only if it is absent.
   frame mapped to NED via `BODY_SIGN=[+1,-1,-1]`.
 - **Position**: 6-state linear PosKF (pn, pe, pz, vn, ve, vz) running
   at 100 Hz predict.
-  - GPS home latches on the first fix with `FIX3D && sats ≥ 6 && HDOP < 2`.
+  - GPS home latches on the first fix with `FIX3D && sats ≥ 5 && HDOP < 3.5`
+    (relaxed for Alpha testing; see backlog for post-Alpha tightening).
   - GPS altitude fuses with σ_gps_v = 5 m; baro (when alive) with
     σ_baro = 0.3 m. Baro dominates the short term; GPS keeps altitude
     honest long-term via cross-covariance.
@@ -84,7 +86,9 @@ and runs GPS-only if it is absent.
 
 ## What's Next
 
-1. **Flash + outdoor verify `a7feea0`.** Then push.
+1. ~~**Flash + outdoor verify `a7feea0`.**~~ Flashed 2026-04-21.
+   GPS-latch thresholds relaxed to 5 sats / HDOP < 3.5 for Alpha
+   testing. Push once verified.
 2. **Motor bring-up on F722.** Never run DShot against a real ESC on
    this hardware. Biggest remaining unknown. ⚠ **Critical safety note:**
    the ESC 'V' pad is Vbat (11–25 V LiPo), not 5 V — bridging it to
@@ -92,7 +96,6 @@ and runs GPS-only if it is absent.
    ST-Link. Triple-check before powering up.
 3. **Close the loop on hardware.** Rate-PID-only hover first, then
    enable the MPC outer loop and tune for transfer from sim.
-4. **External DPS310 soldering** (user task) → baro fusion comes back.
 
 ---
 
@@ -115,6 +118,10 @@ and runs GPS-only if it is absent.
   eRPM telemetry for notch filtering; we could go further and use it
   as an adaptive thrust-mapping term in the MPC's B matrix. See
   "Post-Alpha directions" below.
+- **Tighten GPS home-latch thresholds.** Alpha uses 5 sats / HDOP < 3.5
+  for testability in poor-signal environments. Post-Alpha, tighten to
+  6 sats / HDOP < 2.5 or potentially lower once testing moves to
+  open-sky locations.
 - **Pilot-facing "lost both sensors" warning.** Currently a combined
   baro+GPS loss would just leave the KF coasting on IMU with no
   explicit downgrade. Not implemented.
