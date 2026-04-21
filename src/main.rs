@@ -1208,7 +1208,9 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
     const RAD2DEG: f32 = 180.0 / PI;
 
     // ---- Arming state machine ----
+    // TODO: re-enable GPS requirement before outdoor flight
     let mut arming = ArmingStateMachine::new();
+    arming.require_gps = false; // bench mode — no GPS indoors
 
     // ---- MPC attitude outer loop (50 Hz) ----
     let mut mpc = AttitudeMpc::new();

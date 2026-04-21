@@ -61,6 +61,8 @@ pub struct ArmingStateMachine {
     pub max_arm_angle_deg: f32,
     pub max_imu_age_ms: u32,
     pub max_rc_age_ms: u32,
+    /// When false, GPS home latch is not required to arm (bench mode).
+    pub require_gps: bool,
 }
 
 impl ArmingStateMachine {
@@ -72,6 +74,7 @@ impl ArmingStateMachine {
             max_arm_angle_deg: 25.0,
             max_imu_age_ms: 50,
             max_rc_age_ms: 500,
+            require_gps: true,
         }
     }
 
@@ -146,7 +149,7 @@ impl ArmingStateMachine {
             attitude_level: attitude_mag < self.max_arm_angle_deg,
             imu_fresh: imu_age_ms < self.max_imu_age_ms,
             rc_link_active: rc_age_ms < self.max_rc_age_ms,
-            gps_home_ready: gps_home_latched,
+            gps_home_ready: gps_home_latched || !self.require_gps,
         }
     }
 
