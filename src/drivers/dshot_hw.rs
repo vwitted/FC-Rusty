@@ -1,17 +1,28 @@
-// dshot_hw.rs — multi-timer DMA-driven DShot600 for SpeedyBee F7 V3.
+// dshot_hw.rs — multi-timer DMA-driven DShot600 for Radiolink F722.
 //
-// The F7 V3 motor pins span three different timers, so we cannot
-// drive all four channels from a single timer like the F405 port
-// did. Instead we run three DMA streams in parallel — one TIMx_UP
+// The motor pins span three different timers, so we cannot drive
+// all four channels from a single timer like the F405 port did.
+// Instead we run three DMA streams in parallel — one TIMx_UP
 // stream per timer — and `join3!` on the three transfers.
 //
-// TIM2 (M1 + M2) uses the same burst mechanism as the old F405
-// driver, just 2 channels wide instead of 4: one DMA write per
-// update event scatters two u16s to CCR1 and CCR2.
+// All four outputs go through Embassy's burst-DMA variant
+// (`waveform_up_multi_channel`). TIM2 carries two channels
+// interleaved (M1+M2). TIM3 and TIM4 only drive one channel each,
+// but we still use the multi-channel API in its degenerate form
+// (Ch1 → Ch1, DBL=0) so every motor sits on the same DMAR-burst
+// mechanism.
 //
-// TIM3 (M3) and TIM4 (M4) each use `waveform_up` — the single-
-// channel variant that writes one u16 to CCRx per update event.
-// Same update-event-DMA mechanism, simpler buffer (no interleave).
+// The single-channel `waveform_up` variant looks simpler but
+// saves/restores CCR around the transfer and hits a FIFO-close
+// race at the frame tail — Embassy flags this in its own source
+// at `simple_pwm.rs:357` ("this can almost always trigger a DMA
+// FIFO error"). That corrupted tail caused two of four ESC
+// channels to fail motor bring-up on 2026-04-22 (one stuck at
+// protocol-detect, one weakly spinning with no arm command),
+// while the M1/M2 pair on the TIM2 burst path armed cleanly.
+// Swapping the M3 signal wire onto ESC-channel 1 moved the fault
+// with it, confirming the signal — not the ESCs — was at fault.
+// Unifying all four onto the burst path fixed it.
 //
 // Pin / peripheral assignment (see main.rs header for the full map):
 //   TIM2 CH1 → PA15 → M1 (rear-right,  CW)     AF1
@@ -189,13 +200,15 @@ impl<'d> DshotQuad<'d> {
                 Channel::Ch2,
                 &self.buf_tim2,
             ),
-            self.tim3.waveform_up(
+            self.tim3.waveform_up_multi_channel(
                 self.dma_tim3_up.reborrow(),
+                Channel::Ch1,
                 Channel::Ch1,
                 &self.buf_tim3,
             ),
-            self.tim4.waveform_up(
+            self.tim4.waveform_up_multi_channel(
                 self.dma_tim4_up.reborrow(),
+                Channel::Ch1,
                 Channel::Ch1,
                 &self.buf_tim4,
             ),

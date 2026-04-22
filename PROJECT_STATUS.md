@@ -89,11 +89,21 @@ GPS-only if it is absent.
 1. ~~**Flash + outdoor verify `a7feea0`.**~~ Flashed 2026-04-21.
    GPS-latch thresholds relaxed to 5 sats / HDOP < 3.5 for Alpha
    testing. Push once verified.
-2. **Motor bring-up on F722.** Never run DShot against a real ESC on
-   this hardware. Biggest remaining unknown. ⚠ **Critical safety note:**
-   the ESC 'V' pad is Vbat (11–25 V LiPo), not 5 V — bridging it to
-   the FC 5 V rail killed a previous dev board, the GPS, and the
-   ST-Link. Triple-check before powering up.
+2. **Motor bring-up on F722** — ⚠ **blocked, under investigation.**
+   First attempt 2026-04-22: all four ESC channels show different
+   degrees of DShot decode failure. Swap tests show the malformed
+   behaviour follows the FC signal wire, not the ESC — so the
+   driver or peripheral config is implicated, not the ESCs. Three
+   of the four ESCs are proven healthy on TIM2's signal; a fourth
+   is unproven. Arm attempts at 29 % thrust did not produce clean
+   spin on any motor. Full session observations and hypotheses in
+   `docs/motor-bringup-log.md`. Next diagnostic step waits on an
+   oscilloscope (in transit) to capture TIM2 vs TIM3/4 waveforms
+   directly. Secondary option: retry with a different ESC.
+   ⚠ **Critical safety note:** the ESC 'V' pad is Vbat (11–25 V
+   LiPo), not 5 V — bridging it to the FC 5 V rail killed a
+   previous dev board, the GPS, and the ST-Link. Triple-check
+   before powering up.
 3. **Close the loop on hardware.** Rate-PID-only hover first, then
    enable the MPC outer loop and tune for transfer from sim.
 

@@ -94,3 +94,6 @@ Disable it (`--no-default-features`) when building on the host.
 - `examples/sim_*.rs` — host sim harnesses.
 - `ARCHITECTURE.md` — module structure, task model, data flow.
 - `PROJECT_STATUS.md` — current state, next steps, post-Alpha ideas.
+- `docs/` — append-only session logs for open investigations
+  (e.g. `motor-bringup-log.md`). Not authoritative; useful context
+  when picking up a stalled bring-up thread.
