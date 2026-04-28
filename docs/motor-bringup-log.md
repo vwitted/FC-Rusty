@@ -188,3 +188,194 @@ separated "FC signal on TIM3/4 is bad" from "ESC3/4 are bad".
   our ESCs have reliably reached — so the command can't be the
   lever.
 - `waveform_up` single-channel API for TIM3/TIM4. T4 ruled it out.
+
+## Session 2026-04-25 — register-level instrumentation, alignment red herring, all checks pass
+
+### Setup
+
+- Branch: `feat/icm42688-mekf` (still).
+- Same physical bench as 2026-04-22.
+- **Hardware change**: ESC swapped to a different model running the
+  A-H-30 BLHeli_S firmware (no bidirectional). Each motor verified
+  spinning under direct bench drive before this session.
+- New diagnostic module `src/drivers/dshot_diag.rs` written this
+  session — boot-time + 1 Hz post-send register dumps gated behind
+  `embassy-stm32/unstable-pac`. See `DshotQuad::log_config` and
+  `log_runtime_state`.
+
+### Tests and observations
+
+#### T1 — Move DMA buffers to SRAM2
+
+Hypothesis: STM32F722 DTCM (0x2000_0000–0x2000_FFFF) is unreachable
+by DMA1; if Embassy's main-task stack puts our buffer there, DMA
+reads silently return garbage.
+
+Approach: shrink `RAM` in `memory.x` from 256 K to 255 K, point
+three `&'static mut` slices at hardcoded addresses in the reserved
+1 KB at the top of SRAM2.
+
+- **Boot log proved the hypothesis was real**: pre-relocation buffer
+  addresses were `tim2=2000_039c tim3=2000_03e4 tim4=2000_0408` —
+  all firmly in DTCM. The static-pool task stack model put them
+  there, not the cortex-m-rt top-of-RAM stack assumption.
+- **But moving them did not change the fault.** Symptoms identical
+  to 2026-04-22. So DTCM-unreachability was not the root cause we
+  thought it was — DMA must have been transferring *something*, just
+  apparently still wrong.
+- **Code kept**: defensive even if not curative. Buffers now live at
+  `0x2003_FC00 / FC60 / FC90`.
+
+#### T2 — Build the diagnostic module
+
+Wrote `dshot_diag.rs` exposing one-shot boot dumps (TIMPRE, GPIO
+state, timer counters, all three timer config registers, SCB cache
+state, buffer-canary write/readback) and a 1 Hz post-send dump
+(per-stream NDTR, error flags, CR/FCR/PAR/M0AR; per-channel CCR1).
+Wired into `DshotQuad::log_config()` (boot) and `send()` (every
+200th frame).
+
+#### T3 — First diagnostic run: FE on every stream every frame
+
+Boot dump: PSC=0, ARR=179, CCMR1=0x6868 (PWM mode 1 + CCR preload),
+CCER active-high, caches off, all canaries OK. *Configuration
+correct.*
+
+Runtime dump: every stream on every frame:
+`NDTR=0 TC=false HT=true TE=false DME=false FE=true`.
+Last CCR=0 on every channel.
+
+So: data transferred to completion (NDTR=0, last cell landed) but
+the FIFO error flag fires on every transfer.
+
+#### T4 — Buffer-alignment hypothesis (red herring)
+
+Found in Embassy: `waveform_up_multi_channel` hardcodes
+`mburst=Incr4` and `fifo_threshold=Full` on F7. With 16-bit MSIZE
+that requires NDTR to be a multiple of 8 cells (16 bytes). Our
+buffers were 36 cells (TIM2) and 18 cells (TIM3/4) — none aligned.
+Per F7 RM, an unaligned trailing burst is dropped → last bits of
+every frame would be silently truncated.
+
+Padded `STEPS_PER_FRAME` from 18 → 24 (16 data + 8 trailing zeros);
+TIM2 grew correspondingly to 48 cells; SRAM2 layout re-laid out as
+`0x2003_FC00 / FC60 / FC90`.
+
+- **Result**: FE flag still set on every transfer. Symptoms
+  unchanged.
+- **Conclusion**: the alignment hypothesis was wrong. Re-reading
+  Embassy's own `simple_pwm.rs:357` comment, the FE on
+  `waveform_up*` is a documented benign cleanup race — DMA stream
+  is disabled before the timer's last UEV-triggered request, which
+  always sets FE without corrupting prior transfers.
+- **Padding kept**: harmless (extra 13 µs idle low per frame, well
+  under our 5 ms inter-frame budget) and removes alignment as a
+  variable for any future reanalysis.
+
+#### T5 — Clock-tree / GPIO / counter sanity
+
+Added `log_timpre`, `log_gpio_pins`, `log_timer_running` to the
+boot dump. All clean:
+
+- `RCC.DCKCFGR1.TIMPRE = 0 (MUL2)` → timer clock = 108 MHz, exactly
+  as the bit-cell math assumes. (TIMPRE=1 would have made our
+  "DShot600" actually DShot1200, undecodable by BLHeli_S — credible
+  hypothesis fully ruled out.)
+- All four motor pins: `MODER=2 (AF), OSPEEDR=3 (VeryHigh)`,
+  `AF=1 / 1 / 2 / 2` — exactly the F722 datasheet expects for
+  TIM2_CH1, TIM2_CH2, TIM3_CH1, TIM4_CH1.
+- TIM2/3/4 CNT advance 6–8 ticks between back-to-back reads
+  (~55 ns at 108 MHz). All three timers running at the configured
+  rate.
+
+#### T6 — Manual throttle pass-through
+
+Spotted in the log: `armed=true stick_thr=100% thrust_cmd=29%`.
+Stick was being captured for the log line only; the altitude
+controller pinned `current_thrust = hover_throttle` (0.294)
+whenever PosKF wasn't ready, regardless of arm or stick.
+
+Fixed in `src/main.rs`: when PosKF isn't ready, fall through to
+`current_thrust = throttle_raw.clamp(0.0, 1.0)` (direct stick →
+mixer). Position-flight path unchanged. One-shot
+`WARN ARMED without PosKF lock — MANUAL THROTTLE pass-through` on
+the rising arm edge so the operator gets a clear reminder in the
+log. Unrelated to DShot decode but blocks any meaningful motor
+verification once DShot starts working.
+
+### Proven at end of session
+
+1. **Every register-level check passes.** Clock tree, GPIO config,
+   timer config, DMA placement, buffer alignment, cache state,
+   canary integrity — all correct. By every metric we can read,
+   the FC is emitting valid DShot600 on all four pins.
+2. **The FE flag is benign** (Embassy's own documented cleanup race
+   in `waveform_up*`). It's not the cause of decode failure.
+3. **Two physically distinct ESCs (different brands, different
+   silkscreens) both fail identically.** No credible systemic flaw
+   shared between them — points strongly at the FC's signal as the
+   problem, not the receiver.
+4. **Manual throttle pass-through works** when PosKF isn't ready,
+   so once DShot decodes, motor response can be verified directly.
+
+### Unproven / open
+
+1. **What the signal actually looks like at the pad.** Every
+   register says it's correct, but no oscilloscope trace exists yet
+   to confirm the physical waveform matches the configured timing
+   and polarity. This is now the only remaining unknown.
+2. **Whether the signal degrades between MCU pad and ESC input.**
+   Wire impedance, broken trace, capacitive loading — none ruled
+   out without scope traces at both ends.
+3. **One cosmetic bug**: the `log_dma1_stream` "error flags set"
+   warn renders as the D-cache warn string at runtime (defmt index
+   mismatch — likely a stale elf in the decoder, not a real D-cache
+   problem; boot dump confirms `IC=0 DC=0`). `cargo clean &&
+   rebuild && reflash` should resync. Not investigated further this
+   session.
+
+### Scheduled next steps
+
+- **Scope arrives 2026-04-26**. Capture order:
+  1. PA15 directly at the MCU pad (M1, TIM2_CH1). Confirm: bit
+     period 1.67 µs, T1H ≈ 1.25 µs, T0H ≈ 625 ns, 0–3.3 V swing,
+     16 bits then idle low.
+  2. Same probe on the ESC input pad fed by that same wire. If
+     identical to MCU side → ESC-side issue (despite the
+     two-different-ESCs argument); if different → wire/connector
+     integrity.
+  3. Repeat on PB4 (TIM3_CH1) for cross-timer comparison.
+- **If the scope shows a clean, spec-compliant DShot600 frame at
+  both ends** — then re-examine the BLHeli_S decode-side
+  assumptions (boot tones don't necessarily mean protocol
+  detection; bidirectional accidentally enabled despite A-H-30
+  defaults; etc.).
+
+### Code state at session end
+
+- `memory.x`: RAM 256 K → 255 K, reserves the top 1 KB of SRAM2 for
+  manually-placed DMA buffers.
+- `src/drivers/dshot_hw.rs`: `STEPS_PER_FRAME = 24` (was 18); SRAM2
+  buffers at `0x2003_FC00 / FC60 / FC90`; new `log_config()` and
+  `log_runtime_state()` methods; 1 Hz post-send diagnostic gate.
+- `src/drivers/dshot_diag.rs`: new module — TIMPRE / GPIO / timer
+  CNT / cache / per-timer config / per-DMA-stream state / canary
+  helpers.
+- `Cargo.toml`: `embassy-stm32` gains the `unstable-pac` feature.
+- `src/main.rs`: `dshot.log_config()` at boot; `dshot_diag` mod
+  registered; manual-throttle pass-through when PosKF not ready;
+  one-shot `ARMED without PosKF lock` warn on the arm edge.
+
+### What not to re-try without new evidence
+
+- Buffer relocation, padding, or SRAM-region tricks. T1+T4 fully
+  exhausted that direction; the buffers are demonstrably in
+  DMA-reachable memory and DMA demonstrably consumes the full
+  count.
+- Clock-tree retuning (PSC/ARR/TIMPRE). T5 confirmed 108 MHz timer
+  clock matches the bit-cell math.
+- GPIO retuning (MODER/OSPEEDR/AF). T5 confirmed the datasheet
+  values.
+- Treating the FE flag as a bug to fix. It's Embassy's documented
+  end-of-transfer cleanup race; chasing it costs time and the
+  scope will dispatch the actual root cause faster.

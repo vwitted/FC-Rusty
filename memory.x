@@ -17,6 +17,6 @@ MEMORY
    * is enabled — keep it matching reality regardless.
    */
   FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 512K
-  RAM   (rwx): ORIGIN = 0x20000000, LENGTH = 256K
+  RAM   (rwx): ORIGIN = 0x20000000, LENGTH = 255K
   ITCM  (rx) : ORIGIN = 0x00000000, LENGTH = 16K
 }
