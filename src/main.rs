@@ -32,11 +32,11 @@
 #![no_main]
 
 use embassy_executor::Spawner;
-use embassy_stm32::usart::{self, Uart, UartRx};
 use embassy_stm32::time::Hertz;
+use embassy_stm32::usart::{self, Uart, UartRx};
 use embassy_stm32::{bind_interrupts, peripherals};
-use embassy_sync::signal::Signal;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Ticker};
 
 use panic_probe as _; // panic handler that works with probe
@@ -46,6 +46,7 @@ mod drivers {
     pub mod baro;
     pub mod crsf;
     pub mod dshot;
+    pub mod dshot_diag;
     pub mod dshot_hw;
     pub mod icm42688;
     pub mod nmea;
@@ -64,23 +65,22 @@ mod estimation;
 mod logger;
 mod rc_task;
 
+use attitude_mekf::{AttitudeMekf, G_MPS2, MekfParams};
+use control::altitude::{AltitudeController, AltitudeGains};
+use control::arming::{ArmState, ArmingStateMachine};
+use control::mixer::{ControlDemand, QUAD_X};
+use control::mpc::AttitudeMpc;
+use control::pid::{PidGains, PidLimits, RatePidController};
+use drivers::baro::{self, BaroSample};
 use drivers::crsf::RcChannels;
 use drivers::dshot::{DshotFrame, DshotSpeed};
 use drivers::dshot_hw::DshotQuad;
 use drivers::icm42688::RawImu;
-use drivers::nmea::{NmeaParser, GpsData, FixMode};
+use drivers::nmea::{FixMode, GpsData, NmeaParser};
 use drivers::wt901b::{
-    Wt901bParser, ImuData,
-    UPDATED_ACCEL, UPDATED_GYRO, UPDATED_ANGLE, UPDATED_QUAT,
+    ImuData, UPDATED_ACCEL, UPDATED_ANGLE, UPDATED_GYRO, UPDATED_QUAT, Wt901bParser,
 };
-use attitude_mekf::{AttitudeMekf, MekfParams, G_MPS2};
-use drivers::baro::{self, BaroSample};
 use estimation::{PosKf, geodetic_to_local_ned};
-use control::arming::{ArmingStateMachine, ArmState};
-use control::mixer::{ControlDemand, QUAD_X};
-use control::pid::{PidGains, PidLimits, RatePidController};
-use control::mpc::AttitudeMpc;
-use control::altitude::{AltitudeController, AltitudeGains};
 
 // ---- Interrupt bindings ----
 
@@ -107,7 +107,7 @@ static RAW_IMU: Signal<CriticalSectionRawMutex, RawImu> = Signal::new();
 /// read task is making progress, so a silent INT pin still shows up
 /// as `0 samples/s, 0 errors/s` instead of no log at all.
 static ICM_SAMPLES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-static ICM_ERRORS:  core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static ICM_ERRORS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Latest GPS data from the GPS task
 static GPS_DATA: Signal<CriticalSectionRawMutex, GpsData> = Signal::new();
@@ -189,8 +189,8 @@ async fn main(spawner: Spawner) {
     //   APB1 = 54 MHz  (prescaler 4), APB1 timers = 108 MHz
     //   APB2 = 108 MHz (prescaler 2), APB2 timers = 216 MHz
     use embassy_stm32::rcc::{
-        Hse, HseMode, Pll, PllMul, PllPreDiv, PllPDiv, PllQDiv,
-        PllSource, Sysclk, APBPrescaler, AHBPrescaler,
+        AHBPrescaler, APBPrescaler, Hse, HseMode, Pll, PllMul, PllPDiv, PllPreDiv, PllQDiv,
+        PllSource, Sysclk,
     };
     let mut config = embassy_stm32::Config::default();
     config.rcc.hse = Some(Hse {
@@ -199,18 +199,22 @@ async fn main(spawner: Spawner) {
     });
     config.rcc.pll_src = PllSource::HSE;
     config.rcc.pll = Some(Pll {
-        prediv: PllPreDiv::DIV4,    // 8 MHz / 4 = 2 MHz VCO input
-        mul: PllMul::MUL216,        // 2 MHz × 216 = 432 MHz VCO
-        divp: Some(PllPDiv::DIV2),  // 432 / 2 = 216 MHz SYSCLK
-        divq: Some(PllQDiv::DIV9),  // 432 / 9 = 48 MHz USB
+        prediv: PllPreDiv::DIV4,   // 8 MHz / 4 = 2 MHz VCO input
+        mul: PllMul::MUL216,       // 2 MHz × 216 = 432 MHz VCO
+        divp: Some(PllPDiv::DIV2), // 432 / 2 = 216 MHz SYSCLK
+        divq: Some(PllQDiv::DIV9), // 432 / 9 = 48 MHz USB
         divr: None,
     });
     config.rcc.sys = Sysclk::PLL1_P;
-    config.rcc.ahb_pre = AHBPrescaler::DIV1;    // 216 MHz
-    config.rcc.apb1_pre = APBPrescaler::DIV4;   // 54 MHz (timers 108 MHz)
-    config.rcc.apb2_pre = APBPrescaler::DIV2;   // 108 MHz (timers 216 MHz)
+    config.rcc.ahb_pre = AHBPrescaler::DIV1; // 216 MHz
+    config.rcc.apb1_pre = APBPrescaler::DIV4; // 54 MHz (timers 108 MHz)
+    config.rcc.apb2_pre = APBPrescaler::DIV2; // 108 MHz (timers 216 MHz)
 
     let p = embassy_stm32::init(config);
+
+    // Disable D-cache as early as possible
+    let mut core = cortex_m::Peripherals::take().unwrap();
+    core.SCB.disable_dcache(&mut core.CPUID);
 
     // Bring up USART3 TX (PB10) for defmt output before anything else
     // so the first defmt::info! below actually lands on the wire.
@@ -223,10 +227,11 @@ async fn main(spawner: Spawner) {
     let rc_uart = UartRx::new(
         p.USART2,
         Irqs,
-        p.PA3,           // RX pin
-        p.DMA1_CH5,      // USART2_RX → DMA1 Stream 5
+        p.PA3,      // RX pin
+        p.DMA1_CH5, // USART2_RX → DMA1 Stream 5
         rc_task::crsf_uart_config(),
-    ).unwrap();
+    )
+    .unwrap();
 
     spawner.spawn(rc_task::run(rc_uart)).unwrap();
     defmt::info!("RC task spawned");
@@ -242,13 +247,14 @@ async fn main(spawner: Spawner) {
 
     let imu_uart = Uart::new(
         p.USART1,
-        p.PA10,          // RX
-        p.PA9,           // TX
+        p.PA10, // RX
+        p.PA9,  // TX
         Irqs,
-        p.DMA2_CH7,      // USART1_TX → DMA2 Stream 7
-        p.DMA2_CH2,      // USART1_RX → DMA2 Stream 2
+        p.DMA2_CH7, // USART1_TX → DMA2 Stream 7
+        p.DMA2_CH2, // USART1_RX → DMA2 Stream 2
         imu_uart_config,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Split into TX+RX, auto-detect baud + configure. Hand TX to a
     // dedicated command task so the control loop can trigger in-field
@@ -264,25 +270,24 @@ async fn main(spawner: Spawner) {
     // SCK=PA5, MISO=PA6, MOSI=PA7, CS=PB2, INT1=PC4.
     // SPI @ 10 MHz target (embassy picks nearest ≤: 6.75 MHz on APB2).
     {
-        use embassy_stm32::spi::{Config as SpiConfig, Spi};
-        use embassy_stm32::gpio::{Level, Output, Pull, Speed};
         use embassy_stm32::exti::ExtiInput;
+        use embassy_stm32::gpio::{Level, Output, Pull, Speed};
+        use embassy_stm32::spi::{Config as SpiConfig, Spi};
         use embassy_stm32::time::Hertz;
 
         let mut spi_cfg = SpiConfig::default();
         spi_cfg.frequency = Hertz(10_000_000);
 
         let spi = Spi::new(
-            p.SPI1,
-            p.PA5,           // SCK
-            p.PA7,           // MOSI
-            p.PA6,           // MISO
-            p.DMA2_CH3,      // SPI1_TX (ch3)
-            p.DMA2_CH0,      // SPI1_RX (ch3)
+            p.SPI1, p.PA5,      // SCK
+            p.PA7,      // MOSI
+            p.PA6,      // MISO
+            p.DMA2_CH3, // SPI1_TX (ch3)
+            p.DMA2_CH0, // SPI1_RX (ch3)
             spi_cfg,
         );
 
-        let cs   = Output::new(p.PB2, Level::High, Speed::VeryHigh);
+        let cs = Output::new(p.PB2, Level::High, Speed::VeryHigh);
         let drdy = ExtiInput::new(p.PC4, p.EXTI4, Pull::None);
 
         match drivers::icm42688::Icm42688::new(spi, cs).await {
@@ -321,13 +326,14 @@ async fn main(spawner: Spawner) {
 
     let gps_uart = Uart::new(
         p.USART6,
-        p.PC7,           // RX
-        p.PC6,           // TX
+        p.PC7, // RX
+        p.PC6, // TX
         Irqs,
-        p.DMA2_CH6,      // TX DMA
-        p.DMA2_CH1,      // RX DMA
+        p.DMA2_CH6, // TX DMA
+        p.DMA2_CH1, // RX DMA
         gps_uart_config,
-    ).unwrap();
+    )
+    .unwrap();
 
     let (_gps_tx, gps_rx) = gps_uart.split();
     spawner.spawn(gps_task(gps_rx)).unwrap();
@@ -337,13 +343,20 @@ async fn main(spawner: Spawner) {
     // M1=PA15 (TIM2_CH1), M2=PB3 (TIM2_CH2),
     // M3=PB4  (TIM3_CH1), M4=PB6 (TIM4_CH1).
     let dshot = DshotQuad::new(
-        p.TIM2, p.TIM3, p.TIM4,
-        p.PA15, p.PB3, p.PB4, p.PB6,
-        p.DMA1_CH7,      // TIM2_UP
-        p.DMA1_CH2,      // TIM3_UP
-        p.DMA1_CH6,      // TIM4_UP
+        p.TIM2,
+        p.TIM3,
+        p.TIM4,
+        p.PA15,
+        p.PB3,
+        p.PB4,
+        p.PB6,
+        p.DMA1_CH7, // TIM2_UP
+        p.DMA1_CH2, // TIM3_UP
+        p.DMA1_CH6, // TIM4_UP
         DshotSpeed::Dshot600,
     );
+
+    dshot.log_config();
     defmt::info!("DShot (TIM2+TIM3+TIM4, DShot600) initialised");
 
     // ---- Run the control loop on the main task ----
@@ -357,9 +370,7 @@ async fn main(spawner: Spawner) {
 // Reads NMEA sentences from the GPS module, publishes via GPS_DATA signal.
 
 #[embassy_executor::task]
-async fn gps_task(
-    mut rx: UartRx<'static, embassy_stm32::mode::Async>,
-) {
+async fn gps_task(mut rx: UartRx<'static, embassy_stm32::mode::Async>) {
     let mut parser = NmeaParser::new();
     let mut buf = [0u8; 128];
     let mut sentence_count: u32 = 0;
@@ -381,9 +392,7 @@ async fn gps_task(
                         GPS_DATA_FOR_KF.signal(parser.data);
 
                         if !announced_first {
-                            defmt::info!(
-                                "GPS: first NMEA sentence parsed — stream is alive"
-                            );
+                            defmt::info!("GPS: first NMEA sentence parsed — stream is alive");
                             announced_first = true;
                         }
 
@@ -419,9 +428,7 @@ async fn gps_task(
 // then publishes parsed data via the IMU_DATA signal.
 
 #[embassy_executor::task]
-async fn imu_task(
-    mut rx: UartRx<'static, embassy_stm32::mode::Async>,
-) {
+async fn imu_task(mut rx: UartRx<'static, embassy_stm32::mode::Async>) {
     defmt::info!("IMU task started");
 
     let mut parser = Wt901bParser::new();
@@ -460,8 +467,12 @@ async fn imu_task(
                         if pkt_count == 1 {
                             defmt::info!(
                                 "IMU first packet! accel=[{:?},{:?},{:?}] gyro=[{:?},{:?},{:?}]",
-                                parser.data.accel[0], parser.data.accel[1], parser.data.accel[2],
-                                parser.data.gyro[0], parser.data.gyro[1], parser.data.gyro[2],
+                                parser.data.accel[0],
+                                parser.data.accel[1],
+                                parser.data.accel[2],
+                                parser.data.gyro[0],
+                                parser.data.gyro[1],
+                                parser.data.gyro[2],
                             );
                         }
                     }
@@ -471,7 +482,9 @@ async fn imu_task(
                 if last_report.elapsed() >= Duration::from_secs(1) {
                     defmt::info!(
                         "[IMU-DEBUG] 1s window: {} bytes, {} pkts parsed (total {})",
-                        bytes_since_report, pkts_since_report, pkt_count
+                        bytes_since_report,
+                        pkts_since_report,
+                        pkt_count
                     );
                     bytes_since_report = 0;
                     pkts_since_report = 0;
@@ -497,7 +510,7 @@ async fn imu_task(
 
 #[embassy_executor::task]
 async fn icm_read_task(
-    mut imu:  drivers::icm42688::Icm42688<'static>,
+    mut imu: drivers::icm42688::Icm42688<'static>,
     mut drdy: embassy_stm32::exti::ExtiInput<'static>,
 ) {
     use core::sync::atomic::Ordering;
@@ -537,7 +550,15 @@ async fn icm_monitor_task() {
                 let g = r.gyro_dps();
                 defmt::info!(
                     "ICM {} samples/s, {} errors/s — a=[{=f32},{=f32},{=f32}]g g=[{=f32},{=f32},{=f32}]dps T={=f32}C",
-                    s, e, a[0], a[1], a[2], g[0], g[1], g[2], r.temp_c(),
+                    s,
+                    e,
+                    a[0],
+                    a[1],
+                    a[2],
+                    g[0],
+                    g[1],
+                    g[2],
+                    r.temp_c(),
                 );
             }
             None => {
@@ -611,11 +632,7 @@ async fn mekf_task() {
         last_predict = now;
 
         let g_dps = raw.gyro_dps();
-        let gyro_rad = [
-            g_dps[0] * DEG2RAD,
-            g_dps[1] * DEG2RAD,
-            g_dps[2] * DEG2RAD,
-        ];
+        let gyro_rad = [g_dps[0] * DEG2RAD, g_dps[1] * DEG2RAD, g_dps[2] * DEG2RAD];
         mekf.predict(gyro_rad, dt);
 
         let on_kf_tick = sample_count % ACCEL_DECIMATION == 0;
@@ -666,13 +683,14 @@ async fn mekf_task() {
         if (now - last_report) >= Duration::from_secs(1) {
             let b_dps_mag = libm::sqrtf(
                 (bias_rad[0] * RAD2DEG) * (bias_rad[0] * RAD2DEG)
-              + (bias_rad[1] * RAD2DEG) * (bias_rad[1] * RAD2DEG)
-              + (bias_rad[2] * RAD2DEG) * (bias_rad[2] * RAD2DEG),
+                    + (bias_rad[1] * RAD2DEG) * (bias_rad[1] * RAD2DEG)
+                    + (bias_rad[2] * RAD2DEG) * (bias_rad[2] * RAD2DEG),
             );
             defmt::info!(
                 "MEKF {} samples/s, upd={}/{}rej, euler=[{=f32},{=f32},{=f32}]deg, |bias|={=f32}dps",
                 sample_count,
-                updates_applied, updates_rejected,
+                updates_applied,
+                updates_rejected,
                 euler_rad[0] * RAD2DEG,
                 euler_rad[1] * RAD2DEG,
                 euler_rad[2] * RAD2DEG,
@@ -745,10 +763,10 @@ async fn pos_kf_task() {
     // rightly let baro dominate altitude via the much-smaller σ_baro.
     let mut kf = PosKf::new_at(
         [0.0, 0.0, 0.0],
-        0.5,  // σ_a
-        2.0,  // σ_gps_h
-        5.0,  // σ_gps_v
-        0.3,  // σ_baro
+        0.5, // σ_a
+        2.0, // σ_gps_h
+        5.0, // σ_gps_v
+        0.3, // σ_baro
     );
 
     // Baro self-calibration state. p_ref is the pressure that, if
@@ -838,8 +856,12 @@ async fn pos_kf_task() {
                 // short-term once calibrated; the GPS keeps altitude
                 // honest over the long term via cross-covariance.
                 let ned = geodetic_to_local_ned(
-                    gps.latitude, gps.longitude, gps.altitude_m,
-                    home_lat,      home_lon,      home_alt_msl,
+                    gps.latitude,
+                    gps.longitude,
+                    gps.altitude_m,
+                    home_lat,
+                    home_lon,
+                    home_alt_msl,
                 );
                 kf.update_gps(ned);
                 gps_updates_sec = gps_updates_sec.wrapping_add(1);
@@ -866,7 +888,9 @@ async fn pos_kf_task() {
                         last_baro_t = Instant::now();
                         defmt::info!(
                             "PosKF baro self-cal: p_ref={=f32}Pa @ kf_alt={=f32}m (p_now={=f32}Pa)",
-                            p_ref_pa, kf_alt_up, baro.pressure_pa,
+                            p_ref_pa,
+                            kf_alt_up,
+                            baro.pressure_pa,
                         );
                     }
                 }
@@ -909,15 +933,20 @@ async fn pos_kf_task() {
             if ready {
                 defmt::info!(
                     "PosKF ready: alt={=f32}m vz={=f32}m/s | N={=f32}m E={=f32}m | baro_cal={} | {} baro/s {} gps/s",
-                    est.altitude_up, est.vz_up,
-                    est.position_ned[0], est.position_ned[1],
+                    est.altitude_up,
+                    est.vz_up,
+                    est.position_ned[0],
+                    est.position_ned[1],
                     baro_calibrated,
-                    baro_updates_sec, gps_updates_sec,
+                    baro_updates_sec,
+                    gps_updates_sec,
                 );
             } else {
                 defmt::info!(
                     "PosKF waiting: GPS sats={} hdop={=f32} fix={} | {} gps/s",
-                    sats, hdop, fix,
+                    sats,
+                    hdop,
+                    fix,
                     gps_updates_sec,
                 );
             }
@@ -961,15 +990,15 @@ async fn pos_kf_task() {
 // external baro is wired in. A dead bus should not take the FC down,
 // and pos_kf_task handles missing baro via GPS-only altitude.
 
-const BARO_ERR_STREAK_RECOVERY: u32 = 10;   // ~0.4 s at 25 Hz
-const BARO_TIMEOUT_MS: u64 = 5;             // shorter wastes less CPU when stuck
-const BARO_MAX_INIT_ATTEMPTS: u32 = 5;      // give up after this many detect/init failures
+const BARO_ERR_STREAK_RECOVERY: u32 = 10; // ~0.4 s at 25 Hz
+const BARO_TIMEOUT_MS: u64 = 5; // shorter wastes less CPU when stuck
+const BARO_MAX_INIT_ATTEMPTS: u32 = 5; // give up after this many detect/init failures
 
 #[embassy_executor::task]
 async fn baro_task(
     mut i2c_per: embassy_stm32::Peri<'static, embassy_stm32::peripherals::I2C1>,
-    mut scl:     embassy_stm32::Peri<'static, embassy_stm32::peripherals::PB8>,
-    mut sda:     embassy_stm32::Peri<'static, embassy_stm32::peripherals::PB9>,
+    mut scl: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PB8>,
+    mut sda: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PB9>,
 ) {
     use drivers::baro::{self, BaroChip, Dps310};
     use embassy_stm32::gpio::{Level, OutputOpenDrain, Speed};
@@ -1011,18 +1040,14 @@ async fn baro_task(
         if !first_iter {
             Timer::after(Duration::from_millis(2)).await;
             {
-                let mut scl_out = OutputOpenDrain::new(
-                    scl.reborrow(), Level::High, Speed::Low,
-                );
+                let mut scl_out = OutputOpenDrain::new(scl.reborrow(), Level::High, Speed::Low);
                 for _ in 0..9 {
                     scl_out.set_low();
                     Timer::after(Duration::from_micros(5)).await;
                     scl_out.set_high();
                     Timer::after(Duration::from_micros(5)).await;
                 }
-                let mut sda_out = OutputOpenDrain::new(
-                    sda.reborrow(), Level::Low, Speed::Low,
-                );
+                let mut sda_out = OutputOpenDrain::new(sda.reborrow(), Level::Low, Speed::Low);
                 Timer::after(Duration::from_micros(5)).await;
                 sda_out.set_high();
                 Timer::after(Duration::from_micros(5)).await;
@@ -1047,7 +1072,9 @@ async fn baro_task(
                 init_failures = init_failures.saturating_add(1);
                 defmt::warn!(
                     "Baro detect failed: {:?} ({}/{}) — bitbang + retry in 1 s",
-                    e, init_failures, BARO_MAX_INIT_ATTEMPTS,
+                    e,
+                    init_failures,
+                    BARO_MAX_INIT_ATTEMPTS,
                 );
                 drop(i2c);
                 Timer::after(Duration::from_secs(1)).await;
@@ -1069,7 +1096,9 @@ async fn baro_task(
                 init_failures = init_failures.saturating_add(1);
                 defmt::error!(
                     "DPS310 init failed: {:?} ({}/{}) — bitbang + retry in 1 s",
-                    e, init_failures, BARO_MAX_INIT_ATTEMPTS,
+                    e,
+                    init_failures,
+                    BARO_MAX_INIT_ATTEMPTS,
                 );
                 drop(i2c);
                 Timer::after(Duration::from_secs(1)).await;
@@ -1085,7 +1114,7 @@ async fn baro_task(
         // ---- Read loop ----
         let mut ticker = Ticker::every(Duration::from_millis(40)); // 25 Hz
         let mut reads: u32 = 0;
-        let mut errs:  u32 = 0;
+        let mut errs: u32 = 0;
         let mut streak: u32 = 0;
         let mut last_report = Instant::now();
         let mut last_sample: Option<(BaroSample, Instant)> = None;
@@ -1111,7 +1140,10 @@ async fn baro_task(
                         let age_ms = (Instant::now() - t).as_millis() as u32;
                         defmt::info!(
                             "Baro 0 reads/s, {} errs — bus stuck (last P={=f32}Pa T={=f32}C age={=u32}ms)",
-                            errs, s.pressure_pa, s.temperature_c, age_ms,
+                            errs,
+                            s.pressure_pa,
+                            s.temperature_c,
+                            age_ms,
                         );
                     }
                     (0, None) => {
@@ -1123,7 +1155,10 @@ async fn baro_task(
                             .unwrap_or((0.0, 0.0));
                         defmt::info!(
                             "Baro {} reads/s, {} errs — P={=f32}Pa T={=f32}C",
-                            reads, errs, p, t,
+                            reads,
+                            errs,
+                            p,
+                            t,
                         );
                     }
                 }
@@ -1141,7 +1176,8 @@ async fn baro_task(
             recovery_count = recovery_count.saturating_add(1);
             defmt::warn!(
                 "Baro: I2C bus stuck ({} consecutive errs), recovering (n={})",
-                streak, recovery_count,
+                streak,
+                recovery_count,
             );
             drop(i2c);
             // Fall through — top of outer loop runs the bitbang + rebuild.
@@ -1157,10 +1193,8 @@ async fn baro_task(
 // critical path — which is why it lives here, not inline.
 
 #[embassy_executor::task]
-async fn imu_command_task(
-    mut tx: usart::UartTx<'static, embassy_stm32::mode::Async>,
-) {
-    use drivers::wt901b::{config, SAVE, UNLOCK};
+async fn imu_command_task(mut tx: usart::UartTx<'static, embassy_stm32::mode::Async>) {
+    use drivers::wt901b::{SAVE, UNLOCK, config};
     use embassy_time::Timer;
 
     let step = Duration::from_millis(200);
@@ -1218,25 +1252,44 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
 
     // ---- Altitude hold (50 Hz) ----
     let hover_throttle: f32 = 0.294; // tune per aircraft: mass*g / max_thrust
-    let alt_gains = AltitudeGains { kp: 0.15, kd: 0.1, ki: 0.05 };
+    let alt_gains = AltitudeGains {
+        kp: 0.15,
+        kd: 0.1,
+        ki: 0.05,
+    };
     let mut alt_ctrl = AltitudeController::new(alt_gains, hover_throttle);
     let mut current_thrust = hover_throttle;
 
     // ---- PID rate inner loop (200 Hz) ----
     // Gains tuned for real hardware with motor lag (~30ms ESC+motor).
     // Adjust Kp/Ki/Kd during bench testing with props off first.
-    let rate_gains = PidGains { kp: 0.02, ki: 0.005, kd: 0.001 };
-    let yaw_gains = PidGains { kp: 0.03, ki: 0.005, kd: 0.0 };
-    let limits = PidLimits { integral_max: 0.3, output_max: 0.5, d_lpf_tau_s: 0.008 };
+    let rate_gains = PidGains {
+        kp: 0.02,
+        ki: 0.005,
+        kd: 0.001,
+    };
+    let yaw_gains = PidGains {
+        kp: 0.03,
+        ki: 0.005,
+        kd: 0.0,
+    };
+    let limits = PidLimits {
+        integral_max: 0.3,
+        output_max: 0.5,
+        d_lpf_tau_s: 0.008,
+    };
     let mut rate_pid = RatePidController::new(rate_gains, rate_gains, yaw_gains, limits);
 
     // ---- Sensor state ----
-    let mut last_rc = RcChannels { channels: [992; 16] };
+    let mut last_rc = RcChannels {
+        channels: [992; 16],
+    };
     let mut last_imu = ImuData::new();
     let mut last_gps = GpsData::new();
     let mut last_pos_est: Option<PosEstimate> = None;
     let mut imu_last_seen = Instant::now();
     let mut control_demand = ControlDemand::default();
+    let mut last_armed = false;
 
     // ---- Magnetometer calibration state (AUX ch7) ----
     // Switch high = enter cal mode; switch low = save if held >10s,
@@ -1314,13 +1367,22 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
         let arm_state = arming.update(
             arm_switch,
             throttle_raw,
-            last_imu.angle[0],  // roll deg
-            last_imu.angle[1],  // pitch deg
+            last_imu.angle[0], // roll deg
+            last_imu.angle[1], // pitch deg
             imu_age_ms,
             rc_age_ms,
             gps_home_ready,
         );
         let armed = arm_state == ArmState::Armed;
+        if armed && !last_armed {
+            let pos_ready = last_pos_est.map(|e| e.ready).unwrap_or(false);
+            if !pos_ready {
+                defmt::warn!(
+                    "ARMED without PosKF lock — MANUAL THROTTLE pass-through (no altitude hold)"
+                );
+            }
+        }
+        last_armed = armed;
 
         // Bench diagnostic: if the switch is high but we're still disarmed,
         // report which pre-arm check(s) failed at 1 Hz so the user can see
@@ -1336,12 +1398,18 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
             );
             defmt::info!(
                 "arm rejected: thr_low={} level={} imu={} rc={} gps={} | thr={}% roll={}° pitch={}° imu_age={}ms rc_age={}ms ch4={} ch5={}",
-                c.throttle_low, c.attitude_level, c.imu_fresh, c.rc_link_active, c.gps_home_ready,
+                c.throttle_low,
+                c.attitude_level,
+                c.imu_fresh,
+                c.rc_link_active,
+                c.gps_home_ready,
                 (throttle_raw * 100.0) as i32,
                 last_imu.angle[0] as i32,
                 last_imu.angle[1] as i32,
-                imu_age_ms, rc_age_ms,
-                last_rc.channels[4], last_rc.channels[5],
+                imu_age_ms,
+                rc_age_ms,
+                last_rc.channels[4],
+                last_rc.channels[5],
             );
         }
 
@@ -1440,19 +1508,15 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
                 // today, baro+GPS once `update_gps` is wired in Phase 4c).
                 // Gated on `ready`: the p_ref latch takes ~1 s from first
                 // baro sample, and closing the loop before then would
-                // chase garbage. While not ready, fall back to the
-                // hover_throttle bias so the drone hovers-ish but doesn't
-                // actively try to hold altitude.
+                // chase garbage. With no PosKF lock (bench / GPS-denied
+                // arm), fall through to direct stick → thrust so motor
+                // bring-up can verify throttle response without GPS.
                 if let Some(est) = last_pos_est.filter(|e| e.ready) {
                     let target_alt = est.altitude_up; // hold current altitude
-                    current_thrust = alt_ctrl.update(
-                        target_alt,
-                        est.altitude_up,
-                        est.vz_up,
-                        dt * 4.0,
-                    );
+                    current_thrust =
+                        alt_ctrl.update(target_alt, est.altitude_up, est.vz_up, dt * 4.0);
                 } else {
-                    current_thrust = hover_throttle;
+                    current_thrust = throttle_raw.clamp(0.0, 1.0);
                 }
             }
 
