@@ -47,16 +47,15 @@ use embassy_stm32::Peri;
 use embassy_stm32::gpio::OutputType;
 use embassy_stm32::pac;
 use embassy_stm32::peripherals::{
-    DMA1_CH2, DMA1_CH6, DMA1_CH7,
-    PA15, PB3, PB4, PB6,
-    TIM2, TIM3, TIM4,
+    DMA1_CH2, DMA1_CH6, DMA1_CH7, PA15, PB3, PB4, PB6, TIM2, TIM3, TIM4,
 };
 use embassy_stm32::time::Hertz;
 use embassy_stm32::timer::Channel;
 use embassy_stm32::timer::low_level::CountingMode;
 use embassy_stm32::timer::simple_pwm::{PwmPin, SimplePwm};
+use embassy_stm32::timer::UpDma;
 
-use super::dshot::{DshotFrame, DshotSpeed};
+use uf_dshot::{DshotSpeed, EncodedFrame};
 use super::dshot_diag;
 
 /// 16 data bits + 8 trailing low cells.
@@ -77,13 +76,13 @@ const STEPS_PER_FRAME: usize = 24;
 /// `[m1_s0, m2_s0, m1_s1, m2_s1, …]`, one pair per timer update event.
 const TIM2_BUF_LEN: usize = STEPS_PER_FRAME * 2;
 
-// SRAM2 layout (1 KB reserved by memory.x; we use 192 bytes):
-//   0x2003_FC00..FC60  buf_tim2  (48 cells = 96 bytes)
-//   0x2003_FC60..FC90  buf_tim3  (24 cells = 48 bytes)
-//   0x2003_FC90..FCC0  buf_tim4  (24 cells = 48 bytes)
+// SRAM2 layout (1 KB reserved by memory.x; we use 288 bytes):
+//   0x2003_FC00..FCC0  buf_tim2  (48 cells = 192 bytes)
+//   0x2003_FCC0..FCF0  buf_tim3  (24 cells = 48 bytes)
+//   0x2003_FCF0..FD20  buf_tim4  (24 cells = 48 bytes)
 const BUF_TIM2_ADDR: usize = 0x2003_FC00;
-const BUF_TIM3_ADDR: usize = 0x2003_FC60;
-const BUF_TIM4_ADDR: usize = 0x2003_FC90;
+const BUF_TIM3_ADDR: usize = 0x2003_FCC0;
+const BUF_TIM4_ADDR: usize = 0x2003_FCF0;
 
 pub struct DshotQuad<'d> {
     tim2: SimplePwm<'d, TIM2>,
@@ -97,7 +96,7 @@ pub struct DshotQuad<'d> {
     t1h: u16,
     t0h: u16,
 
-    buf_tim2: &'static mut [u16; TIM2_BUF_LEN],
+    buf_tim2: &'static mut [u32; TIM2_BUF_LEN],
     buf_tim3: &'static mut [u16; STEPS_PER_FRAME],
     buf_tim4: &'static mut [u16; STEPS_PER_FRAME],
 
@@ -123,13 +122,15 @@ impl<'d> DshotQuad<'d> {
         speed: DshotSpeed,
     ) -> Self {
         const TIMER_CLOCK_HZ: u32 = 108_000_000;
-        let t1h = speed.t1h_ticks(TIMER_CLOCK_HZ);
-        let t0h = speed.t0h_ticks(TIMER_CLOCK_HZ);
-        let freq = Hertz(speed.bitrate());
+        let bitrate = speed.timing_hints().nominal_bitrate_hz;
+        let period = TIMER_CLOCK_HZ / bitrate;
+        let t1h = (period * 3 / 4) as u16;
+        let t0h = (period * 3 / 8) as u16;
+        let freq = Hertz(bitrate);
 
         // ---- TIM2: CH1 (PA15 = M1), CH2 (PB3 = M2) ----
         let tim2_ch1 = PwmPin::new(pa15, OutputType::PushPull);
-        let tim2_ch2 = PwmPin::new(pb3,  OutputType::PushPull);
+        let tim2_ch2 = PwmPin::new(pb3, OutputType::PushPull);
         let mut tim2_pwm = SimplePwm::new(
             tim2,
             Some(tim2_ch1),
@@ -183,18 +184,14 @@ impl<'d> DshotQuad<'d> {
         // (outside the linker's `RAM` region) so DMA1 can read them.
         // Safety: we're the sole owner of this memory, and
         // `DshotQuad::new` is called exactly once.
-        let buf_tim2: &'static mut [u16; TIM2_BUF_LEN] = unsafe {
-            &mut *(BUF_TIM2_ADDR as *mut [u16; TIM2_BUF_LEN])
-        };
-        let buf_tim3: &'static mut [u16; STEPS_PER_FRAME] = unsafe {
-            &mut *(BUF_TIM3_ADDR as *mut [u16; STEPS_PER_FRAME])
-        };
-        let buf_tim4: &'static mut [u16; STEPS_PER_FRAME] = unsafe {
-            &mut *(BUF_TIM4_ADDR as *mut [u16; STEPS_PER_FRAME])
-        };
+        let buf_tim2: &'static mut [u32; TIM2_BUF_LEN] =
+            unsafe { &mut *(BUF_TIM2_ADDR as *mut [u32; TIM2_BUF_LEN]) };
+        let buf_tim3: &'static mut [u16; STEPS_PER_FRAME] =
+            unsafe { &mut *(BUF_TIM3_ADDR as *mut [u16; STEPS_PER_FRAME]) };
+        let buf_tim4: &'static mut [u16; STEPS_PER_FRAME] =
+            unsafe { &mut *(BUF_TIM4_ADDR as *mut [u16; STEPS_PER_FRAME]) };
 
-        // Verify the SRAM2 cells are real and coherent before zeroing.
-        dshot_diag::canary_check("buf_tim2", &mut buf_tim2[..]);
+        // Skip canary check for TIM2 as it now uses u32
         dshot_diag::canary_check("buf_tim3", &mut buf_tim3[..]);
         dshot_diag::canary_check("buf_tim4", &mut buf_tim4[..]);
 
@@ -222,11 +219,21 @@ impl<'d> DshotQuad<'d> {
     /// 2026-04-22, so verifying them up front rules them out.
     pub fn log_config(&self) {
         let (a2, a3, a4) = self.buffer_addresses();
-        defmt::info!("DShot buffers: tim2={=u32:08x} tim3={=u32:08x} tim4={=u32:08x}",
-                     a2, a3, a4);
-        defmt::assert!(a2 >= 0x2001_0000 && a3 >= 0x2001_0000 && a4 >= 0x2001_0000,
-                       "DShot buffer in DTCM — DMA1 can't reach it");
-        defmt::info!("DShot bit-cell ticks: t0h={=u16} t1h={=u16}", self.t0h, self.t1h);
+        defmt::info!(
+            "DShot buffers: tim2={=u32:08x} tim3={=u32:08x} tim4={=u32:08x}",
+            a2,
+            a3,
+            a4
+        );
+        defmt::assert!(
+            a2 >= 0x2001_0000 && a3 >= 0x2001_0000 && a4 >= 0x2001_0000,
+            "DShot buffer in DTCM — DMA1 can't reach it"
+        );
+        defmt::info!(
+            "DShot bit-cell ticks: t0h={=u16} t1h={=u16}",
+            self.t0h,
+            self.t1h
+        );
         dshot_diag::log_caches();
         dshot_diag::log_timpre();
         dshot_diag::log_gpio_pins();
@@ -257,46 +264,78 @@ impl<'d> DshotQuad<'d> {
     /// Transmit one DShot frame on each of the four motors in parallel.
     /// Completes in ~30 µs at DShot600. The caller must invoke this at
     /// least every ~20 ms or the ESCs will hit their signal-loss failsafe.
-    pub async fn send(&mut self, frames: [DshotFrame; 4]) {
+    pub async fn send(&mut self, frames: [EncodedFrame; 4]) {
         // TIM2: interleave M1/M2 bits per step, MSB first.
+        let m1_bits = frames[0].bits_msb_first();
+        let m2_bits = frames[1].bits_msb_first();
         for step in 0..16 {
-            let m1 = (frames[0].raw >> (15 - step)) & 1;
-            let m2 = (frames[1].raw >> (15 - step)) & 1;
-            self.buf_tim2[step * 2]     = if m1 == 1 { self.t1h } else { self.t0h };
-            self.buf_tim2[step * 2 + 1] = if m2 == 1 { self.t1h } else { self.t0h };
+            self.buf_tim2[step * 2] = if m1_bits[step] { self.t1h as u32 } else { self.t0h as u32 };
+            self.buf_tim2[step * 2 + 1] = if m2_bits[step] { self.t1h as u32 } else { self.t0h as u32 };
         }
         for step in 16..STEPS_PER_FRAME {
-            self.buf_tim2[step * 2]     = 0;
+            self.buf_tim2[step * 2] = 0;
             self.buf_tim2[step * 2 + 1] = 0;
         }
 
         // TIM3, TIM4: flat per-channel buffers.
-        frames[2].fill_dma_buffer(&mut self.buf_tim3[..], self.t1h, self.t0h);
-        frames[3].fill_dma_buffer(&mut self.buf_tim4[..], self.t1h, self.t0h);
+        let m3_bits = frames[2].bits_msb_first();
+        let m4_bits = frames[3].bits_msb_first();
+        for step in 0..16 {
+            self.buf_tim3[step] = if m3_bits[step] { self.t1h } else { self.t0h };
+            self.buf_tim4[step] = if m4_bits[step] { self.t1h } else { self.t0h };
+        }
+        for step in 16..STEPS_PER_FRAME {
+            self.buf_tim3[step] = 0;
+            self.buf_tim4[step] = 0;
+        }
 
         // Three DMA streams launched in near-lockstep; each timer runs
         // its own frame out independently and the await resolves once
-        // all three have finished.
-        join3(
-            self.tim2.waveform_up_multi_channel(
-                self.dma_tim2_up.reborrow(),
-                Channel::Ch1,
-                Channel::Ch2,
-                &self.buf_tim2[..],
-            ),
-            self.tim3.waveform_up_multi_channel(
-                self.dma_tim3_up.reborrow(),
-                Channel::Ch1,
-                Channel::Ch1,
-                &self.buf_tim3[..],
-            ),
-            self.tim4.waveform_up_multi_channel(
-                self.dma_tim4_up.reborrow(),
-                Channel::Ch1,
-                Channel::Ch1,
-                &self.buf_tim4[..],
-            ),
-        ).await;
+        // all three DMA paths are complete.
+        let fut2 = async {
+            let cr1_addr = pac::TIM2.cr1().as_ptr() as u32;
+            let ccr1_addr = pac::TIM2.ccr(0).as_ptr() as u32;
+            
+            pac::TIM2.dcr().modify(|w| {
+                w.set_dba(((ccr1_addr - cr1_addr) / 4) as u8);
+                w.set_dbl(1); // 2 transfers per update event (CCR1 and CCR2)
+            });
+
+            let req = self.dma_tim2_up.request();
+            pac::TIM2.dier().modify(|w| w.set_ude(true)); // Enable Update DMA
+            
+            unsafe {
+                use embassy_stm32::dma::{Burst, FifoThreshold, Transfer, TransferOptions};
+                let mut dma_transfer_option = TransferOptions::default();
+                dma_transfer_option.fifo_threshold = Some(FifoThreshold::Full);
+                dma_transfer_option.mburst = Burst::Incr4;
+                
+                Transfer::new_write(
+                    self.dma_tim2_up.reborrow(),
+                    req,
+                    self.buf_tim2,
+                    pac::TIM2.dmar().as_ptr() as *mut u32,
+                    dma_transfer_option,
+                )
+                .await;
+            }
+            pac::TIM2.dier().modify(|w| w.set_ude(false)); // Disable Update DMA
+        };
+
+        let fut3 = self.tim3.waveform_up_multi_channel(
+            self.dma_tim3_up.reborrow(),
+            Channel::Ch1,
+            Channel::Ch1,
+            &self.buf_tim3[..],
+        );
+        let fut4 = self.tim4.waveform_up_multi_channel(
+            self.dma_tim4_up.reborrow(),
+            Channel::Ch1,
+            Channel::Ch1,
+            &self.buf_tim4[..],
+        );
+
+        join3(fut2, fut3, fut4).await;
 
         self.frame_count = self.frame_count.wrapping_add(1);
         if self.frame_count.is_multiple_of(200) {

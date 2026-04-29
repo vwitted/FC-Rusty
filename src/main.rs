@@ -45,7 +45,6 @@ use panic_probe as _; // panic handler that works with probe
 mod drivers {
     pub mod baro;
     pub mod crsf;
-    pub mod dshot;
     pub mod dshot_diag;
     pub mod dshot_hw;
     pub mod icm42688;
@@ -73,8 +72,8 @@ use control::mpc::AttitudeMpc;
 use control::pid::{PidGains, PidLimits, RatePidController};
 use drivers::baro::{self, BaroSample};
 use drivers::crsf::RcChannels;
-use drivers::dshot::{DshotFrame, DshotSpeed};
 use drivers::dshot_hw::DshotQuad;
+use uf_dshot::{Command, DshotSpeed, DshotTx, EncodedFrame};
 use drivers::icm42688::RawImu;
 use drivers::nmea::{FixMode, GpsData, NmeaParser};
 use drivers::wt901b::{
@@ -1543,16 +1542,18 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
         let motor_outputs = QUAD_X.apply(&control_demand);
 
         // ---- 5. DShot output ----
-        let frames: [DshotFrame; 4] = if armed {
-            [
-                DshotFrame::from_normalised(motor_outputs.motors[0], false),
-                DshotFrame::from_normalised(motor_outputs.motors[1], false),
-                DshotFrame::from_normalised(motor_outputs.motors[2], false),
-                DshotFrame::from_normalised(motor_outputs.motors[3], false),
-            ]
-        } else {
-            [DshotFrame::disarmed(); 4]
-        };
+        let mut frames: [EncodedFrame; 4] = [DshotTx::standard().command(Command::MotorStop); 4];
+        if armed {
+            for i in 0..4 {
+                let v = motor_outputs.motors[i];
+                if v <= 0.0 {
+                    frames[i] = DshotTx::standard().command(Command::MotorStop);
+                } else {
+                    let throttle = (v * 1999.0) as u16;
+                    frames[i] = DshotTx::standard().throttle_clamped(throttle);
+                }
+            }
+        }
         dshot.send(frames).await;
 
         // ---- 6. Loop timing ----

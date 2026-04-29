@@ -538,6 +538,7 @@ dependencies = [
  "panic-probe",
  "static_cell",
  "tinympc-rs",
+ "uf-dshot",
 ]
 
 [[package]]
@@ -1101,6 +1102,15 @@ name = "typenum"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
+
+[[package]]
+name = "uf-dshot"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "334cf1a0e85c02285054a8f68be30f00107161fbb00f19e3d074415288709700"
+dependencies = [
+ "defmt 1.0.1",
+]
 
 [[package]]
 name = "unicode-ident"

@@ -112,6 +112,7 @@ panic-probe = { version = "0.3", optional = true, features = ["print-defmt"] }
 
 # Static allocation
 static_cell = { version = "2", optional = true }
+uf-dshot = { version = "0.1.0", features = ["defmt"] }
 
 # ---- Build profiles ----
 
