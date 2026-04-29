@@ -83,6 +83,7 @@ embassy-stm32 = { version = "0.4", optional = true, features = [
     "time-driver-tim5",
     "exti",
     "defmt",
+    "unstable-pac",
 ] }
 # Embassy time
 embassy-time = { version = "0.5", optional = true, features = [

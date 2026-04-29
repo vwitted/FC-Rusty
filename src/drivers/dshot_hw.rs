@@ -45,6 +45,7 @@
 use embassy_futures::join::join3;
 use embassy_stm32::Peri;
 use embassy_stm32::gpio::OutputType;
+use embassy_stm32::pac;
 use embassy_stm32::peripherals::{
     DMA1_CH2, DMA1_CH6, DMA1_CH7,
     PA15, PB3, PB4, PB6,
@@ -56,13 +57,33 @@ use embassy_stm32::timer::low_level::CountingMode;
 use embassy_stm32::timer::simple_pwm::{PwmPin, SimplePwm};
 
 use super::dshot::{DshotFrame, DshotSpeed};
+use super::dshot_diag;
 
-/// 16 data bits + 2 trailing low cells so lines idle low after the frame.
-const STEPS_PER_FRAME: usize = 18;
+/// 16 data bits + 8 trailing low cells.
+///
+/// Two reasons for 8 trailing zeros (we'd only need 2 to idle low):
+/// Embassy's `waveform_up_multi_channel` configures the F7 DMA with
+/// `mburst=Incr4` (4-beat memory bursts) and `fifo_threshold=Full`
+/// (16-byte FIFO), which together require the total transfer length
+/// in bytes to be a multiple of 16. With 16-bit cells that's a
+/// multiple of 8 cells. Misalignment causes a FIFO error and the
+/// trailing partial-burst is dropped — corrupting the last bits of
+/// every frame (proven on bench 2026-04-25, see motor-bringup-log).
+/// 24 cells × 2 bytes = 48 bytes (TIM3/4) and × 4 = 96 bytes (TIM2)
+/// — both clean multiples of 16.
+const STEPS_PER_FRAME: usize = 24;
 
 /// TIM2 carries two channels interleaved row-major:
 /// `[m1_s0, m2_s0, m1_s1, m2_s1, …]`, one pair per timer update event.
 const TIM2_BUF_LEN: usize = STEPS_PER_FRAME * 2;
+
+// SRAM2 layout (1 KB reserved by memory.x; we use 192 bytes):
+//   0x2003_FC00..FC60  buf_tim2  (48 cells = 96 bytes)
+//   0x2003_FC60..FC90  buf_tim3  (24 cells = 48 bytes)
+//   0x2003_FC90..FCC0  buf_tim4  (24 cells = 48 bytes)
+const BUF_TIM2_ADDR: usize = 0x2003_FC00;
+const BUF_TIM3_ADDR: usize = 0x2003_FC60;
+const BUF_TIM4_ADDR: usize = 0x2003_FC90;
 
 pub struct DshotQuad<'d> {
     tim2: SimplePwm<'d, TIM2>,
@@ -76,9 +97,12 @@ pub struct DshotQuad<'d> {
     t1h: u16,
     t0h: u16,
 
-    buf_tim2: [u16; TIM2_BUF_LEN],
-    buf_tim3: [u16; STEPS_PER_FRAME],
-    buf_tim4: [u16; STEPS_PER_FRAME],
+    buf_tim2: &'static mut [u16; TIM2_BUF_LEN],
+    buf_tim3: &'static mut [u16; STEPS_PER_FRAME],
+    buf_tim4: &'static mut [u16; STEPS_PER_FRAME],
+
+    /// Wraps every 200 sends. Used to gate the 1 Hz runtime diag log.
+    frame_count: u32,
 }
 
 impl<'d> DshotQuad<'d> {
@@ -155,6 +179,25 @@ impl<'d> DshotQuad<'d> {
             c.enable();
         }
 
+        // DShot DMA buffers — placed at a fixed address in SRAM2
+        // (outside the linker's `RAM` region) so DMA1 can read them.
+        // Safety: we're the sole owner of this memory, and
+        // `DshotQuad::new` is called exactly once.
+        let buf_tim2: &'static mut [u16; TIM2_BUF_LEN] = unsafe {
+            &mut *(BUF_TIM2_ADDR as *mut [u16; TIM2_BUF_LEN])
+        };
+        let buf_tim3: &'static mut [u16; STEPS_PER_FRAME] = unsafe {
+            &mut *(BUF_TIM3_ADDR as *mut [u16; STEPS_PER_FRAME])
+        };
+        let buf_tim4: &'static mut [u16; STEPS_PER_FRAME] = unsafe {
+            &mut *(BUF_TIM4_ADDR as *mut [u16; STEPS_PER_FRAME])
+        };
+
+        // Verify the SRAM2 cells are real and coherent before zeroing.
+        dshot_diag::canary_check("buf_tim2", &mut buf_tim2[..]);
+        dshot_diag::canary_check("buf_tim3", &mut buf_tim3[..]);
+        dshot_diag::canary_check("buf_tim4", &mut buf_tim4[..]);
+
         Self {
             tim2: tim2_pwm,
             tim3: tim3_pwm,
@@ -164,10 +207,51 @@ impl<'d> DshotQuad<'d> {
             dma_tim4_up,
             t1h,
             t0h,
-            buf_tim2: [0; TIM2_BUF_LEN],
-            buf_tim3: [0; STEPS_PER_FRAME],
-            buf_tim4: [0; STEPS_PER_FRAME],
+            buf_tim2,
+            buf_tim3,
+            buf_tim4,
+            frame_count: 0,
         }
+    }
+
+    /// Dump caches, every timer's PWM/DMA configuration, and assert
+    /// the DMA buffers landed in SRAM (not DTCM, which DMA1 can't
+    /// reach). Call once at boot, immediately after `new`. Cheap
+    /// (~10 defmt lines) but high-signal: PSC/ARR/CCMR/DCR mismatches
+    /// would produce exactly the malformed-signal symptoms seen on
+    /// 2026-04-22, so verifying them up front rules them out.
+    pub fn log_config(&self) {
+        let (a2, a3, a4) = self.buffer_addresses();
+        defmt::info!("DShot buffers: tim2={=u32:08x} tim3={=u32:08x} tim4={=u32:08x}",
+                     a2, a3, a4);
+        defmt::assert!(a2 >= 0x2001_0000 && a3 >= 0x2001_0000 && a4 >= 0x2001_0000,
+                       "DShot buffer in DTCM — DMA1 can't reach it");
+        defmt::info!("DShot bit-cell ticks: t0h={=u16} t1h={=u16}", self.t0h, self.t1h);
+        dshot_diag::log_caches();
+        dshot_diag::log_timpre();
+        dshot_diag::log_gpio_pins();
+        dshot_diag::log_timer_running();
+        dshot_diag::log_tim2_config();
+        dshot_diag::log_tim3_config();
+        dshot_diag::log_tim4_config();
+    }
+
+    /// Post-transfer DMA + timer state for all three streams. Called
+    /// from `send()` every 200 frames (~1 Hz at the 200 Hz outer
+    /// loop). Intended to surface mid-flight regressions: an NDTR
+    /// stuck > 0, an error flag set, or a non-zero CCR1 at frame end
+    /// would all explain ESCs failing to decode.
+    pub fn log_runtime_state(&self) {
+        dshot_diag::log_dma1_stream("TIM2_UP", 7);
+        dshot_diag::log_dma1_stream("TIM3_UP", 2);
+        dshot_diag::log_dma1_stream("TIM4_UP", 6);
+        defmt::info!(
+            "post-send CCR: tim2_ch1={=u32} tim2_ch2={=u32} tim3_ch1={=u16} tim4_ch1={=u16}",
+            pac::TIM2.ccr(0).read(),
+            pac::TIM2.ccr(1).read(),
+            pac::TIM3.ccr(0).read().ccr(),
+            pac::TIM4.ccr(0).read().ccr(),
+        );
     }
 
     /// Transmit one DShot frame on each of the four motors in parallel.
@@ -187,8 +271,8 @@ impl<'d> DshotQuad<'d> {
         }
 
         // TIM3, TIM4: flat per-channel buffers.
-        frames[2].fill_dma_buffer(&mut self.buf_tim3, self.t1h, self.t0h);
-        frames[3].fill_dma_buffer(&mut self.buf_tim4, self.t1h, self.t0h);
+        frames[2].fill_dma_buffer(&mut self.buf_tim3[..], self.t1h, self.t0h);
+        frames[3].fill_dma_buffer(&mut self.buf_tim4[..], self.t1h, self.t0h);
 
         // Three DMA streams launched in near-lockstep; each timer runs
         // its own frame out independently and the await resolves once
@@ -198,20 +282,35 @@ impl<'d> DshotQuad<'d> {
                 self.dma_tim2_up.reborrow(),
                 Channel::Ch1,
                 Channel::Ch2,
-                &self.buf_tim2,
+                &self.buf_tim2[..],
             ),
             self.tim3.waveform_up_multi_channel(
                 self.dma_tim3_up.reborrow(),
                 Channel::Ch1,
                 Channel::Ch1,
-                &self.buf_tim3,
+                &self.buf_tim3[..],
             ),
             self.tim4.waveform_up_multi_channel(
                 self.dma_tim4_up.reborrow(),
                 Channel::Ch1,
                 Channel::Ch1,
-                &self.buf_tim4,
+                &self.buf_tim4[..],
             ),
         ).await;
+
+        self.frame_count = self.frame_count.wrapping_add(1);
+        if self.frame_count.is_multiple_of(200) {
+            self.log_runtime_state();
+        }
+    }
+
+    /// Returns the memory addresses of the three DMA buffers.
+    /// Used to verify buffers live in DMA-accessible memory.
+    pub fn buffer_addresses(&self) -> (u32, u32, u32) {
+        (
+            self.buf_tim2.as_ptr() as u32,
+            self.buf_tim3.as_ptr() as u32,
+            self.buf_tim4.as_ptr() as u32,
+        )
     }
 }
