@@ -25,15 +25,15 @@ use embassy_stm32::pac;
 /// BLHeli_S can't decode (max DShot600).
 pub fn log_timpre() {
     use pac::rcc::vals::Timpre;
-    let t = pac::RCC.dckcfgr1().read().timpre();
+    let t = pac::RCC.cfgr().read().timpre();
     let raw = t.to_bits();
     let label: &str = match t {
-        Timpre::MUL2 => "MUL2 (timer = APB*2 = 108 MHz expected)",
-        Timpre::MUL4 => "MUL4 (timer = HCLK = 216 MHz — DShot600 would be DShot1200)",
+        Timpre::DEFAULT_X2 => "DEFAULT_X2 (timer = APB*2 = 240 MHz expected)",
+        Timpre::DEFAULT_X4 => "DEFAULT_X4 (timer = HCLK = 480 MHz)",
     };
-    defmt::info!("RCC.DCKCFGR1.TIMPRE = {=u8} ({=str})", raw, label);
-    if !matches!(t, Timpre::MUL2) {
-        defmt::error!("TIMPRE != MUL2 — actual bit rate is double what we configured");
+    defmt::info!("RCC.CFGR.TIMPRE = {=u8} ({=str})", raw, label);
+    if !matches!(t, Timpre::DEFAULT_X2) {
+        defmt::error!("TIMPRE != DEFAULT_X2 — actual bit rate is double what we configured");
     }
 }
 

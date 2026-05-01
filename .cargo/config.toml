@@ -27,7 +27,7 @@
 # still works.
 
 [target.'cfg(all(target_arch = "arm", target_os = "none"))']
-runner = "probe-rs run --chip STM32F722RETx"
+runner = "probe-rs run --chip STM32H743VITx"
 
 [build]
 target = "thumbv7em-none-eabihf"

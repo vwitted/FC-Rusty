@@ -17,11 +17,11 @@
 // SPI IMU is a post-Alpha optimisation (would need a new driver plus
 // an AHRS filter to recover Euler angles).
 //
-// Motors (multi-timer DShot600 via three parallel DMA streams):
-//   TIM2_CH1 → PA15 → M1 (rear-right,  CW)
-//   TIM2_CH2 → PB3  → M2 (front-right, CCW)
-//   TIM3_CH1 → PB4  → M3 (rear-left,   CCW)
-//   TIM4_CH1 → PB6  → M4 (front-left,  CW)
+// Motors (DShot600 via a single timer multi-channel burst):
+//   TIM2_CH1 → PA0 → M1
+//   TIM2_CH2 → PA1 → M2
+//   TIM2_CH3 → PA2 → M3
+//   TIM2_CH4 → PA3 → M4
 //   See src/drivers/dshot_hw.rs for DMA stream / timing details.
 //
 // Flashing: board has no SWD; use DFU over USB-C. Hold BOOT while
@@ -188,26 +188,29 @@ async fn main(spawner: Spawner) {
     //   APB1 = 54 MHz  (prescaler 4), APB1 timers = 108 MHz
     //   APB2 = 108 MHz (prescaler 2), APB2 timers = 216 MHz
     use embassy_stm32::rcc::{
-        AHBPrescaler, APBPrescaler, Hse, HseMode, Pll, PllMul, PllPDiv, PllPreDiv, PllQDiv,
-        PllSource, Sysclk,
+        AHBPrescaler, APBPrescaler, Hse, HseMode, Pll, PllMul, PllDiv, PllPreDiv,
+        PllSource, Sysclk, VoltageScale,
     };
     let mut config = embassy_stm32::Config::default();
     config.rcc.hse = Some(Hse {
         freq: Hertz(8_000_000),
         mode: HseMode::Oscillator,
     });
-    config.rcc.pll_src = PllSource::HSE;
-    config.rcc.pll = Some(Pll {
-        prediv: PllPreDiv::DIV4,   // 8 MHz / 4 = 2 MHz VCO input
-        mul: PllMul::MUL216,       // 2 MHz × 216 = 432 MHz VCO
-        divp: Some(PllPDiv::DIV2), // 432 / 2 = 216 MHz SYSCLK
-        divq: Some(PllQDiv::DIV9), // 432 / 9 = 48 MHz USB
+    config.rcc.pll1 = Some(Pll {
+        source: PllSource::HSE,
+        prediv: PllPreDiv::DIV1,   // 8 MHz / 1 = 8 MHz VCO input
+        mul: PllMul::MUL120,       // 8 MHz × 120 = 960 MHz VCO
+        divp: Some(PllDiv::DIV2),  // 960 / 2 = 480 MHz SYSCLK
+        divq: Some(PllDiv::DIV20), // 960 / 20 = 48 MHz USB
         divr: None,
     });
     config.rcc.sys = Sysclk::PLL1_P;
-    config.rcc.ahb_pre = AHBPrescaler::DIV1; // 216 MHz
-    config.rcc.apb1_pre = APBPrescaler::DIV4; // 54 MHz (timers 108 MHz)
-    config.rcc.apb2_pre = APBPrescaler::DIV2; // 108 MHz (timers 216 MHz)
+    config.rcc.ahb_pre = AHBPrescaler::DIV2; // 240 MHz
+    config.rcc.apb1_pre = APBPrescaler::DIV2; // 120 MHz (timers 240 MHz)
+    config.rcc.apb2_pre = APBPrescaler::DIV2; // 120 MHz (timers 240 MHz)
+    config.rcc.apb3_pre = APBPrescaler::DIV2; // 120 MHz
+    config.rcc.apb4_pre = APBPrescaler::DIV2; // 120 MHz
+    config.rcc.voltage_scale = VoltageScale::Scale0;
 
     let p = embassy_stm32::init(config);
 
@@ -226,7 +229,7 @@ async fn main(spawner: Spawner) {
     let rc_uart = UartRx::new(
         p.USART2,
         Irqs,
-        p.PA3,      // RX pin
+        p.PD6,      // RX pin (USART2)
         p.DMA1_CH5, // USART2_RX → DMA1 Stream 5
         rc_task::crsf_uart_config(),
     )
@@ -286,7 +289,7 @@ async fn main(spawner: Spawner) {
             spi_cfg,
         );
 
-        let cs = Output::new(p.PB2, Level::High, Speed::VeryHigh);
+        let cs = Output::new(p.PA4, Level::High, Speed::VeryHigh);
         let drdy = ExtiInput::new(p.PC4, p.EXTI4, Pull::None);
 
         match drivers::icm42688::Icm42688::new(spi, cs).await {
@@ -303,14 +306,12 @@ async fn main(spawner: Spawner) {
     }
 
     // ---- Baro on I2C1 (DPS310 or BMP280, auto-detected) ----
-    // SCL=PB8, SDA=PB9. Blocking mode — DMA1 CH6/CH7 (the only I2C1
-    // TX options on F722) are already claimed by DShot, and baro I/O
-    // is ~6 bytes per read so blocking costs <0.1% CPU at 25 Hz.
+    // SCL=PB10, SDA=PB11. Blocking mode.
     //
     // The task owns the raw peripherals (not a pre-built I2c) so it can
     // drop the driver and bitbang SCL to unstick the bus when the STM32
     // I2C peripheral latches BUSY/ARLO — observed mid-run in the field.
-    spawner.spawn(baro_task(p.I2C1, p.PB8, p.PB9)).unwrap();
+    spawner.spawn(baro_task(p.I2C2, p.PB10, p.PB11)).unwrap();
     spawner.spawn(pos_kf_task()).unwrap();
 
     // ---- Configure and spawn the GPS task ----
@@ -338,20 +339,15 @@ async fn main(spawner: Spawner) {
     spawner.spawn(gps_task(gps_rx)).unwrap();
     defmt::info!("GPS task spawned (NMEA at 9600)");
 
-    // ---- DShot ESC outputs (multi-timer across TIM2/TIM3/TIM4) ----
-    // M1=PA15 (TIM2_CH1), M2=PB3 (TIM2_CH2),
-    // M3=PB4  (TIM3_CH1), M4=PB6 (TIM4_CH1).
+    // DShot ESC outputs (all 4 channels on TIM2)
+    // M1=PA0, M2=PA1, M3=PA2, M4=PA3.
     let dshot = DshotQuad::new(
         p.TIM2,
-        p.TIM3,
-        p.TIM4,
-        p.PA15,
-        p.PB3,
-        p.PB4,
-        p.PB6,
+        p.PA0,
+        p.PA1,
+        p.PA2,
+        p.PA3,
         p.DMA1_CH7, // TIM2_UP
-        p.DMA1_CH2, // TIM3_UP
-        p.DMA1_CH6, // TIM4_UP
         DshotSpeed::Dshot600,
     );
 
@@ -995,9 +991,9 @@ const BARO_MAX_INIT_ATTEMPTS: u32 = 5; // give up after this many detect/init fa
 
 #[embassy_executor::task]
 async fn baro_task(
-    mut i2c_per: embassy_stm32::Peri<'static, embassy_stm32::peripherals::I2C1>,
-    mut scl: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PB8>,
-    mut sda: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PB9>,
+    mut i2c_per: embassy_stm32::Peri<'static, embassy_stm32::peripherals::I2C2>,
+    mut scl: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PB10>,
+    mut sda: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PB11>,
 ) {
     use drivers::baro::{self, BaroChip, Dps310};
     use embassy_stm32::gpio::{Level, OutputOpenDrain, Speed};
