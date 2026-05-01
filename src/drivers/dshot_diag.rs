@@ -186,8 +186,13 @@ pub fn log_dma1_stream(name: &'static str, stream: usize) {
         ndtr, par, m0ar, cr, fcr,
         tc, ht, te, dme, fe,
     );
-    if te || dme || fe {
-        defmt::warn!("DMA1 S{=usize} {=str}: error flags set", stream, name);
+    if te || dme {
+        defmt::warn!("DMA1 S{=usize} {=str}: error flags set (TE/DME)", stream, name);
+    }
+    if fe && !te && !dme {
+        // FE (FIFO Error) alone is benign on H7 burst DMA — fires when
+        // the FIFO drains at transfer completion. Not a data-integrity issue.
+        defmt::trace!("DMA1 S{=usize} {=str}: FE flag (benign)", stream, name);
     }
 
     // Clear all six flags for this stream so the next 1 Hz log

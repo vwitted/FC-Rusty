@@ -143,7 +143,7 @@ impl AttitudeMekf {
         //   F = I + dt · [[ −[ω]×,  −I₃ ],
         //                 [    0,     0  ]]
         // We build F discretely and compute FPFᵀ; at 6x6 this is ~200
-        // multiplies, trivial at 8 kHz on the F722 FPU.
+        // multiplies, trivial at 8 kHz on the H743 FPU.
         let wx = skew(&w);
         let mut f = SMatrix::<f32, 6, 6>::identity();
         // top-left 3x3 ← I − dt·[ω]×

@@ -1,21 +1,17 @@
 // main.rs — Flight controller entry point
 //
-// Target: STM32F722RET6 (216 MHz, Cortex-M7F, 64-pin LQFP)
-// Board:  Radiolink F722 (after the SpeedyBee F7 V3 suffered a dead
+// Target: STM32H743VIT6 (480 MHz, Cortex-M7F, 100-pin LQFP)
+// Board:  DAKEFPVH743 (STM32H743)
 //         5V BEC during IMU rework — see git log for context)
 // Framework: Embassy async executor
 //
-// Pin map (Radiolink F722):
-//   USART1  TX=PA9   RX=PA10    → T1/R1 pads, WT901B IMU (full duplex)
-//   USART2  RX=PA3              → R2 pad, CRSF receiver (416666 baud)
-//   USART3  TX=PB10             → T3 pad, defmt output (raw-reg logger, 115200)
+// Pin map (DAKEFPVH743):
+//   USART1  TX=PA9              → T1 pad, defmt output (raw-reg logger, 115200)
+//   USART2  RX=PD6              → R2 pad, CRSF receiver (416666 baud)
 //   USART6  TX=PC6   RX=PC7     → T6/R6 pads, GPS (UBX binary)
 //   UART4   RX=PA1              → ESC telemetry (internal, not wired yet)
 //
-// The onboard ICM-42688P (SPI1) and baro (BMP280 on I2C1) are unused
-// for now; WT901B over UART remains the primary IMU. Moving to the
-// SPI IMU is a post-Alpha optimisation (would need a new driver plus
-// an AHRS filter to recover Euler angles).
+// The onboard ICM-42688P (SPI1) is used as the primary IMU.
 //
 // Motors (DShot600 via a single timer multi-channel burst):
 //   TIM2_CH1 → PA0 → M1
@@ -83,10 +79,10 @@ use estimation::{PosKf, geodetic_to_local_ned};
 
 // ---- Interrupt bindings ----
 
-// USART3 is owned by `logger::init_usart3()` (raw register TX for defmt)
+// USART1 is owned by `logger::init_usart1()` (raw register TX for defmt)
 // — no Embassy interrupt handler needed here.
 bind_interrupts!(struct Irqs {
-    USART1 => usart::InterruptHandler<peripherals::USART1>;
+
     USART2 => usart::InterruptHandler<peripherals::USART2>;
     USART6 => usart::InterruptHandler<peripherals::USART6>;
 });
@@ -158,19 +154,7 @@ struct PosEstimate {
 
 static POS_ESTIMATE: Signal<CriticalSectionRawMutex, PosEstimate> = Signal::new();
 
-/// Commands from the control loop to the IMU command task (TX side).
-/// Used for in-field magnetometer calibration via AUX channel.
-#[derive(Clone, Copy)]
-enum ImuCommand {
-    /// Enter mag-field calibration mode (CALSW=0x02, unlocked).
-    StartMagCal,
-    /// Exit calibration mode and persist bias to flash.
-    SaveMagCal,
-    /// Exit calibration mode without saving.
-    AbortMagCal,
-}
 
-static IMU_COMMAND: Signal<CriticalSectionRawMutex, ImuCommand> = Signal::new();
 
 // RC signals are defined in rc_task.rs:
 // rc_task::RC_CHANNELS, rc_task::RC_LINK, rc_task::RC_LAST_SEEN
@@ -180,13 +164,13 @@ static IMU_COMMAND: Signal<CriticalSectionRawMutex, ImuCommand> = Signal::new();
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     // ---- Clock configuration ----
-    // STM32F722RET6 with 8 MHz HSE crystal on the SpeedyBee F7 V3.
-    //   HSE 8 MHz → PLL_M=4 → 2 MHz → PLL_N=216 → VCO 432 MHz
-    //   PLL_P=2 → SYSCLK 216 MHz  (F722 max)
-    //   PLL_Q=9 → USB 48 MHz      (432/9 = 48, exact)
-    //   AHB  = 216 MHz (prescaler 1)
-    //   APB1 = 54 MHz  (prescaler 4), APB1 timers = 108 MHz
-    //   APB2 = 108 MHz (prescaler 2), APB2 timers = 216 MHz
+    // STM32H743 with 8 MHz HSE crystal on the DAKEFPVH743.
+    //   HSE 8 MHz → PLL_M=1 → 8 MHz → PLL_N=120 → VCO 960 MHz
+    //   PLL_P=2 → SYSCLK 480 MHz  (H743 max)
+    //   PLL_Q=20 → USB 48 MHz     (960/20 = 48, exact)
+    //   AHB  = 240 MHz (prescaler 2)
+    //   APB1 = 120 MHz (prescaler 2), APB1 timers = 240 MHz
+    //   APB2 = 120 MHz (prescaler 2), APB2 timers = 240 MHz
     use embassy_stm32::rcc::{
         AHBPrescaler, APBPrescaler, Hse, HseMode, Pll, PllMul, PllDiv, PllPreDiv,
         PllSource, Sysclk, VoltageScale,
@@ -218,9 +202,9 @@ async fn main(spawner: Spawner) {
     let mut core = cortex_m::Peripherals::take().unwrap();
     core.SCB.disable_dcache(&mut core.CPUID);
 
-    // Bring up USART3 TX (PD8) for defmt output before anything else
+    // Bring up USART1 TX (PA9) for defmt output before anything else
     // so the first defmt::info! below actually lands on the wire.
-    logger::init_usart3();
+    logger::init_usart1();
 
     // ---- Status LED Heartbeat ----
     // DAKEFPVH743 has LED0 on PD10 (active low). We spawn a quick blink
@@ -233,7 +217,7 @@ async fn main(spawner: Spawner) {
     defmt::info!("Flight controller starting");
 
     // ---- Configure and spawn the RC receiver task ----
-    // CRSF on USART2 RX (PA3), 416666 baud — R2 pad on the Radiolink F722.
+    // CRSF on USART2 RX (PD6), 416666 baud — R2 pad on the DAKEFPVH743.
     let rc_uart = UartRx::new(
         p.USART2,
         Irqs,
@@ -246,35 +230,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(rc_task::run(rc_uart)).unwrap();
     defmt::info!("RC task spawned");
 
-    // ---- WT901B IMU on USART1 (full duplex) ----
-    // Start at factory 9600 baud, configure over UART, then switch
-    // to 115200. TX=PA9 (T1 pad), RX=PA10 (R1 pad).
-    let imu_uart_config = {
-        let mut c = usart::Config::default();
-        c.baudrate = 9600;
-        c
-    };
 
-    let imu_uart = Uart::new(
-        p.USART1,
-        p.PA10, // RX
-        p.PA9,  // TX
-        Irqs,
-        p.DMA2_CH7, // USART1_TX → DMA2 Stream 7
-        p.DMA2_CH2, // USART1_RX → DMA2 Stream 2
-        imu_uart_config,
-    )
-    .unwrap();
-
-    // Split into TX+RX, auto-detect baud + configure. Hand TX to a
-    // dedicated command task so the control loop can trigger in-field
-    // mag calibration over AUX channel 7 (see imu_command_task).
-    let (mut imu_tx, mut imu_rx) = imu_uart.split();
-    let imu_baud = drivers::wt901b::configure(&mut imu_tx, &mut imu_rx).await;
-
-    spawner.spawn(imu_task(imu_rx)).unwrap();
-    spawner.spawn(imu_command_task(imu_tx)).unwrap();
-    defmt::info!("IMU task spawned at {} baud", imu_baud);
 
     // ---- ICM-42688P on SPI1 (Phase 2: 8 kHz INT-driven reads) ----
     // SCK=PA5, MISO=PA6, MOSI=PA7, CS=PB2, INT1=PC4.
@@ -438,90 +394,11 @@ async fn gps_task(mut rx: UartRx<'static, embassy_stm32::mode::Async>) {
     }
 }
 
-// ---- IMU Task ----
-// Reads WT901B data, optionally configures it on startup,
-// then publishes parsed data via the IMU_DATA signal.
-
-#[embassy_executor::task]
-async fn imu_task(mut rx: UartRx<'static, embassy_stm32::mode::Async>) {
-    defmt::info!("IMU task started");
-
-    let mut parser = Wt901bParser::new();
-    let mut buf = [0u8; 32];
-    let mut pkt_count: u32 = 0;
-
-    // =========================================================================
-    // TEMP DEBUG — IMU framing diagnosis on Radiolink F722 (2026-04-20)
-    // Remove this entire block once soldering / framing is confirmed good.
-    // Look for: `// END TEMP DEBUG` marker below.
-    // =========================================================================
-    let mut read_count: u32 = 0;
-    let mut bytes_since_report: u32 = 0;
-    let mut pkts_since_report: u32 = 0;
-    let mut last_report = embassy_time::Instant::now();
-    // END TEMP DEBUG (part 1/3)
-
-    loop {
-        match rx.read(&mut buf).await {
-            Ok(()) => {
-                // TEMP DEBUG (part 2/3) — remove with part 1 & 3
-                read_count += 1;
-                bytes_since_report += buf.len() as u32;
-                if read_count % 50 == 0 {
-                    defmt::info!("[IMU-DEBUG] raw[0..16]: {=[u8]:02x}", buf[..16]);
-                }
-                // END TEMP DEBUG (part 2/3)
-
-                for &byte in &buf {
-                    if parser.push_byte(byte).is_some() {
-                        pkt_count += 1;
-                        pkts_since_report += 1; // TEMP DEBUG
-                        IMU_DATA.signal(parser.data);
-
-                        // Log first successful packet so we know it's alive
-                        if pkt_count == 1 {
-                            defmt::info!(
-                                "IMU first packet! accel=[{:?},{:?},{:?}] gyro=[{:?},{:?},{:?}]",
-                                parser.data.accel[0],
-                                parser.data.accel[1],
-                                parser.data.accel[2],
-                                parser.data.gyro[0],
-                                parser.data.gyro[1],
-                                parser.data.gyro[2],
-                            );
-                        }
-                    }
-                }
-
-                // TEMP DEBUG (part 3/3) — remove with part 1 & 2
-                if last_report.elapsed() >= Duration::from_secs(1) {
-                    defmt::info!(
-                        "[IMU-DEBUG] 1s window: {} bytes, {} pkts parsed (total {})",
-                        bytes_since_report,
-                        pkts_since_report,
-                        pkt_count
-                    );
-                    bytes_since_report = 0;
-                    pkts_since_report = 0;
-                    last_report = embassy_time::Instant::now();
-                }
-                // END TEMP DEBUG (part 3/3)
-            }
-            Err(e) => {
-                defmt::warn!("IMU UART error: {:?}", e);
-                embassy_time::Timer::after(Duration::from_millis(1)).await;
-            }
-        }
-    }
-}
-
-// ---- ICM-42688P Read Task (Phase 2: INT-driven 8 kHz) ----
+// ---- ICM-42688P Read Task (INT-driven 8 kHz) ----
 // Waits on rising edge of DRDY (INT1 → PC4), reads the 14-byte data
-// block, and publishes the RawImu to RAW_IMU. Not yet wired into the
-// control loop — Phase 3 (MEKF) will consume RAW_IMU.
-//
-// Logs sample rate + one representative packet every second so we
-// can see the INT pipeline is alive and hitting the expected ~8 kHz.
+// block, and publishes the RawImu to RAW_IMU. The MEKF task consumes
+// RAW_IMU at 8 kHz and republishes fused attitude to IMU_DATA for the
+// control loop.
 
 #[embassy_executor::task]
 async fn icm_read_task(
@@ -548,8 +425,8 @@ async fn icm_read_task(
 // ---- ICM Monitor Task ----
 // Runs on a 1 Hz ticker independently of the read task, so we see
 // sample/error counters even if the read task is stuck (e.g. INT pin
-// not firing). Also logs one representative sample from RAW_IMU so
-// the scaled values can be eyeballed without interleaving with reads.
+// not firing). Raw IMU values are logged by the MEKF task which
+// consumes RAW_IMU at full rate.
 
 #[embassy_executor::task]
 async fn icm_monitor_task() {
@@ -559,27 +436,7 @@ async fn icm_monitor_task() {
         ticker.next().await;
         let s = ICM_SAMPLES.swap(0, Ordering::Relaxed);
         let e = ICM_ERRORS.swap(0, Ordering::Relaxed);
-        match RAW_IMU.try_take() {
-            Some(r) => {
-                let a = r.accel_g();
-                let g = r.gyro_dps();
-                defmt::info!(
-                    "ICM {} samples/s, {} errors/s — a=[{=f32},{=f32},{=f32}]g g=[{=f32},{=f32},{=f32}]dps T={=f32}C",
-                    s,
-                    e,
-                    a[0],
-                    a[1],
-                    a[2],
-                    g[0],
-                    g[1],
-                    g[2],
-                    r.temp_c(),
-                );
-            }
-            None => {
-                defmt::info!("ICM {} samples/s, {} errors/s — no RAW_IMU payload", s, e);
-            }
-        }
+        defmt::info!("ICM {} samples/s, {} errors/s", s, e);
     }
 }
 
@@ -975,8 +832,8 @@ async fn pos_kf_task() {
 // ---- Baro Task (Phase 4) ----
 // Owns I2C1 + SCL/SDA pins directly (not a pre-built I2c) so it can
 // drop the driver and bitbang SCL to unstick the bus when the STM32
-// I2C peripheral latches BUSY/ARLO. Observed mid-run on the Radiolink
-// F722: runs clean for ~60 s then dies with a steady stream of
+// I2C peripheral latches BUSY/ARLO on some platforms.
+// If it times out at the 25 Hz tick rate, we use a recovery sequence.
 // timeouts at the 25 Hz tick rate (≈25 errs/s), no reads.
 //
 // Recovery sequence:
@@ -1200,46 +1057,7 @@ async fn baro_task(
     }
 }
 
-// ---- IMU Command Task ----
-// Owns the WT901B's UART TX half and dispatches mag-cal commands
-// posted to IMU_COMMAND from the control loop. Each command waits
-// 200 ms between bytes (WT901B datasheet requirement) before
-// returning, so this task must NOT be on the control-loop's
-// critical path — which is why it lives here, not inline.
 
-#[embassy_executor::task]
-async fn imu_command_task(mut tx: usart::UartTx<'static, embassy_stm32::mode::Async>) {
-    use drivers::wt901b::{SAVE, UNLOCK, config};
-    use embassy_time::Timer;
-
-    let step = Duration::from_millis(200);
-
-    loop {
-        let cmd = IMU_COMMAND.wait().await;
-        match cmd {
-            ImuCommand::StartMagCal => {
-                let _ = tx.write(&UNLOCK).await;
-                Timer::after(step).await;
-                let _ = tx.write(&config::start_mag_calibration()).await;
-                Timer::after(step).await;
-            }
-            ImuCommand::SaveMagCal => {
-                let _ = tx.write(&UNLOCK).await;
-                Timer::after(step).await;
-                let _ = tx.write(&config::exit_calibration()).await;
-                Timer::after(step).await;
-                let _ = tx.write(&SAVE).await;
-                Timer::after(step).await;
-            }
-            ImuCommand::AbortMagCal => {
-                let _ = tx.write(&UNLOCK).await;
-                Timer::after(step).await;
-                let _ = tx.write(&config::exit_calibration()).await;
-                Timer::after(step).await;
-            }
-        }
-    }
-}
 
 // ---- Control Loop ----
 // The heart of the flight controller. Reads sensor data and
@@ -1305,16 +1123,6 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
     let mut imu_last_seen = Instant::now();
     let mut control_demand = ControlDemand::default();
     let mut last_armed = false;
-
-    // ---- Magnetometer calibration state (AUX ch7) ----
-    // Switch high = enter cal mode; switch low = save if held >10s,
-    // otherwise abort. `ch7_seen_low` guards against accidental start
-    // when the user boots with the switch already high.
-    const MAG_CAL_CH7_HI: u16 = 1500;
-    const MAG_CAL_MIN_SECS: u64 = 10;
-    let mut last_ch7_high = false;
-    let mut ch7_seen_low = false;
-    let mut mag_cal_start: Option<Instant> = None;
 
     // ---- Loop timing instrumentation ----
     // Tracks how long each control loop iteration takes.
@@ -1428,48 +1236,7 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
             );
         }
 
-        // ---- 2b. Mag calibration edge detection on AUX ch7 ----
-        let ch7_high = last_rc.channels[6] > MAG_CAL_CH7_HI;
-        if !ch7_high {
-            ch7_seen_low = true;
-        }
-        let ch7_rising = ch7_high && !last_ch7_high && ch7_seen_low;
-        let ch7_falling = !ch7_high && last_ch7_high;
-        last_ch7_high = ch7_high;
 
-        if ch7_rising && mag_cal_start.is_none() {
-            if armed {
-                defmt::warn!("MAG CAL: ignored — disarm first");
-            } else if throttle_raw > 0.05 {
-                defmt::warn!("MAG CAL: ignored — throttle not idle");
-            } else {
-                mag_cal_start = Some(Instant::now());
-                defmt::info!(
-                    "MAG CAL: START — rotate through all axes for >{}s, flip ch7 low to save",
-                    MAG_CAL_MIN_SECS,
-                );
-                IMU_COMMAND.signal(ImuCommand::StartMagCal);
-            }
-        }
-
-        if ch7_falling {
-            if let Some(start) = mag_cal_start.take() {
-                let secs = start.elapsed().as_secs();
-                if secs >= MAG_CAL_MIN_SECS {
-                    defmt::info!("MAG CAL: saved after {}s", secs);
-                    IMU_COMMAND.signal(ImuCommand::SaveMagCal);
-                } else {
-                    defmt::warn!("MAG CAL: too short ({}s), not saved", secs);
-                    IMU_COMMAND.signal(ImuCommand::AbortMagCal);
-                }
-            }
-        }
-
-        if let Some(start) = mag_cal_start {
-            if cycle_count % 200 == 0 {
-                defmt::info!("MAG CAL: rotating... {}s", start.elapsed().as_secs());
-            }
-        }
 
         // ---- 3. Control computation ----
         if armed {

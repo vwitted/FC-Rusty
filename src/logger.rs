@@ -1,49 +1,50 @@
-// logger.rs — defmt global logger over USART3 TX (PD8)
+// logger.rs — defmt global logger over USART1 TX (PA9)
 //
 // Target board: DAKEFPVH743
-// USART3 TX is on PD8.
+// USART1 TX is on PA9 (T1 pad). USART3 was previously used but PD8
+// is either not broken out or conflicts with ESC telemetry on this board.
 //
 // Implementation notes:
-//   * We bypass Embassy's USART driver and poke USART3 registers
+//   * We bypass Embassy's USART driver and poke USART1 registers
 //     directly using the `pac` module. The logger is called from many
 //     tasks and interrupts; keeping it raw avoids lock contention with
 //     any Embassy-owned DMA transfers and keeps the Logger trait
 //     implementation entirely synchronous.
-//   * `init_usart3()` MUST be called after `embassy_stm32::init()`
-//     has configured the clock tree — it assumes APB1 = 120 MHz.
-//   * Defmt calls made before `init_usart3()` silently drop their
+//   * `init_usart1()` MUST be called after `embassy_stm32::init()`
+//     has configured the clock tree — it assumes APB2 = 120 MHz.
+//   * Defmt calls made before `init_usart1()` silently drop their
 //     bytes (guarded by the INITIALIZED flag).
 
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_stm32::pac;
 
-/// Configure USART3 TX on PD8 at 115200 baud 8N1.
+/// Configure USART1 TX on PA9 at 115200 baud 8N1.
 ///
 /// Call once after `embassy_stm32::init()` — this function assumes
-/// the clock tree is already set up with APB1 = 120 MHz.
-pub fn init_usart3() {
-    const APB1_HZ: u32 = 120_000_000;
+/// the clock tree is already set up with APB2 = 120 MHz.
+pub fn init_usart1() {
+    const APB2_HZ: u32 = 120_000_000;
     const BAUD: u32 = 115_200;
     // BRR = fck / baud for OVER8=0 (the reset default).
-    let brr = (APB1_HZ + BAUD / 2) / BAUD;
+    let brr = (APB2_HZ + BAUD / 2) / BAUD;
 
     // Enable peripheral clocks using PAC
-    // For STM32H7, GPIOD is on AHB4. USART3 is on APB1L.
-    pac::RCC.ahb4enr().modify(|w| w.set_gpioden(true));
-    pac::RCC.apb1lenr().modify(|w| w.set_usart3en(true));
+    // For STM32H7, GPIOA is on AHB4. USART1 is on APB2.
+    pac::RCC.ahb4enr().modify(|w| w.set_gpioaen(true));
+    pac::RCC.apb2enr().modify(|w| w.set_usart1en(true));
 
-    let gpiod = pac::GPIOD;
+    let gpioa = pac::GPIOA;
     
-    // PD8 -> AF7 (USART3_TX)
-    gpiod.moder().modify(|w| w.set_moder(8, pac::gpio::vals::Moder::ALTERNATE));
-    gpiod.otyper().modify(|w| w.set_ot(8, pac::gpio::vals::Ot::PUSH_PULL));
-    gpiod.ospeedr().modify(|w| w.set_ospeedr(8, pac::gpio::vals::Ospeedr::VERY_HIGH_SPEED));
-    gpiod.pupdr().modify(|w| w.set_pupdr(8, pac::gpio::vals::Pupdr::FLOATING));
-    gpiod.afr(1).modify(|w| w.set_afr(8 - 8, 7)); // AF7
+    // PA9 -> AF7 (USART1_TX)
+    gpioa.moder().modify(|w| w.set_moder(9, pac::gpio::vals::Moder::ALTERNATE));
+    gpioa.otyper().modify(|w| w.set_ot(9, pac::gpio::vals::Ot::PUSH_PULL));
+    gpioa.ospeedr().modify(|w| w.set_ospeedr(9, pac::gpio::vals::Ospeedr::VERY_HIGH_SPEED));
+    gpioa.pupdr().modify(|w| w.set_pupdr(9, pac::gpio::vals::Pupdr::FLOATING));
+    gpioa.afr(1).modify(|w| w.set_afr(9 - 8, 7)); // AF7
 
-    // USART3
-    let usart = pac::USART3;
+    // USART1
+    let usart = pac::USART1;
     usart.brr().write(|w| w.set_brr(brr as u16));
     usart.cr1().write(|w| {
         w.set_ue(true);
@@ -62,7 +63,7 @@ fn putc(byte: u8) {
     if !INITIALIZED.load(Ordering::Relaxed) {
         return; // pre-init defmt calls are dropped
     }
-    let usart = pac::USART3;
+    let usart = pac::USART1;
     while !usart.isr().read().txe() {}
     usart.tdr().write(|w| w.set_dr(byte as u16));
 }
@@ -99,7 +100,7 @@ unsafe impl defmt::Logger for Logger {
     }
 
     unsafe fn flush() {
-        let usart = pac::USART3;
+        let usart = pac::USART1;
         while !usart.isr().read().tc() {}
     }
 

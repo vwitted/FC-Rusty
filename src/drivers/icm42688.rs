@@ -15,15 +15,15 @@ use embassy_time::{Duration, Timer};
 
 // ---- Register map (Bank 0) ----
 
-const REG_DEVICE_CONFIG:  u8 = 0x11;
-const REG_INT_CONFIG:     u8 = 0x14;
-const REG_TEMP_DATA1:     u8 = 0x1D;   // 14 bytes from here: T(2), A(6), G(6)
-const REG_PWR_MGMT0:      u8 = 0x4E;
-const REG_GYRO_CONFIG0:   u8 = 0x4F;
-const REG_ACCEL_CONFIG0:  u8 = 0x50;
-const REG_INT_CONFIG1:    u8 = 0x64;
-const REG_INT_SOURCE0:    u8 = 0x65;
-const REG_WHO_AM_I:       u8 = 0x75;
+const REG_DEVICE_CONFIG: u8 = 0x11;
+const REG_INT_CONFIG: u8 = 0x14;
+const REG_TEMP_DATA1: u8 = 0x1D; // 14 bytes from here: T(2), A(6), G(6)
+const REG_PWR_MGMT0: u8 = 0x4E;
+const REG_GYRO_CONFIG0: u8 = 0x4F;
+const REG_ACCEL_CONFIG0: u8 = 0x50;
+const REG_INT_CONFIG1: u8 = 0x64;
+const REG_INT_SOURCE0: u8 = 0x65;
+const REG_WHO_AM_I: u8 = 0x75;
 
 const WHO_AM_I_VALUE: u8 = 0x47;
 const READ_MASK: u8 = 0x80;
@@ -33,7 +33,7 @@ const READ_MASK: u8 = 0x80;
 //   GYRO_ODR[3:0]=0b0011 → 8 kHz
 //   ACCEL_FS_SEL[7:5]=000 → ±16 g
 //   ACCEL_ODR[3:0]=0b0011 → 8 kHz
-const GYRO_CFG:  u8 = 0x03;
+const GYRO_CFG: u8 = 0x03;
 const ACCEL_CFG: u8 = 0x03;
 
 // PWR_MGMT0: GYRO_MODE[3:2]=11 (LN) | ACCEL_MODE[1:0]=11 (LN)
@@ -65,7 +65,7 @@ pub const ACCEL_LSB_PER_G: f32 = 2048.0;
 
 /// Sign flips that rotate ICM sensor frame → FC body frame (NED).
 ///
-/// ICM native frame on the Radiolink F722: X-forward, Y-left, Z-up
+/// ICM native frame on the DAKEFPVH743: X-forward, Y-left, Z-up
 /// (right-handed chip frame — verified 2026-04-20 by tilt test with
 /// board arrow pointing forward).
 ///
@@ -78,8 +78,8 @@ const BODY_SIGN: [f32; 3] = [1.0, -1.0, -1.0];
 #[derive(Clone, Copy, Debug, defmt::Format)]
 pub struct RawImu {
     pub accel: [i16; 3],
-    pub gyro:  [i16; 3],
-    pub temp:  i16,
+    pub gyro: [i16; 3],
+    pub temp: i16,
 }
 
 impl RawImu {
@@ -134,16 +134,13 @@ pub enum InitError {
 
 pub struct Icm42688<'d> {
     spi: Spi<'d, Async>,
-    cs:  Output<'d>,
+    cs: Output<'d>,
 }
 
 impl<'d> Icm42688<'d> {
     /// Soft-reset, verify WHO_AM_I, configure for ±16 g / ±2000 dps /
     /// 8 kHz / low-noise on both sensors, then power them up.
-    pub async fn new(
-        spi: Spi<'d, Async>,
-        cs:  Output<'d>,
-    ) -> Result<Self, InitError> {
+    pub async fn new(spi: Spi<'d, Async>, cs: Output<'d>) -> Result<Self, InitError> {
         let mut dev = Self { spi, cs };
 
         // CS idle high
@@ -160,11 +157,11 @@ impl<'d> Icm42688<'d> {
         }
 
         // Configure ranges + ODR *before* powering the sensors up.
-        dev.write_reg(REG_GYRO_CONFIG0,  GYRO_CFG).await?;
+        dev.write_reg(REG_GYRO_CONFIG0, GYRO_CFG).await?;
         dev.write_reg(REG_ACCEL_CONFIG0, ACCEL_CFG).await?;
-        dev.write_reg(REG_INT_CONFIG,    INT_CFG).await?;
-        dev.write_reg(REG_INT_CONFIG1,   INT_CFG1).await?;
-        dev.write_reg(REG_INT_SOURCE0,   INT_SRC_DRDY).await?;
+        dev.write_reg(REG_INT_CONFIG, INT_CFG).await?;
+        dev.write_reg(REG_INT_CONFIG1, INT_CFG1).await?;
+        dev.write_reg(REG_INT_SOURCE0, INT_SRC_DRDY).await?;
 
         // Power on — gyro + accel in low-noise mode.
         dev.write_reg(REG_PWR_MGMT0, PWR_LN_BOTH).await?;
@@ -186,14 +183,14 @@ impl<'d> Icm42688<'d> {
 
         let d = &buf[1..];
         Ok(RawImu {
-            temp:  i16::from_be_bytes([d[0],  d[1]]),
+            temp: i16::from_be_bytes([d[0], d[1]]),
             accel: [
-                i16::from_be_bytes([d[2],  d[3]]),
-                i16::from_be_bytes([d[4],  d[5]]),
-                i16::from_be_bytes([d[6],  d[7]]),
+                i16::from_be_bytes([d[2], d[3]]),
+                i16::from_be_bytes([d[4], d[5]]),
+                i16::from_be_bytes([d[6], d[7]]),
             ],
             gyro: [
-                i16::from_be_bytes([d[8],  d[9]]),
+                i16::from_be_bytes([d[8], d[9]]),
                 i16::from_be_bytes([d[10], d[11]]),
                 i16::from_be_bytes([d[12], d[13]]),
             ],

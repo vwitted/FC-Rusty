@@ -1,4 +1,4 @@
-// baro.rs — Onboard barometer driver for the Radiolink F722.
+// baro.rs — Onboard barometer driver for the DAKEFPVH743.
 //
 // The board footprint is populated with either a BMP280 (Bosch) or a
 // DPS310 (Infineon) depending on build lot — not register-compatible.
