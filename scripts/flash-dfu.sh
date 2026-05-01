@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# flash-dfu.sh — build the firmware and flash it to the SpeedyBee F7 V3
+# flash-dfu.sh — build the firmware and flash it to the DAKEFPVH743
 # via USB DFU. The board has no SWD pads, so this is the intended flow.
 #
 # Prerequisites (one-off per machine):
