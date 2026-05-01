@@ -218,9 +218,17 @@ async fn main(spawner: Spawner) {
     let mut core = cortex_m::Peripherals::take().unwrap();
     core.SCB.disable_dcache(&mut core.CPUID);
 
-    // Bring up USART3 TX (PB10) for defmt output before anything else
+    // Bring up USART3 TX (PD8) for defmt output before anything else
     // so the first defmt::info! below actually lands on the wire.
     logger::init_usart3();
+
+    // ---- Status LED Heartbeat ----
+    // DAKEFPVH743 has LED0 on PD10 (active low). We spawn a quick blink
+    // task so we have an immediate visual indicator that the firmware
+    // has booted and is running, without needing to check the UART logs.
+    use embassy_stm32::gpio::{Level, Output, Speed};
+    let led = Output::new(p.PD10, Level::High, Speed::Low);
+    spawner.spawn(blink_task(led)).unwrap();
 
     defmt::info!("Flight controller starting");
 
@@ -359,6 +367,18 @@ async fn main(spawner: Spawner) {
     // work, so it runs on the main executor rather than being
     // spawned as a separate task.
     control_loop(dshot).await;
+}
+
+// ---- Heartbeat Task ----
+
+#[embassy_executor::task]
+async fn blink_task(mut led: embassy_stm32::gpio::Output<'static>) {
+    loop {
+        led.set_low(); // Turn LED ON
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(100)).await;
+        led.set_high(); // Turn LED OFF
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(900)).await;
+    }
 }
 
 // ---- GPS Task ----
