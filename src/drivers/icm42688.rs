@@ -1,12 +1,15 @@
 // icm42688.rs — ICM-42688-P 6-axis IMU driver over SPI.
 //
-// Phase 1: raw reads only. No attitude fusion here — that lives in
-// the MEKF (see src/attitude_mekf.rs, added in Phase 3).
+// Supports dual-sensor configurations where two ICM-42688P chips are
+// mounted in different orientations (e.g. Roll180 + Pitch180 on the
+// DAKEFPVH743). Each instance carries its own orientation, and
+// `RawImu` stores the per-sample sign vector so downstream code
+// (MEKF, averaging) can convert to body-frame NED without knowing
+// which sensor produced the reading.
 //
 // Configuration: ±16 g accel, ±2000 dps gyro, 8 kHz ODR, low-noise
 // mode on both. INT1 is configured push-pull active-high pulsed for
-// data-ready, but Phase 1 polls — Phase 2 will wire up the EXTI on
-// PC4 to drive an interrupt-driven read task.
+// data-ready (used if EXTI is available; otherwise timer-polled).
 
 use embassy_stm32::gpio::Output;
 use embassy_stm32::mode::Async;
@@ -63,23 +66,47 @@ pub const GYRO_LSB_PER_DPS: f32 = 16.384;
 /// Accel: ±16 g / 32768 counts → 2048 LSB/g
 pub const ACCEL_LSB_PER_G: f32 = 2048.0;
 
-/// Sign flips that rotate ICM sensor frame → FC body frame (NED).
+// ---- Board orientation ----
+
+/// How the ICM-42688P chip is mounted relative to the FC body frame.
 ///
-/// ICM native frame on the DAKEFPVH743: X-forward, Y-left, Z-up
-/// (right-handed chip frame — verified 2026-04-20 by tilt test with
-/// board arrow pointing forward).
+/// The DAKEFPVH743 has two IMUs with different physical rotations.
+/// ArduPilot hwdef specifies:
+///   IMU1 (SPI1): ROTATION_ROLL_180  → sign vector [1, -1, -1]
+///   IMU2 (SPI4): ROTATION_PITCH_180 → sign vector [-1, 1, -1]
 ///
-/// FC body frame (aerospace NED): X-forward, Y-right, Z-down.
-///
-/// The mapping is a pure sign flip on Y and Z — no axis permutation —
-/// because the chip's X already aligns with the board arrow.
-const BODY_SIGN: [f32; 3] = [1.0, -1.0, -1.0];
+/// The `Identity` variant (sign [1, 1, 1]) is used for pre-averaged
+/// samples that are already in body-frame NED.
+#[derive(Clone, Copy, Debug, defmt::Format)]
+pub enum Orientation {
+    /// IMU1: ROTATION_ROLL_180. Sensor X → +X, Y → −Y, Z → −Z.
+    Roll180,
+    /// IMU2: ROTATION_PITCH_180. Sensor X → −X, Y → +Y, Z → −Z.
+    Pitch180,
+    /// Pre-averaged / already in body frame. No axis flips.
+    Identity,
+}
+
+impl Orientation {
+    /// Sign vector that maps sensor-native axes to FC body frame (NED).
+    pub const fn sign(self) -> [f32; 3] {
+        match self {
+            Self::Roll180  => [ 1.0, -1.0, -1.0],
+            Self::Pitch180 => [-1.0,  1.0, -1.0],
+            Self::Identity => [ 1.0,  1.0,  1.0],
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, defmt::Format)]
 pub struct RawImu {
     pub accel: [i16; 3],
     pub gyro: [i16; 3],
     pub temp: i16,
+    /// Sign vector baked into this sample — set by the producing
+    /// sensor's `Orientation`. `accel_g()` and `gyro_dps()` apply
+    /// this to convert raw counts into body-frame NED floats.
+    sign: [f32; 3],
 }
 
 impl RawImu {
@@ -87,18 +114,18 @@ impl RawImu {
     /// When stationary and level, this reads ≈(0, 0, −1) g.
     pub fn accel_g(&self) -> [f32; 3] {
         [
-            self.accel[0] as f32 / ACCEL_LSB_PER_G * BODY_SIGN[0],
-            self.accel[1] as f32 / ACCEL_LSB_PER_G * BODY_SIGN[1],
-            self.accel[2] as f32 / ACCEL_LSB_PER_G * BODY_SIGN[2],
+            self.accel[0] as f32 / ACCEL_LSB_PER_G * self.sign[0],
+            self.accel[1] as f32 / ACCEL_LSB_PER_G * self.sign[1],
+            self.accel[2] as f32 / ACCEL_LSB_PER_G * self.sign[2],
         ]
     }
 
     /// Gyro in deg/s, rotated into FC body frame (NED).
     pub fn gyro_dps(&self) -> [f32; 3] {
         [
-            self.gyro[0] as f32 / GYRO_LSB_PER_DPS * BODY_SIGN[0],
-            self.gyro[1] as f32 / GYRO_LSB_PER_DPS * BODY_SIGN[1],
-            self.gyro[2] as f32 / GYRO_LSB_PER_DPS * BODY_SIGN[2],
+            self.gyro[0] as f32 / GYRO_LSB_PER_DPS * self.sign[0],
+            self.gyro[1] as f32 / GYRO_LSB_PER_DPS * self.sign[1],
+            self.gyro[2] as f32 / GYRO_LSB_PER_DPS * self.sign[2],
         ]
     }
 
@@ -124,6 +151,45 @@ impl RawImu {
     pub fn temp_c(&self) -> f32 {
         self.temp as f32 / 132.48 + 25.0
     }
+
+    /// Create a fused sample by averaging two body-frame readings.
+    ///
+    /// Both inputs must already carry their correct orientation sign
+    /// vectors. The average is computed in body-frame float space and
+    /// the result gets `Identity` sign (values are already in NED).
+    ///
+    /// The raw `i16` fields in the returned `RawImu` are set to zero
+    /// since they're meaningless after cross-orientation averaging;
+    /// only the float accessors (`accel_g`, `gyro_dps`, `temp_c`)
+    /// should be used on fused samples.
+    pub fn averaged(a: &RawImu, b: &RawImu) -> RawImu {
+        let ag = a.accel_g();
+        let bg = b.accel_g();
+        let ad = a.gyro_dps();
+        let bd = b.gyro_dps();
+
+        // Average in float body-frame space, then store as "raw" by
+        // scaling back to counts with Identity sign so the existing
+        // accel_g() / gyro_dps() paths reconstruct the exact values.
+        let fused_accel = [
+            ((ag[0] + bg[0]) * 0.5 * ACCEL_LSB_PER_G) as i16,
+            ((ag[1] + bg[1]) * 0.5 * ACCEL_LSB_PER_G) as i16,
+            ((ag[2] + bg[2]) * 0.5 * ACCEL_LSB_PER_G) as i16,
+        ];
+        let fused_gyro = [
+            ((ad[0] + bd[0]) * 0.5 * GYRO_LSB_PER_DPS) as i16,
+            ((ad[1] + bd[1]) * 0.5 * GYRO_LSB_PER_DPS) as i16,
+            ((ad[2] + bd[2]) * 0.5 * GYRO_LSB_PER_DPS) as i16,
+        ];
+        let fused_temp = ((a.temp as i32 + b.temp as i32) / 2) as i16;
+
+        RawImu {
+            accel: fused_accel,
+            gyro: fused_gyro,
+            temp: fused_temp,
+            sign: Orientation::Identity.sign(),
+        }
+    }
 }
 
 #[derive(Debug, defmt::Format)]
@@ -135,13 +201,22 @@ pub enum InitError {
 pub struct Icm42688<'d> {
     spi: Spi<'d, Async>,
     cs: Output<'d>,
+    orientation: Orientation,
 }
 
 impl<'d> Icm42688<'d> {
     /// Soft-reset, verify WHO_AM_I, configure for ±16 g / ±2000 dps /
     /// 8 kHz / low-noise on both sensors, then power them up.
-    pub async fn new(spi: Spi<'d, Async>, cs: Output<'d>) -> Result<Self, InitError> {
-        let mut dev = Self { spi, cs };
+    ///
+    /// `orient` specifies how this particular chip is mounted on the
+    /// board — determines the sign vector applied in `RawImu::accel_g`
+    /// and `RawImu::gyro_dps`.
+    pub async fn new(
+        spi: Spi<'d, Async>,
+        cs: Output<'d>,
+        orient: Orientation,
+    ) -> Result<Self, InitError> {
+        let mut dev = Self { spi, cs, orientation: orient };
 
         // CS idle high
         dev.cs.set_high();
@@ -172,6 +247,9 @@ impl<'d> Icm42688<'d> {
     }
 
     /// Read the 14-byte TEMP+ACCEL+GYRO data block in one transaction.
+    ///
+    /// The returned `RawImu` carries this sensor's orientation sign
+    /// vector, so `accel_g()` / `gyro_dps()` return body-frame NED.
     pub async fn read_raw(&mut self) -> Result<RawImu, InitError> {
         let mut buf = [0u8; 15];
         buf[0] = REG_TEMP_DATA1 | READ_MASK;
@@ -194,6 +272,7 @@ impl<'d> Icm42688<'d> {
                 i16::from_be_bytes([d[10], d[11]]),
                 i16::from_be_bytes([d[12], d[13]]),
             ],
+            sign: self.orientation.sign(),
         })
     }
 

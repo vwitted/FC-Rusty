@@ -264,7 +264,7 @@ impl CrsfParser {
 
     /// Decode Link Statistics (type 0x14)
     ///
-    /// 10 bytes of telemetry about the radio link.
+    /// 10 bytes of telemetry about the radio link.Acti
     fn decode_link_statistics(&self, payload: &[u8]) -> Option<CrsfEvent> {
         if payload.len() < 10 {
             return None;

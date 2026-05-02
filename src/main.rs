@@ -5,13 +5,20 @@
 //         5V BEC during IMU rework — see git log for context)
 // Framework: Embassy async executor
 //
-// Pin map (DAKEFPVH743):
-//   USART1  TX=PA9              → T1 pad, defmt output (raw-reg logger, 115200)
-//   USART2  RX=PD6              → R2 pad, CRSF receiver (416666 baud)
-//   USART6  TX=PC6   RX=PC7     → T6/R6 pads, GPS (UBX binary)
-//   UART4   RX=PA1              → ESC telemetry (internal, not wired yet)
+// Pin map (DAKEFPVH743 — matches board connector labels):
+//   USART1  TX=PA9   RX=PA10    → T1/R1 pads, GPS (SERIAL1, NMEA 9600)
+//   USART2  (reserved)          → T2/R2 pads, available (SERIAL2)
+//   USART3  (reserved)          → T3/R3 pads, ESC telem (SERIAL3, free)
+//   UART4   TX=PD1   RX=PD0    → T4/R4, DisplayPort/VTX (SERIAL4, free)
+//   UART5   RX=PB5              → R5 pad, CRSF receiver (SERIAL5, 416666)
+//   USART6  TX=PC6              → T6 pad, defmt logger (SERIAL6, 115200)
+//   UART7   (available)         → T7/R7 pads, user/GP (SERIAL7, free)
+//   UART8   (available)         → T8/R8 pads, user/GP (SERIAL8, free)
 //
-// The onboard ICM-42688P (SPI1) is used as the primary IMU.
+// The onboard dual ICM-42688P sensors are used as the IMU:
+//   IMU1 on SPI1 (SCK=PA5, MISO=PA6, MOSI=PA7, CS=PA4)  — ROTATION_ROLL_180
+//   IMU2 on SPI4 (SCK=PE12, MISO=PE13, MOSI=PE14, CS=PB1) — ROTATION_PITCH_180
+// Both are read at 8 kHz and averaged for √2 noise reduction.
 //
 // Motors (DShot600 via a single timer multi-channel burst):
 //   TIM2_CH1 → PA0 → M1
@@ -79,12 +86,11 @@ use estimation::{PosKf, geodetic_to_local_ned};
 
 // ---- Interrupt bindings ----
 
-// USART1 is owned by `logger::init_usart1()` (raw register TX for defmt)
+// USART6 is owned by `logger::init_usart6()` (raw register TX for defmt)
 // — no Embassy interrupt handler needed here.
 bind_interrupts!(struct Irqs {
-
-    USART2 => usart::InterruptHandler<peripherals::USART2>;
-    USART6 => usart::InterruptHandler<peripherals::USART6>;
+    USART1 => usart::InterruptHandler<peripherals::USART1>;
+    UART5 => usart::InterruptHandler<peripherals::UART5>;
 });
 
 // ---- Shared state between tasks ----
@@ -93,9 +99,9 @@ bind_interrupts!(struct Irqs {
 /// Latest IMU data from the WT901B task (fused angles + raw rates).
 static IMU_DATA: Signal<CriticalSectionRawMutex, ImuData> = Signal::new();
 
-/// Latest raw samples from the ICM-42688P task (body-frame NED).
-/// Phase 2: populated at ~8 kHz, not yet consumed by the control loop.
-/// Phase 3 (MEKF) will consume this and republish to IMU_DATA.
+/// Latest raw samples from the ICM-42688P dual-IMU task (body-frame NED,
+/// averaged across both sensors when both are online).
+/// Consumed at ~8 kHz by the MEKF attitude filter.
 static RAW_IMU: Signal<CriticalSectionRawMutex, RawImu> = Signal::new();
 
 /// Counters for the ICM monitor task. Live regardless of whether the
@@ -103,6 +109,29 @@ static RAW_IMU: Signal<CriticalSectionRawMutex, RawImu> = Signal::new();
 /// as `0 samples/s, 0 errors/s` instead of no log at all.
 static ICM_SAMPLES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static ICM_ERRORS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Per-sensor diagnostic snapshots. Updated at ~1 Hz by the dual read
+/// task so the monitor can log individual IMU1 / IMU2 values alongside
+/// the fused output for cross-sensor validation.
+#[derive(Clone, Copy, Debug, defmt::Format)]
+struct ImuDiag {
+    /// Body-frame accel (g) from IMU1
+    a1: [f32; 3],
+    /// Body-frame accel (g) from IMU2
+    a2: [f32; 3],
+    /// Body-frame gyro (dps) from IMU1
+    g1: [f32; 3],
+    /// Body-frame gyro (dps) from IMU2
+    g2: [f32; 3],
+    /// Fused accel (g)
+    a_fused: [f32; 3],
+    /// Fused gyro (dps)
+    g_fused: [f32; 3],
+    /// Temp °C from IMU1 / IMU2
+    t1: f32,
+    t2: f32,
+}
+static IMU_DIAG: Signal<CriticalSectionRawMutex, ImuDiag> = Signal::new();
 
 /// Latest GPS data from the GPS task
 static GPS_DATA: Signal<CriticalSectionRawMutex, GpsData> = Signal::new();
@@ -202,9 +231,9 @@ async fn main(spawner: Spawner) {
     let mut core = cortex_m::Peripherals::take().unwrap();
     core.SCB.disable_dcache(&mut core.CPUID);
 
-    // Bring up USART1 TX (PA9) for defmt output before anything else
+    // Bring up USART6 TX (PC6) for defmt output before anything else
     // so the first defmt::info! below actually lands on the wire.
-    logger::init_usart1();
+    logger::init_usart6();
 
     // ---- Status LED Heartbeat ----
     // DAKEFPVH743 has LED0 on PD10 (active low). We spawn a quick blink
@@ -217,12 +246,13 @@ async fn main(spawner: Spawner) {
     defmt::info!("Flight controller starting");
 
     // ---- Configure and spawn the RC receiver task ----
-    // CRSF on USART2 RX (PD6), 416666 baud — R2 pad on the DAKEFPVH743.
+    // CRSF on UART5 RX (PB5), 416666 baud — R5 pad on the DAKEFPVH743
+    // (SERIAL5, the board's dedicated RC input port).
     let rc_uart = UartRx::new(
-        p.USART2,
+        p.UART5,
         Irqs,
-        p.PD6,      // RX pin (USART2)
-        p.DMA1_CH5, // USART2_RX → DMA1 Stream 5
+        p.PB5,      // RX pin (UART5)
+        p.DMA1_CH5, // UART5_RX DMA
         rc_task::crsf_uart_config(),
     )
     .unwrap();
@@ -232,39 +262,62 @@ async fn main(spawner: Spawner) {
 
 
 
-    // ---- ICM-42688P on SPI1 (Phase 2: 8 kHz INT-driven reads) ----
-    // SCK=PA5, MISO=PA6, MOSI=PA7, CS=PB2, INT1=PC4.
-    // SPI @ 10 MHz target (embassy picks nearest ≤: 6.75 MHz on APB2).
+    // ---- Dual ICM-42688P IMUs (timer-polled 8 kHz reads) ----
+    // IMU1 on SPI1: SCK=PA5, MISO=PA6, MOSI=PA7, CS=PA4  (ROTATION_ROLL_180)
+    // IMU2 on SPI4: SCK=PE12, MISO=PE13, MOSI=PE14, CS=PB1 (ROTATION_PITCH_180)
+    // Both sensors are read back-to-back and averaged for √2 noise reduction.
+    // No EXTI pins are mapped on this board, so we use an 8 kHz ticker.
     {
-        use embassy_stm32::exti::ExtiInput;
-        use embassy_stm32::gpio::{Level, Output, Pull, Speed};
+        use drivers::icm42688::Orientation;
+        use embassy_stm32::gpio::{Level, Output, Speed};
         use embassy_stm32::spi::{Config as SpiConfig, Spi};
         use embassy_stm32::time::Hertz;
 
         let mut spi_cfg = SpiConfig::default();
         spi_cfg.frequency = Hertz(10_000_000);
 
-        let spi = Spi::new(
+        // ---- IMU1 (SPI1) ----
+        let spi1 = Spi::new(
             p.SPI1, p.PA5,      // SCK
             p.PA7,      // MOSI
             p.PA6,      // MISO
-            p.DMA2_CH3, // SPI1_TX (ch3)
-            p.DMA2_CH0, // SPI1_RX (ch3)
+            p.DMA2_CH3, // SPI1_TX
+            p.DMA2_CH0, // SPI1_RX
             spi_cfg,
         );
+        let cs1 = Output::new(p.PA4, Level::High, Speed::VeryHigh);
 
-        let cs = Output::new(p.PA4, Level::High, Speed::VeryHigh);
-        let drdy = ExtiInput::new(p.PC4, p.EXTI4, Pull::None);
+        match drivers::icm42688::Icm42688::new(spi1, cs1, Orientation::Roll180).await {
+            Ok(imu1) => {
+                defmt::info!("ICM-42688P IMU1 (SPI1, Roll180) initialised OK");
 
-        match drivers::icm42688::Icm42688::new(spi, cs).await {
-            Ok(imu) => {
-                defmt::info!("ICM-42688P initialised OK");
-                spawner.spawn(icm_read_task(imu, drdy)).unwrap();
+                // ---- IMU2 (SPI4) ----
+                let spi4 = Spi::new(
+                    p.SPI4, p.PE12,     // SCK
+                    p.PE14,     // MOSI
+                    p.PE13,     // MISO
+                    p.DMA1_CH0, // SPI4_TX
+                    p.DMA1_CH1, // SPI4_RX
+                    spi_cfg,
+                );
+                let cs2 = Output::new(p.PB1, Level::High, Speed::VeryHigh);
+
+                match drivers::icm42688::Icm42688::new(spi4, cs2, Orientation::Pitch180).await {
+                    Ok(imu2) => {
+                        defmt::info!("ICM-42688P IMU2 (SPI4, Pitch180) initialised OK");
+                        spawner.spawn(dual_icm_read_task(imu1, imu2)).unwrap();
+                    }
+                    Err(e) => {
+                        defmt::warn!("ICM-42688P IMU2 init failed: {:?} — running single-IMU", e);
+                        spawner.spawn(single_icm_read_task(imu1)).unwrap();
+                    }
+                }
+
                 spawner.spawn(icm_monitor_task()).unwrap();
                 spawner.spawn(mekf_task()).unwrap();
             }
             Err(e) => {
-                defmt::error!("ICM-42688P init failed: {:?}", e);
+                defmt::error!("ICM-42688P IMU1 init failed: {:?} — NO IMU AVAILABLE", e);
             }
         }
     }
@@ -279,9 +332,9 @@ async fn main(spawner: Spawner) {
     spawner.spawn(pos_kf_task()).unwrap();
 
     // ---- Configure and spawn the GPS task ----
-    // GPS on USART6 TX=PC6 RX=PC7 at factory 9600 baud, speaking
-    // factory-default NMEA. We parse NMEA directly — no module
-    // reconfiguration required. See `drivers::nmea`.
+    // GPS on USART1 TX=PA9 RX=PA10 at factory 9600 baud, speaking
+    // factory-default NMEA. SERIAL1 / T1+R1 pads — the board's
+    // dedicated GPS connector. See `drivers::nmea`.
     let gps_uart_config = {
         let mut c = usart::Config::default();
         c.baudrate = 9600;
@@ -289,9 +342,9 @@ async fn main(spawner: Spawner) {
     };
 
     let gps_uart = Uart::new(
-        p.USART6,
-        p.PC7, // RX
-        p.PC6, // TX
+        p.USART1,
+        p.PA10, // RX
+        p.PA9,  // TX
         Irqs,
         p.DMA2_CH6, // TX DMA
         p.DMA2_CH1, // RX DMA
@@ -394,22 +447,87 @@ async fn gps_task(mut rx: UartRx<'static, embassy_stm32::mode::Async>) {
     }
 }
 
-// ---- ICM-42688P Read Task (INT-driven 8 kHz) ----
-// Waits on rising edge of DRDY (INT1 → PC4), reads the 14-byte data
-// block, and publishes the RawImu to RAW_IMU. The MEKF task consumes
-// RAW_IMU at 8 kHz and republishes fused attitude to IMU_DATA for the
-// control loop.
+// ---- Dual ICM-42688P Read Task (timer-polled 8 kHz) ----
+// Reads both IMUs back-to-back on each tick, averages the body-frame
+// outputs, and publishes the fused RawImu to RAW_IMU. The MEKF task
+// consumes RAW_IMU unchanged.
+//
+// Sequential reads take ~40 µs total (2 × 15-byte SPI @ 10 MHz + CS
+// toggling), well within the 125 µs budget at 8 kHz.
 
 #[embassy_executor::task]
-async fn icm_read_task(
-    mut imu: drivers::icm42688::Icm42688<'static>,
-    mut drdy: embassy_stm32::exti::ExtiInput<'static>,
+async fn dual_icm_read_task(
+    mut imu1: drivers::icm42688::Icm42688<'static>,
+    mut imu2: drivers::icm42688::Icm42688<'static>,
 ) {
     use core::sync::atomic::Ordering;
-    defmt::info!("ICM read task started (INT-driven)");
+    defmt::info!("Dual ICM read task started (8 kHz ticker)");
+
+    let mut ticker = Ticker::every(Duration::from_micros(125));
+    let mut last_diag = Instant::now();
 
     loop {
-        drdy.wait_for_rising_edge().await;
+        ticker.next().await;
+
+        let r1 = imu1.read_raw().await;
+        let r2 = imu2.read_raw().await;
+
+        match (r1, r2) {
+            (Ok(a), Ok(b)) => {
+                let fused = drivers::icm42688::RawImu::averaged(&a, &b);
+                RAW_IMU.signal(fused);
+                ICM_SAMPLES.fetch_add(1, Ordering::Relaxed);
+
+                // Snapshot per-sensor diagnostics at ~1 Hz
+                let now = Instant::now();
+                if (now - last_diag) >= Duration::from_secs(1) {
+                    IMU_DIAG.signal(ImuDiag {
+                        a1: a.accel_g(),
+                        a2: b.accel_g(),
+                        g1: a.gyro_dps(),
+                        g2: b.gyro_dps(),
+                        a_fused: fused.accel_g(),
+                        g_fused: fused.gyro_dps(),
+                        t1: a.temp_c(),
+                        t2: b.temp_c(),
+                    });
+                    last_diag = now;
+                }
+            }
+            (Ok(a), Err(_)) => {
+                // IMU2 read failed — use IMU1 only this cycle
+                RAW_IMU.signal(a);
+                ICM_SAMPLES.fetch_add(1, Ordering::Relaxed);
+                ICM_ERRORS.fetch_add(1, Ordering::Relaxed);
+            }
+            (Err(_), Ok(b)) => {
+                // IMU1 read failed — use IMU2 only this cycle
+                RAW_IMU.signal(b);
+                ICM_SAMPLES.fetch_add(1, Ordering::Relaxed);
+                ICM_ERRORS.fetch_add(1, Ordering::Relaxed);
+            }
+            (Err(_), Err(_)) => {
+                ICM_ERRORS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+// ---- Single ICM-42688P Read Task (fallback, timer-polled 8 kHz) ----
+// Used when IMU2 fails to initialise. Identical to the dual task but
+// reads only IMU1.
+
+#[embassy_executor::task]
+async fn single_icm_read_task(
+    mut imu: drivers::icm42688::Icm42688<'static>,
+) {
+    use core::sync::atomic::Ordering;
+    defmt::info!("Single ICM read task started (8 kHz ticker, IMU2 unavailable)");
+
+    let mut ticker = Ticker::every(Duration::from_micros(125));
+
+    loop {
+        ticker.next().await;
         match imu.read_raw().await {
             Ok(r) => {
                 RAW_IMU.signal(r);
@@ -437,6 +555,46 @@ async fn icm_monitor_task() {
         let s = ICM_SAMPLES.swap(0, Ordering::Relaxed);
         let e = ICM_ERRORS.swap(0, Ordering::Relaxed);
         defmt::info!("ICM {} samples/s, {} errors/s", s, e);
+
+        // If a diagnostic snapshot is available, log per-sensor detail.
+        if let Some(d) = IMU_DIAG.try_take() {
+            // Max absolute accel disagreement across axes (g)
+            let da = [
+                libm::fabsf(d.a1[0] - d.a2[0]),
+                libm::fabsf(d.a1[1] - d.a2[1]),
+                libm::fabsf(d.a1[2] - d.a2[2]),
+            ];
+            let max_da = if da[0] > da[1] { if da[0] > da[2] { da[0] } else { da[2] } }
+                         else { if da[1] > da[2] { da[1] } else { da[2] } };
+
+            // Max absolute gyro disagreement across axes (dps)
+            let dg = [
+                libm::fabsf(d.g1[0] - d.g2[0]),
+                libm::fabsf(d.g1[1] - d.g2[1]),
+                libm::fabsf(d.g1[2] - d.g2[2]),
+            ];
+            let max_dg = if dg[0] > dg[1] { if dg[0] > dg[2] { dg[0] } else { dg[2] } }
+                         else { if dg[1] > dg[2] { dg[1] } else { dg[2] } };
+
+            defmt::info!(
+                "IMU1 accel=[{=f32},{=f32},{=f32}]g  gyro=[{=f32},{=f32},{=f32}]dps  t={=f32}C",
+                d.a1[0], d.a1[1], d.a1[2],
+                d.g1[0], d.g1[1], d.g1[2],
+                d.t1,
+            );
+            defmt::info!(
+                "IMU2 accel=[{=f32},{=f32},{=f32}]g  gyro=[{=f32},{=f32},{=f32}]dps  t={=f32}C",
+                d.a2[0], d.a2[1], d.a2[2],
+                d.g2[0], d.g2[1], d.g2[2],
+                d.t2,
+            );
+            defmt::info!(
+                "FUSED accel=[{=f32},{=f32},{=f32}]g  gyro=[{=f32},{=f32},{=f32}]dps  |da|max={=f32}g |dg|max={=f32}dps",
+                d.a_fused[0], d.a_fused[1], d.a_fused[2],
+                d.g_fused[0], d.g_fused[1], d.g_fused[2],
+                max_da, max_dg,
+            );
+        }
     }
 }
 
