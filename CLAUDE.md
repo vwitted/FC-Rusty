@@ -8,8 +8,8 @@ state belongs in Claude's memory, not here.
 
 ## What this project is
 
-FC-Rusty is a Rust flight controller for the **Radiolink F722**
-(STM32F722RET6, Cortex-M7F @ 216 MHz) built on Embassy async.
+FC-Rusty is a Rust flight controller for the **DAKEFPV H743**
+(STM32H743VIT6, dual gyro) built on Embassy async.
 
 North-star: **high-authority attitude control via MPC**. Subordinate
 every other decision (estimation, sensors, arming, comms) to the
@@ -65,7 +65,7 @@ drift again.
 # Embedded build (default features = firmware)
 cargo build --release
 
-# Flash to Radiolink F722 via USB DFU (hold boot button, plug USB)
+# Flash to DAKEFPV H743 via USB DFU (hold boot button, plug USB)
 ./scripts/flash-dfu.sh
 
 # Host unit tests (strips firmware feature so cortex-m isn't pulled in)

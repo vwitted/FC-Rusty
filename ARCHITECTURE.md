@@ -3,7 +3,7 @@
 ## Overview
 
 An Embassy-based async flight controller in Rust, targeting the
-STM32F405 (Cortex-M4F, 168 MHz). The design separates concerns into
+STM32H743 (Cortex-M7F @ 480 MHz). The design separates concerns into
 independent async tasks that communicate via lock-free channels.
 
 ## Crate / Module Structure
@@ -27,7 +27,7 @@ fc-firmware/
 │   │   ├── mod.rs
 │   │   ├── types.rs          # Core data types (Attitude, Position, etc.)
 │   │   ├── estimator.rs      # State estimator (initially passthrough from
-│   │   │                     # WitMotion, later own EKF if needed)
+│   │   │                     # internal baro (DPS310), accel (ICM-42688P), MEKF)
 │   │   └── calibration.rs    # Sensor calibration (mag, accel offsets)
 │   │
 │   ├── control/              # The control system
@@ -162,7 +162,7 @@ The control loop runs in two layers, which can be in the same task
 but execute at different rates:
 
 ```
-Every IMU sample (~200 Hz from WT901B):
+Every IMU sample:
 ┌─────────────────────────────────────────┐
 │  Read AttitudeEstimate                  │
 │  Read RcChannels                        │
@@ -186,38 +186,27 @@ Every IMU sample (~200 Hz from WT901B):
 
 ## Design Decisions / Open Questions
 
-1. **WT901B as primary IMU**: Gets us flying fast with onboard
-   Kalman-fused attitude. Includes gyro, accel, mag, and baro in
-   one 15mm package. Limits inner loop rate to ~200 Hz. Acceptable
-   for MPC at 50 Hz + simple PID at 200 Hz. At max rate, not all
-   data fields arrive every packet — driver should cache last known
-   values. If we later need faster raw gyro rates, add a dedicated
-   IMU (e.g. ICM-42688) on SPI.
-
+1. **Using dual IMUs, with barometer, GPS (potential for magnatometer) as core inertial sensing**
+   Kalman-fused attitude.
+   For MPC at 50 Hz + simple PID at 200 Hz. We should look to increase these rates on H7.
 2. **Single control task vs split inner/outer**: Starting with a
    single task that runs both loops at different rates is simpler.
-   Can split later if needed.
+   The task should try and read sensor data at the highest rate
+   possible, while maintaining the control loop rates.
 
-3. **DShot implementation**: Timer + DMA on STM32F405. Well
-   supported in embassy-stm32 — TIM1/TIM2/TIM3/TIM4 all have
-   DMA-capable channels suitable for DShot.
+3. **DShot implementation**: Timer + DMA. Relies heavily on our own implementation for DMA and Timer configuration for H7.
 
-4. **STM32F405 platform**: First-class Embassy support via
-   embassy-stm32. Cortex-M4F at 168 MHz, 192 kB SRAM, 1 MB
-   flash. Proven to run TinyMPC (Crazyflie uses this exact chip).
-   Plenty of UARTs (for CRSF, WT901B, GPS, telemetry), SPI and
-   I2C buses, and timer channels for DShot.
-
-5. **tinympc-rs integration**: Use as a cargo dependency. The
+4. **tinympc-rs integration**: Use as a cargo dependency. The
    vehicle model (A, B matrices) goes in config/vehicle.rs.
    Cost weights (Q, R) go in config/params.rs. MPC wrapper in
    control/mpc.rs handles the solve loop and reference generation.
 
-6. **Arming safety**: Need an arming state machine — disarmed by
+5. **Arming safety**: Need an arming state machine — disarmed by
    default, arm only when throttle low + specific stick gesture
    or switch. All motor output zero when disarmed.
 
-7. **Failsafe**: What happens when RC link is lost? Timer-based
+6. **Failsafe**: What happens when RC link is lost? Timer-based
    detection from CRSF link quality. Options: hold position,
    return to home, or cut motors (configurable).
+
 ```

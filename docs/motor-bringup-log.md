@@ -1,11 +1,14 @@
 # Motor bring-up debug log
 
-Append-only log of FC→ESC signal debugging on the Radiolink F722.
+## __For reference only - issue has been resolved - issue lay with embassy's waveform_up and waveform_up_multi_channel methods; fix was to write manually to the DMA registers to generate the DShot waveforms  
+
+### Log of FC→ESC signal debugging on the Radiolink F722
+
 Each session gets its own dated entry. Preserves raw observations so
 later sessions (and the oscilloscope, once it arrives) have a clean
 reference rather than reconstructing from memory.
 
-## Hardware under test
+### Hardware under test
 
 - **FC**: Radiolink F722 (STM32F722RET6). DShot pins:
   - M1 → PA15 → TIM2 CH1 (AF1), TIM2_UP DMA1 Stream 7
