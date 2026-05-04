@@ -1020,7 +1020,7 @@ async fn pos_kf_task() {
 // external baro is wired in. A dead bus should not take the FC down,
 // and pos_kf_task handles missing baro via GPS-only altitude.
 
-const BARO_ERR_STREAK_RECOVERY: u32 = 10; // ~0.4 s at 25 Hz
+const BARO_ERR_STREAK_RECOVERY: u32 = 50; // ~0.4 s at 125 Hz
 const BARO_TIMEOUT_MS: u64 = 5; // shorter wastes less CPU when stuck
 const BARO_MAX_INIT_ATTEMPTS: u32 = 5; // give up after this many detect/init failures
 
@@ -1030,7 +1030,7 @@ async fn baro_task(
     mut scl: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PB10>,
     mut sda: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PB11>,
 ) {
-    use drivers::baro::{self, BaroChip, Dps310};
+    use drivers::baro::{self, BaroChip, Spl06};
     use embassy_stm32::gpio::{Level, OutputOpenDrain, Speed};
     use embassy_stm32::i2c::{Config as I2cConfig, I2c};
     use embassy_stm32::time::Hertz;
@@ -1113,19 +1113,20 @@ async fn baro_task(
         };
 
         let addr = match chip {
-            BaroChip::Dps310 { addr } => addr,
+            BaroChip::Spl06  { addr } => addr,
+            BaroChip::Dps310 { addr } => addr, // fallback; not on this board
             BaroChip::Bmp280 { addr: _ } => {
                 defmt::warn!("BMP280 detected but driver not yet implemented");
                 return;
             }
         };
 
-        let dps = match Dps310::init(&mut i2c, addr).await {
+        let spl = match Spl06::init(&mut i2c, addr).await {
             Ok(d) => d,
             Err(e) => {
                 init_failures = init_failures.saturating_add(1);
                 defmt::error!(
-                    "DPS310 init failed: {:?} ({}/{}) — bitbang + retry in 1 s",
+                    "SPL06 init failed: {:?} ({}/{}) — bitbang + retry in 1 s",
                     e,
                     init_failures,
                     BARO_MAX_INIT_ATTEMPTS,
@@ -1142,7 +1143,9 @@ async fn baro_task(
         init_failures = 0;
 
         // ---- Read loop ----
-        let mut ticker = Ticker::every(Duration::from_millis(40)); // 25 Hz
+        // SPL06 configured at 128 Hz; tick at 8 ms (125 Hz) to consume
+        // each new sample without skipping.
+        let mut ticker = Ticker::every(Duration::from_millis(8)); // 125 Hz
         let mut reads: u32 = 0;
         let mut errs: u32 = 0;
         let mut streak: u32 = 0;
@@ -1151,7 +1154,7 @@ async fn baro_task(
 
         let recover = loop {
             ticker.next().await;
-            match dps.read(&mut i2c) {
+            match spl.read(&mut i2c) {
                 Ok(s) => {
                     last_sample = Some((s, Instant::now()));
                     BARO_DATA.signal(s);

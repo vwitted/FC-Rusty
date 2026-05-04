@@ -1,233 +1,256 @@
-# FC-Rusty — Project Status & Roadmap
+# FC-Rusty — Project Status
 
-A Rust flight controller targeting the ~~Radiolink F722 STM32F722RET6~~
-~~Cortex-M7F @ 216 MHz~~ STM32H743VIT6, specifically a DAKEFPV F7-H7 stack. The north-star is **stable, high-authority
+A Rust flight controller targeting the **DAKEFPV H743** (STM32H743VIT6,
+Cortex-M7F @ 480 MHz). The north-star is **stable, high-authority
 attitude control via MPC**; everything else — estimation, sensors,
 arming, comms — exists to feed or protect that loop.
 
-This document is the project status log. Update this document whenever a material hardware or design change lands (see `CLAUDE.md`).
+Status is a snapshot, not a log. Update this document whenever a
+material hardware or design change lands (see `CLAUDE.md`).
+
+---
+
+## Current Hardware — DAKEFPV H743
+
+### Peripherals
+
+| Peripheral             | Role                              | Status                                        |
+|------------------------|-----------------------------------|-----------------------------------------------|
+| USART6 TX (PC6)        | defmt logger (115200, T6 pad)     | ✅ verified                                    |
+| UART5 RX (PB5)         | CRSF RC receiver (R5, 416666)     | ✅ verified — 6 channels parsing               |
+| USART1 (PA9/PA10)      | GPS (NMEA, 9600, T1/R1)           | ✅ verified — 3D fix, home latches             |
+| SPI1 + PA4             | ICM-42688P IMU1 (onboard)         | ✅ verified — 8 kHz reads, MEKF fusing         |
+| SPI4 + PB1             | ICM-42688P IMU2 (onboard)         | ✅ verified — 8 kHz reads, averaged with IMU1  |
+| I2C2 (PB10/PB11)       | SPL06 barometer (onboard)         | ✅ proper driver — 128 Hz, correct calibration              |
+| TIM2 (PA0/PA1/PA2/PA3) | DShot600, motors M1–M4            | ✅ verified — all four motors spin on arm      |
+| PD10                   | Status LED (active low)           | ✅ heartbeat blink task                        |
+| USB-C                  | DFU flashing                      | ✅ verified — no SWD on this board             |
+| UART4 (PD1/PD0)        | DisplayPort / VTX (T4/R4)         | ⚪ not wired                                   |
+| USART3                 | ESC telemetry (T3/R3)             | ⚪ not wired                                   |
+| UART7 / UART8          | General purpose (T7/R7, T8/R8)   | ⚪ available                                   |
+| SPI2 (PB13/14/15) + PB12 | AT7456E OSD (MAX7456-compatible) | ⚪ no driver yet                               |
+
+### Why this board
+
+- **Radiolink F722** (STM32F722RET6): prior board. DShot was unresolvable
+  via Embassy's `waveform_up` / `waveform_up_multi_channel` APIs — scope
+  traces showed malformed waveforms from DMAR contention. Fix: write to
+  DMAR directly. Opportunity taken to move to a more capable board.
+- **DAKEFPV H743**: STM32H743VIT6 at 480 MHz, 1 MB SRAM, dual onboard
+  ICM-42688P (√2 noise reduction), all four motor outputs on a single
+  TIM2 (no multi-timer synchronisation problem), USB-C DFU flashing.
+  The DShot fix (direct DMAR burst write) carries straight over and
+  works cleanly on the H743.
+
+---
 
 ## What's Verified on Hardware
 
-(THe specifics here are on older hardware, but the overall functionality is implemented on the H7, with improvements in some cases.
-
-- **Attitude**: ICM-42688P at 8 kHz, MEKF fusing accel (100 Hz update)
-  and gyro (8 kHz predict). Gyro bias bounded to 0.3–0.5 dps; innovation
-  gate rejects ~0% at rest and ~25% under aggressive motion. Sensor
-  frame mapped to NED via `BODY_SIGN=[+1,-1,-1]`.
-- **Position**: 6-state linear PosKF (pn, pe, pz, vn, ve, vz) running
-  at 100 Hz predict.
-  - GPS home latches on the first fix with `FIX3D && sats ≥ 5 && HDOP < 3.5`
-    (relaxed for Alpha testing; see backlog for post-Alpha tightening).
-  - GPS altitude fuses with σ_gps_v = 5 m; baro (when alive) with
-    σ_baro = 0.3 m. Baro dominates the short term; GPS keeps altitude
-    honest long-term via cross-covariance.
-  - Outdoor verification 2026-04-20: clean `alt-ready → ready`
-    transition, baro 26 reads/s with 0 errors across the run,
-    post-home-latch IMU-only drift (~1500 m) corrected in one GPS
-    tick as expected.
-- **Comms**: CRSF RC (6 channels), NMEA GPS, defmt over USART3.
-- **Control loop**: 200 Hz closed loop running on MPC+PID against
-  real sensors; timing 61 µs avg / 122 µs max with no overruns. MPC
-  warm-up 213 µs; in-flight MPC scheduled at 50 Hz (160:1 decimation
-  against the 8 kHz inner rate).
-
----
-
-## Deprecated - Look to revert functionality as GPS and Baro both work well
-
-- **GPS-gated arm + baro self-calibration** — commit `a7feea0` on
-  `feat/icm42688-mekf`.
-  - Arming requires `gps_home_ready`. Mid-flight GPS loss does not
-    disarm (arm-time gate only).
-  - pos_kf_task drops the boot-time p_ref average. Once home has
-    latched and ≥2 GPS fixes have fused, the next baro sample
-    self-calibrates: `p_ref = p_now / (1 - kf_alt_up/44330.77)^5.2558`.
-  - Rationale: the onboard baro's intermittency makes a baro-only
-    take-off unsafe. GPS home is the new altitude floor.
-  - Verification checklist lives in the session pickup memory; the
-    short version: `gps=false` in "arm rejected" until home latches,
-    `baro_cal=false` until the 2-fuse window passes, no altitude
-    jump at calibration.
-
-Correct functionality now will be to rely on either baro or GPS as an altitude start (GPS with fix requirements as documented) and for this data to be fused as independent sources of truth with regards altitude specifically
+- **Attitude**: dual ICM-42688P at 8 kHz. Both sensors read back-to-back
+  and averaged (IMU1 ROTATION_ROLL_180, IMU2 ROTATION_PITCH_180). MEKF
+  fuses accel at 100 Hz and gyro at 8 kHz. Gyro bias bounded to 0.3–0.5
+  dps; innovation gate rejects ~0% at rest and ~25% under aggressive
+  motion. Single-IMU fallback path if IMU2 fails to init.
+- **Position**: 6-state linear PosKF (pn, pe, pz, vn, ve, vz) at 100 Hz.
+  - GPS home latches on first fix with FIX3D, ≥5 sats, HDOP < 3.5
+    (relaxed for Alpha; post-Alpha: 7 sats / HDOP < 2.0).
+  - Baro self-calibrates once ≥2 GPS fuses have landed post-home-latch.
+    After cal, baro (σ=0.3 m) dominates altitude; GPS (σ=5 m) keeps
+    it honest long-term.
+  - GPS-only path is safe if baro is absent or dead.
+- **Comms**: CRSF RC (6 channels on UART5), NMEA GPS (USART1), defmt
+  logger (USART6).
+- **Control loop**: MEKF predict at 8 kHz (gyro integration); accel
+  update at 100 Hz. PID inner loop at 200 Hz; MPC outer loop at 50 Hz
+  (every 4th PID cycle). The control loop reads the MEKF's published
+  `IMU_DATA` at 200 Hz — the 8 kHz MEKF and 200 Hz PID are decoupled
+  tasks. Timing well within budget.
+- **Motors**: DShot600 via TIM2 DMAR burst write. All four ESC channels
+  decode correctly; motors spin on arm. Alpha milestone reached
+  2026-05-03.
 
 ---
 
-## What's Next
+## ★ Alpha Complete — 2026-05-03
 
-1. ~~**Flash + outdoor verify `a7feea0`.**~~ Flashed 2026-04-21.
-   GPS-latch thresholds relaxed to 5 sats / HDOP < 3.5 for Alpha
-   testing. Push once verified.
-   Tighten GPS thresholds post Alpha for more reliable prearm (7 sats / HDOP < 2.5)
-   **~~Motor bring-up on F722~~**
-   ~~blocked, under investigation~~
-   Resolved: Record kept for reference as of around 25-04-26:
-   Driver or peripheral config is implicated, not the ESCs. Three
-   of the four ESCs are proven healthy on TIM2's signal; a fourth
-   is unproven. Arm attempts at 29 % thrust did not produce clean
-   spin on any motor. Full session observations and hypotheses in
-   `docs/motor-bringup-log.md`. Captured
-   oscilloscope waveforms and eventually traced malformed bitstream to various embassy issues populating DMAR. We implemented this functionality directly to avoid the issue (src/drivers/dshot_hw.rs) so the ESCs now receive the correct bitstream and the motors spin up on arm.
-  
-2. **Close the loop on hardware.** Rate-PID-only hover first, then
-   enable the MPC outer loop and tune for transfer from sim.
+Full stack running on DAKEFPV H743: dual-IMU MEKF → PosKF → MPC →
+rate PID → mixer → DShot → four motors. Arming, failsafe, and GPS
+home-latch all functional.
 
- (Currently very unclear on whether point 2 is stale comment or true - please verify)
+---
 
-## ****Alpha Complete 03-05-2026****
+## Post-Alpha Tweaks (near-term)
 
-### post-Alpha tweaks
+These are the first things to do now that Alpha is declared.
 
-- GPS thresholds tightened to 7 sats / HDOP < 2.0
-- Re-enable arming on baro only, but if GPS fix is available set home co-ords.
-- Assign CRSF channels for user-initiated GPS Rescue, pos-hold and alt-hold functionality.
-- ESC Bidirectional Dshot functionality
-- revert throttle changes implemented for bench motor testing (posssibly this is done by adding a stick scaling factor in the mixer)
+1. **Fix arming to not require GPS.** `arming.require_gps = false` is
+   currently a bench-mode override; the underlying logic still hard-gates
+   on GPS home. Correct behaviour: arm on either baro or GPS being
+   available. If a GPS fix meeting quality thresholds is present at arm
+   time, latch the home co-ordinates then; otherwise arm baro-only and
+   latch home whenever the fix arrives. Baro and GPS are independent
+   altitude sources — neither gates the other.
+2. **Tighten GPS home-latch thresholds.** Alpha used 5 sats / HDOP < 3.5.
+   Tighten to 7 sats / HDOP < 2.0 for outdoor reliability.
+4. **CRSF channel assignments.** Assign pilot-selectable switches for
+   GPS rescue, position hold, and altitude hold. Currently all three
+   modes are always-on or unreachable from the transmitter.
+5. **Revert bench-mode throttle behaviour.** The manual-throttle
+   pass-through (stick → thrust when PosKF not ready) may need a stick
+   scaling factor in the mixer rather than being a special code path.
 
-### Items for Beta build
+---
+
+## Backlog (pre-Beta, north-star-aligned)
 
 - **Accel bias estimation in PosKF.** The 6-state filter predicts
-  kinematics from raw body specific force with no accel-bias state;
-  outdoor verify showed ~0.4 m/s/s drift between GPS fixes. Benign
-  while GPS σ=2 m dominates, but will bite in two scenarios:
-  - GPS dropouts > a few seconds → drift then re-acquire jumps.
-  - Autonomous landing / loiter hold / precise RTH → a 0.4 m/s/s
-    leak is ~25 m in a minute with intermittent GPS.
-  - Design: extend to 9-state (pn pe pz vn ve vz **bax bay baz**),
-    subtract estimated bias from predict, random-walk process noise
-    with τ ≈ hundreds of seconds. Nominal magnitudes per ICM-42688P
-    spec: ~40 mg offset, ~0.1 mg/°C drift → steady-state |b_a| ~ 0.4
-    m/s² is plausible.
-  - **Schedule: after motor bring-up, before any precision feature.**
-  - **Bidirectional DShot + RPM into the MPC model.** (Betaflight uses
-    eRPM telemetry for notch filtering; we could go further and use it
-    as an adaptive thrust-mapping term in the MPC's B matrix.) See
-    "Post-Alpha directions" below.
+  kinematics from raw body specific force with no accel-bias state.
+  Outdoor testing showed ~0.4 m/s/s drift between GPS fixes. Benign
+  while GPS σ=2 m dominates, but will degrade GPS-rescue accuracy and
+  any loiter/precision features.
+  - Design: extend to 9-state (pn pe pz vn ve vz bax bay baz), subtract
+    estimated bias from predict, random-walk process noise with τ ≈
+    hundreds of seconds.
+  - **Schedule: before any precision autonomous feature.**
+
+- **Bidirectional DShot + eRPM into the MPC.** Measured eRPM from the
+  ESCs closes the loop on real motor behaviour, with several payoff layers:
+  1. **RPM-based notch filter** on the gyro signal — removes motor/prop
+     resonances that currently pass through to the attitude estimate.
+  2. **Adaptive thrust mapping** — runtime DShot→RPM→thrust lookup
+     linearises the actuator response and directly improves MPC accuracy.
+     The MPC's B matrix currently uses a fixed model; substituting
+     measured data makes it adaptive.
+  3. **Motor failure detection** — diverging RPM from commanded value
+     detected in real time; MPC's constraint handling makes mixer
+     reconfiguration theoretically possible.
+  USART3 (ESC telemetry pad) is free; needs wiring and a bidirectional
+  DShot + telemetry-decode driver.
+
+- **Magnetometer calibration.** The onboard magnetometer is not yet used
+  (zeroed out in `ImuData`). Before it can correct yaw drift, a
+  calibration mode is needed: ~1 minute where the pilot can move the
+  drone through full rotation on all three axes, collecting min/max field
+  readings for sphere-fitting (hard-iron + soft-iron correction). The FC
+  needs to detect when sufficient coverage has been collected and store
+  the result. No implementation exists yet.
+
+- ~~**SPL06 barometer driver.**~~ Done. `drivers/baro.rs` now has a
+  proper `Spl06` struct reading calibration from the correct register
+  start (0x18, not the DPS310's 0x10). Running at 128 Hz / 1× OSR;
+  baro task ticks at 125 Hz. DPS310 code retained for reference.
+
+- **Position hold.** `control/position.rs` is written and unit-tested but
+  not yet wired into the control loop. Gates on reliable baro + GPS
+  fusion and sufficient PID tuning in flight.
 
 ---
 
-## Implemented Modules (at Alpha)
+## Implemented Modules
 
 All host-tested (`cargo test --lib --no-default-features --target x86_64-unknown-linux-gnu`).
 
-| Module              | File                      | Description                                                   |
-|---------------------|---------------------------|---------------------------------------------------------------|
-| Rate PID            | `control/pid.rs`          | 3-axis, derivative-on-measurement, D-term LPF, anti-windup    |
-| Attitude MPC        | `control/mpc.rs`          | 6-state roll/pitch/yaw+rates, tinympc ADMM, 50 Hz             |
-| Altitude hold       | `control/altitude.rs`     | PID + hover feedforward, anti-windup, gated on PosKF.ready    |
-| Position PD         | `control/position.rs`     | Horizontal hold, world→body rotation, tilt-limited            |
-| Quad-X mixer        | `control/mixer.rs`        | Airmode + no-airmode paths, phantom-thrust prevention         |
-| Arming FSM          | `control/arming.rs`       | Pre-arm (thr/lvl/imu/rc/gps), failsafe, re-arm lockout        |
-| PosKF               | `estimation.rs`           | 6-state linear KF; GPS + baro + IMU predict                   |
-| MEKF                | `attitude_mekf.rs`        | Quaternion MEKF with gyro-bias state, 8 kHz predict           |
-| CRSF parser         | `drivers/crsf.rs`         | Byte streaming, 11-bit unpack, link stats, CRC8               |
-| NMEA parser         | `drivers/nmea.rs`         | GGA/RMC/GSA/VTG, 3D fix detection, checksum                   |
-| WT901B parser       | `drivers/wt901b.rs`       | All packet types; retained as fallback IMU                    |
-| DPS310 driver       | `drivers/baro.rs`         | I2C @ 16× OSR, bus-recovery bitbang (open-drain)              |
-| DShot encoder       | `drivers/dshot.rs`        | Frame, CRC, DMA buffer, speed/timing                          |
-| Physics sim         | `sim/sim.rs`              | 6DOF rigid body, τ=30ms motor lag, NED, ground collision      |
-| Sensor sim          | `sim/sensors.rs`          | GPS (10 Hz + noise), baro (50 Hz + noise/drift), xorshift64   |
-| TinyMPC solver      | `tinympc-rs/`             | ADMM, no_std, const-generic dimensions                        |
+| Module           | File                     | Description                                                   |
+|------------------|--------------------------|---------------------------------------------------------------|
+| Rate PID         | `control/pid.rs`         | 3-axis, derivative-on-measurement, D-term LPF, anti-windup   |
+| Attitude MPC     | `control/mpc.rs`         | 6-state roll/pitch/yaw+rates, tinympc ADMM, 50 Hz            |
+| Altitude hold    | `control/altitude.rs`    | PID + hover feedforward, anti-windup, gated on PosKF.ready   |
+| Position PD      | `control/position.rs`    | Horizontal hold, world→body rotation, tilt-limited — **written, not yet wired** |
+| Quad-X mixer     | `control/mixer.rs`       | Airmode + no-airmode paths, phantom-thrust prevention         |
+| Arming FSM       | `control/arming.rs`      | Pre-arm (thr/lvl/imu/rc/gps), failsafe, re-arm lockout       |
+| PosKF            | `estimation.rs`          | 6-state linear KF; GPS + baro + IMU predict                  |
+| MEKF             | `attitude_mekf.rs`       | Quaternion MEKF with gyro-bias state, 8 kHz predict          |
+| CRSF parser      | `drivers/crsf.rs`        | Byte streaming, 11-bit unpack, link stats, CRC8              |
+| NMEA parser      | `drivers/nmea.rs`        | GGA/RMC/GSA/VTG, 3D fix detection, checksum                  |
+| UBX parser       | `drivers/ubx.rs`         | u-blox binary protocol — written, not yet active             |
+| WT901B parser    | `drivers/wt901b.rs`      | All packet types; `ImuData` type still used internally        |
+| SPL06 driver     | `drivers/baro.rs`        | 128 Hz / 1× OSR, correct cal from 0x18; DPS310 retained     |
+| DShot driver     | `drivers/dshot_hw.rs`    | TIM2 DMAR burst, DShot600, all 4 channels simultaneously     |
+| Physics sim      | `sim/sim.rs`             | 6DOF rigid body, τ=30ms motor lag, NED, ground collision     |
+| Sensor sim       | `sim/sensors.rs`         | GPS (10 Hz + noise), baro (50 Hz + noise/drift), xorshift64  |
+| TinyMPC solver   | `control/tinympc-rs/`    | ADMM, no_std, const-generic dimensions                        |
 
-### Control cascade (proven in sim and — with the exception of motors — on hardware)
+### Control cascade
 
 ```
-PosKf (100 Hz) ← GPS (1 Hz NMEA) + baro (25 Hz) + IMU predict
+PosKF (100 Hz) ← GPS (1 Hz NMEA) + baro (25 Hz) + IMU predict
       │
       ▼
-Position PD (5 Hz) → desired roll/pitch
+Position PD (5 Hz)  ← [written, not yet wired]
       │
       ▼
 Attitude MPC (50 Hz) → rate setpoints
       │
       ▼
-Rate PID (200 Hz) → torque demands → mixer → motors
+Rate PID (200 Hz) → torque demands → mixer → DShot → motors
 ```
 
 ### Simulation examples
 
 `cargo run --example <name> --no-default-features`:
 
-| Example           | Description                                               | Status                               |
-|-------------------|-----------------------------------------------------------|--------------------------------------|
-| `sim_hover`       | PID-only hover at 5 m                                     | Stable, ±0.02 m altitude             |
-| `sim_mpc_hover`   | MPC+PID hover at 5 m                                      | MPC converges in 3–5 iterations      |
-| `sim_kf_hover`    | Full stack, noisy GPS+baro → KF → altitude hold           | KF altitude within ~30 mm of truth   |
-| `sim_gps_rescue`  | Fly (20, 10) m → home at 5 m altitude                     | Arrives within 0.23 m of home        |
+| Example          | Description                                          | Status                             |
+|------------------|------------------------------------------------------|------------------------------------|
+| `sim_hover`      | PID-only hover at 5 m                                | Stable, ±0.02 m altitude           |
+| `sim_mpc_hover`  | MPC+PID hover at 5 m                                 | MPC converges in 3–5 iterations    |
+| `sim_kf_hover`   | Full stack, noisy GPS+baro → KF → altitude hold      | KF altitude within ~30 mm of truth |
+| `sim_gps_rescue` | Fly (20, 10) m → home at 5 m altitude                | Arrives within 0.23 m of home      |
 
 ---
 
 ## Post-Alpha Directions
 
-Parked here so they aren't forgotten. **None of these should be
-started until a flyable Alpha exists.**
+Parked here so they aren't forgotten. **None of these should be started
+until the post-Alpha tweaks above are done.**
 
 ### H743 headroom
 
-- **ITCM/DTCM/ART** — zero-wait-state memories
-
-- Ideas ordered by ratio of payoff to risk:
+The H743 is significantly more capable than the F722 it replaced:
+480 MHz vs 216 MHz, 1 MB SRAM, ITCM/DTCM zero-wait-state memories,
+dual FPU. Ideas ordered by payoff/risk ratio:
 
 1. **MPC hot loop in ITCM.** TinyMPC's ADMM iteration is our tightest
-   inner loop; zero-wait ITCM should measurably cut solve time. Cheap,
-   low-risk.
-2. **MPC rate 50 Hz → 100 Hz → 200 Hz or beyond.** Gated on solve-time headroom
-   from (1) and potentially 3. Cuts attitude-tracking lag; if matched to the PID rate,
-   the rate loop sees a fresh setpoint every tick.
-3. **Longer MPC horizon.** More RAM + faster solve = look further
-   ahead; helps on aggressive manoeuvres where the controller currently
-   sees constraints too late.
-
-4. **True NMPC (12-state, SQP / multiple-shooting / RTI).** Biggest
-   payoff, biggest work item. Needs a nonlinear solver (acados-style),
-   not tinympc. Gate on (1)+(2) showing us the solve-time budget.
-5. **Accel-bias state in PosKF** — see Backlog above. Independent of
-   the MPC work.
-6. **Bidirectional DShot + adaptive B matrix.** Use measured RPM to
-   correct the thrust mapping at runtime. RPM-based notch filtering
-   on the gyro falls out for free. Phases:
+   inner loop; zero-wait ITCM should measurably cut solve time. Low risk.
+2. **MPC rate 50 Hz → 100 Hz → 200 Hz.** Gated on (1). Cuts
+   attitude-tracking lag; at 200 Hz the rate loop gets a fresh setpoint
+   every tick.
+3. **Longer MPC horizon.** More RAM + faster solve = look further ahead;
+   helps on aggressive manoeuvres.
+4. **True NMPC (12-state, SQP / RTI).** Biggest payoff, biggest work.
+   Needs a nonlinear solver (acados-style). Gate on (1)+(2) showing us
+   the solve-time budget.
+5. **Bidirectional DShot + adaptive B matrix.** See Backlog above for the
+   full rationale. The MPC aspect specifically: feed measured eRPM through
+   a thrust model (eRPM → force) and use it to update the B matrix in
+   the MPC's linear model at runtime. This makes the controller
+   self-correcting as battery voltage sags, props wear, and ESC
+   characteristics vary motor to motor. Phases:
    - Bidirectional DShot capture (timer input capture + DMA)
-   - RPM filtering (port the notch-filter concept)
-   - RPM → thrust estimation for MPC model correction
-   - Disturbance estimate into MPC state
+   - eRPM → thrust estimation
+   - Online B-matrix update in the MPC solve loop
+   - Disturbance observer for unmodelled dynamics
 
-### VTX / OSD
+### OSD / VTX
 
-- **Analog OSD:** SPI-driven character overlay. Onboard hardware.
-
-- **Digital OSD** FC sends OSD data to
-  the VTX, which renders digitally. Path of least resistance. ~30 Hz,
-  one UART.
-- **VTX control:** SmartAudio (4800 baud, Tx-only) or IRC Tramp (9600,
-  Tx/Rx). Low priority — manual button configuration works until it's
-  implemented.
+- **Analog OSD (AT7456E, onboard):** SPI character-overlay chip, register-
+  compatible with the MAX7456. Verified from ArduPilot docs. Driver would
+  follow the MAX7456 protocol; datasheet is the AT7456E.
+- **Digital OSD:** MSP DisplayPort over UART4 (already labelled for this).
+- **VTX control:** SmartAudio or IRC Tramp over a spare UART.
 
 ### Blackbox logging
 
-Record ~200 Hz flight data to the onboard W25Nx1G flash. Essential
-for post-flight tuning. Key fields: IMU raw+fused, RC input, control
-demand, motor outputs, MPC solve time/convergence, GPS fix quality.
-Format could be Betaflight-compatible (reuse Blackbox Explorer) or
-custom.
+Record ~200 Hz flight data to onboard flash. Key fields: IMU raw+fused,
+RC input, control demands, motor outputs, MPC solve time, GPS fix
+quality. Format could be Betaflight-compatible or custom.
 
 ### Current sensing
 
-Board needs to be able to sense the current draw from the motors and battery voltage to provide feedback to the Flight Controller and to the pilot.
+Battery voltage and motor current feedback to the FC and pilot.
+The board has current-sensing hardware; a driver is needed.
 
 ### Configuration interface
 
-- **MSP over USB** — compatible with Betaflight configurator.
-  Ambitious but useful.
-- **MAVLink over UART** — Mission Planner / QGC compatibility.
+- **MSP over USB** — Betaflight configurator compatibility.
+- **MAVLink over UART** — Mission Planner / QGC.
 - **Parameter storage in flash** — persist tuning across reboots.
-
-### ESC telemetry — post-Alpha motor health
-
-See (6) above. Beyond notch filtering:
-
-- **Adaptive thrust mapping** — runtime lookup (DShot → RPM → thrust),
-  linearises actuator response, directly improves MPC accuracy.
-- **Motor failure detection** — if one motor's RPM diverges wildly
-  from commanded, the MPC's constraint handling makes real-time
-  mixer reconfiguration theoretically possible.

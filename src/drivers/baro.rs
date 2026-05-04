@@ -1,17 +1,16 @@
-// baro.rs — Onboard barometer driver for the DAKEFPVH743.
+// baro.rs — Onboard barometer driver.
 //
-// The board footprint is populated with either a BMP280 (Bosch) or a
-// DPS310 (Infineon) depending on build lot — not register-compatible.
-// `detect()` at boot figures out which one is there; on the current
-// target (2026-04-20) that's a DPS310 at 0x76.
+// The DAKEFPV H743 has an SPL06 (Goertek) at I2C2.  The DPS310 (Infineon)
+// code is retained as reference — its compensation formula and register
+// map are nearly identical to the SPL06, differing only in the calibration
+// coefficient start address (0x10 vs 0x18).
 //
 // This file holds:
-//   - `detect()`:      WHO_AM_I probe for both chips at both addresses.
-//   - `Dps310`:        full DPS310 driver — calibration parse,
-//                      continuous-mode config, compensated read.
-//
-// BMP280 would slot in similarly if a future board populates it; its
-// compensation math is different so it'd live under its own struct.
+//   - `detect()`:  WHO_AM_I probe at both I2C addresses.
+//   - `Spl06`:     full SPL06 driver — calibration parse, 128 Hz
+//                  continuous-mode config, compensated read.
+//   - `Dps310`:    retained for reference / future boards.
+//   - `pressure_to_altitude_m`: shared altitude conversion.
 
 use embassy_stm32::i2c::{Error as I2cError, I2c, Master};
 use embassy_stm32::mode::Blocking;
@@ -32,7 +31,8 @@ const DPS310_ID_VALUE: u8 = 0x10;
 #[derive(Clone, Copy, Debug, defmt::Format)]
 pub enum BaroChip {
     Bmp280 { addr: u8 },
-    Dps310 { addr: u8 },
+    Spl06  { addr: u8 },
+    Dps310 { addr: u8 }, // retained; not on DAKEFPV H743
 }
 
 #[derive(Debug, defmt::Format)]
@@ -62,7 +62,11 @@ pub fn detect(i2c: &mut I2c<'_, Blocking, Master>) -> Result<BaroChip, DetectErr
             return Ok(BaroChip::Bmp280 { addr });
         }
         if dps_id == Some(DPS310_ID_VALUE) {
-            return Ok(BaroChip::Dps310 { addr });
+            // SPL06 and DPS310 share CHIP_ID 0x10 at register 0x0D.
+            // On the DAKEFPV H743 the chip is an SPL06; report it as
+            // such. A future board with a genuine DPS310 would need a
+            // secondary distinguisher here.
+            return Ok(BaroChip::Spl06 { addr });
         }
         if bmp_id == Some(BMP388_ID_VALUE) {
             return Err(DetectError::UnknownChip { addr, id: BMP388_ID_VALUE });
@@ -84,6 +88,7 @@ pub fn detect(i2c: &mut I2c<'_, Blocking, Master>) -> Result<BaroChip, DetectErr
 pub fn name(chip: BaroChip) -> &'static str {
     match chip {
         BaroChip::Bmp280 { .. } => "BMP280",
+        BaroChip::Spl06  { .. } => "SPL06",
         BaroChip::Dps310 { .. } => "DPS310",
     }
 }
@@ -131,6 +136,154 @@ pub fn pressure_to_altitude_m(p_pa: f32, p_ref_pa: f32) -> f32 {
     }
     let ratio = p_pa / p_ref_pa;
     44330.77_f32 * (1.0 - libm::powf(ratio, 1.0 / 5.2558))
+}
+
+// ---- SPL06 ----
+//
+// Register map matches the DPS310 almost exactly. The one material
+// difference: calibration coefficients start at 0x18 (vs 0x10 on the
+// DPS310). Compensation formula, OSR/rate encoding, PRS_CFG, TMP_CFG,
+// MEAS_CFG, CFG_REG, RESET, COEF_SRCE registers are all identical.
+//
+// Configured at init: 128 Hz pressure, 1× OSR (scale factor 524288).
+// Temperature: 1 Hz, 1× OSR. No P_SHIFT/T_SHIFT needed at 1× OSR.
+
+const SPL06_REG_COEF_START: u8 = 0x18; // 18 bytes: 0x18..=0x29
+
+#[derive(Debug, defmt::Format)]
+pub enum Spl06Error {
+    I2c,
+    CoefTimeout,
+    SensorTimeout,
+    WhoAmIMismatch(u8),
+}
+
+impl From<I2cError> for Spl06Error {
+    fn from(_: I2cError) -> Self { Spl06Error::I2c }
+}
+
+pub struct Spl06 {
+    addr: u8,
+    cal:  Dps310Cal, // identical layout — reuse the struct
+    k_p:  f32,
+    k_t:  f32,
+}
+
+impl Spl06 {
+    /// Initialise the SPL06: soft reset, wait for coefficient and sensor
+    /// ready, read calibration, configure 128 Hz / 1× OSR continuous mode.
+    ///
+    /// 128 Hz at 1× OSR gives a new pressure reading every ~7.8 ms.
+    /// The baro task should tick at 8 ms (125 Hz) to consume them without
+    /// queuing up.
+    pub async fn init(
+        i2c: &mut I2c<'_, Blocking, Master>,
+        addr: u8,
+    ) -> Result<Self, Spl06Error> {
+        let mut id = [0u8; 1];
+        i2c.blocking_write_read(addr, &[DPS310_REG_ID], &mut id)?;
+        if id[0] != DPS310_ID_VALUE {
+            return Err(Spl06Error::WhoAmIMismatch(id[0]));
+        }
+
+        // Soft reset (same magic value as DPS310).
+        i2c.blocking_write(addr, &[DPS310_REG_RESET, 0x09])?;
+        Timer::after(Duration::from_millis(15)).await;
+
+        // Poll COEF_RDY — OTP read takes ~40 ms on cold start.
+        let mut meas = 0u8;
+        for _ in 0..20 {
+            let mut buf = [0u8; 1];
+            i2c.blocking_write_read(addr, &[DPS310_REG_MEAS_CFG], &mut buf)?;
+            meas = buf[0];
+            if meas & MEAS_CFG_COEF_RDY != 0 { break; }
+            Timer::after(Duration::from_millis(5)).await;
+        }
+        if meas & MEAS_CFG_COEF_RDY == 0 {
+            return Err(Spl06Error::CoefTimeout);
+        }
+
+        // COEF_SRCE bit 7 selects the temperature sensor used for
+        // compensation — must be mirrored into TMP_CFG bit 7.
+        let mut src = [0u8; 1];
+        i2c.blocking_write_read(addr, &[DPS310_REG_COEF_SRCE], &mut src)?;
+        let tmp_source_bit = src[0] & 0x80;
+
+        // Read 18-byte calibration block from SPL06-specific start address.
+        let mut coef = [0u8; 18];
+        i2c.blocking_write_read(addr, &[SPL06_REG_COEF_START], &mut coef)?;
+        let cal = Dps310Cal::parse(&coef);
+
+        // Poll SENSOR_RDY.
+        let mut ready = false;
+        for _ in 0..20 {
+            let mut buf = [0u8; 1];
+            i2c.blocking_write_read(addr, &[DPS310_REG_MEAS_CFG], &mut buf)?;
+            if buf[0] & MEAS_CFG_SENSOR_RDY != 0 { ready = true; break; }
+            Timer::after(Duration::from_millis(5)).await;
+        }
+        if !ready {
+            return Err(Spl06Error::SensorTimeout);
+        }
+
+        // 128 Hz rate, 1× OSR for pressure.
+        let p_rate = Rate::Hz128;
+        let p_osr  = Osr::X1;
+        // 1 Hz rate, 1× OSR for temperature (slow drift — no need to race).
+        let t_rate = Rate::Hz1;
+        let t_osr  = Osr::X1;
+
+        let prs_cfg = ((p_rate as u8) << 4) | (p_osr as u8);
+        i2c.blocking_write(addr, &[DPS310_REG_PRS_CFG, prs_cfg])?;
+
+        let tmp_cfg = tmp_source_bit | ((t_rate as u8) << 4) | (t_osr as u8);
+        i2c.blocking_write(addr, &[DPS310_REG_TMP_CFG, tmp_cfg])?;
+
+        // P_SHIFT / T_SHIFT not needed at 1× OSR.
+        i2c.blocking_write(addr, &[DPS310_REG_CFG_REG, 0x00])?;
+
+        // Continuous pressure + temperature.
+        i2c.blocking_write(addr, &[DPS310_REG_MEAS_CFG, MEAS_CTRL_CONT_PT])?;
+
+        let k_p = K_SCALE[p_osr as usize];
+        let k_t = K_SCALE[t_osr as usize];
+
+        defmt::info!(
+            "SPL06 init OK @ 0x{=u8:02x}: tmp_src={=u8:#x} k_p={=f32} k_t={=f32}",
+            addr, tmp_source_bit, k_p, k_t,
+        );
+        defmt::info!("SPL06 cal: {}", cal);
+
+        Ok(Self { addr, cal, k_p, k_t })
+    }
+
+    /// Read the latest compensated pressure (Pa) + temperature (°C).
+    /// Burst-reads 6 bytes — cheap at 400 kHz I2C (~150 µs).
+    pub fn read(
+        &self,
+        i2c: &mut I2c<'_, Blocking, Master>,
+    ) -> Result<BaroSample, Spl06Error> {
+        let mut buf = [0u8; 6];
+        i2c.blocking_write_read(self.addr, &[DPS310_REG_PRS_B2], &mut buf)?;
+
+        let p_raw = sign_extend_24(
+            ((buf[0] as u32) << 16) | ((buf[1] as u32) << 8) | (buf[2] as u32),
+        );
+        let t_raw = sign_extend_24(
+            ((buf[3] as u32) << 16) | ((buf[4] as u32) << 8) | (buf[5] as u32),
+        );
+
+        let p_scaled = p_raw as f32 / self.k_p;
+        let t_scaled = t_raw as f32 / self.k_t;
+
+        let temperature_c = self.cal.c0 * 0.5 + self.cal.c1 * t_scaled;
+        let pressure_pa   = self.cal.c00
+            + p_scaled * (self.cal.c10 + p_scaled * (self.cal.c20 + p_scaled * self.cal.c30))
+            + t_scaled * self.cal.c01
+            + t_scaled * p_scaled * (self.cal.c11 + p_scaled * self.cal.c21);
+
+        Ok(BaroSample { pressure_pa, temperature_c })
+    }
 }
 
 // ---- DPS310 ----
