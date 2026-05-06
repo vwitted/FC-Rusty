@@ -46,6 +46,7 @@ material hardware or design change lands (see `CLAUDE.md`).
 
 ## What's Verified on Hardware
 
+<<<<<<< HEAD
 - **Attitude**: dual ICM-42688P at 8 kHz. Both sensors read back-to-back
   and averaged (IMU1 ROTATION_ROLL_180, IMU2 ROTATION_PITCH_180). MEKF
   fuses accel at 100 Hz and gyro at 8 kHz. Gyro bias bounded to 0.3–0.5
@@ -68,6 +69,29 @@ material hardware or design change lands (see `CLAUDE.md`).
 - **Motors**: DShot600 via TIM2 DMAR burst write. All four ESC channels
   decode correctly; motors spin on arm. Alpha milestone reached
   2026-05-03.
+=======
+(The specifics here are largely validated on older hardware, but the overall functionality has now been implemented and enhanced for the STM32H743).
+
+- **Attitude**: Dual ICM-42688P sensors read at 8 kHz via SPI. MEKF fusing accel (100 Hz update)
+  and gyro (8 kHz predict). Gyro bias bounded to 0.3–0.5 dps; innovation
+  gate rejects ~0% at rest and ~25% under aggressive motion. Sensor
+  frame mapped to NED via `BODY_SIGN=[+1,-1,-1]`.
+- **Position**: 6-state linear PosKF (pn, pe, pz, vn, ve, vz) running
+  at 100 Hz predict.
+  - GPS home latches on the first fix with `FIX3D && sats ≥ 5 && HDOP < 3.5`
+    (relaxed for Alpha testing; see backlog for post-Alpha tightening).
+  - GPS altitude fuses with σ_gps_v = 5 m; baro (when alive) with
+    σ_baro = 0.3 m. Baro dominates the short term; GPS keeps altitude
+    honest long-term via cross-covariance.
+  - Outdoor verification 2026-04-20: clean `alt-ready → ready`
+    transition, baro 26 reads/s with 0 errors across the run,
+    post-home-latch IMU-only drift (~1500 m) corrected in one GPS
+    tick as expected.
+- **Comms**: CRSF RC (6 channels), NMEA GPS, defmt over USART3.
+- **Control loop**: Asynchronous dual-loop architecture communicating via lock-free `Watch` channel:
+  - **Outer Loop (100 Hz)**: `navigation_task` handles Attitude MPC, altitude hold, position hold, and RC processing.
+  - **Inner Loop (8 kHz)**: `control_loop` executes the rate PID and DShot output, fully synchronized to the MEKF gyro predicts without arbitrary timers.
+>>>>>>> 3ee0c5a (feat: introduce flight modes and implementnavigation task with position control and GPS rescue functionality.)
 
 ---
 
@@ -83,6 +107,7 @@ home-latch all functional.
 
 These are the first things to do now that Alpha is declared.
 
+<<<<<<< HEAD
 1. **Fix arming to not require GPS.** `arming.require_gps = false` is
    currently a bench-mode override; the underlying logic still hard-gates
    on GPS home. Correct behaviour: arm on either baro or GPS being
@@ -98,10 +123,25 @@ These are the first things to do now that Alpha is declared.
 5. **Revert bench-mode throttle behaviour.** The manual-throttle
    pass-through (stick → thrust when PosKF not ready) may need a stick
    scaling factor in the mixer rather than being a special code path.
+=======
+   *(Status Verification: This point remains **TRUE**. While the logic and loop decoupling have been heavily validated in the simulation environments (`sim_gps_rescue`, `sim_hover`), we are still awaiting the delivery of the final target hardware to begin the physical motor bring-up and physical PID tuning.)*
+>>>>>>> 3ee0c5a (feat: introduce flight modes and implementnavigation task with position control and GPS rescue functionality.)
 
 ---
 
+<<<<<<< HEAD
 ## Backlog (pre-Beta, north-star-aligned)
+=======
+### post-Alpha tweaks
+
+- [ ] GPS thresholds tightened to 7 sats / HDOP < 2.0
+- [x] Re-enable arming on baro only, but if GPS fix is available set home co-ords. (Implemented in `arming.rs` FSM)
+- [x] Assign CRSF channels for user-initiated GPS Rescue, pos-hold and alt-hold functionality. (Implemented: CH5 for mode, CH6 for RTH trigger)
+- [ ] ESC Bidirectional Dshot functionality
+- [ ] revert throttle changes implemented for bench motor testing (posssibly this is done by adding a stick scaling factor in the mixer)
+
+### Items for Beta build
+>>>>>>> 3ee0c5a (feat: introduce flight modes and implementnavigation task with position control and GPS rescue functionality.)
 
 - **Accel bias estimation in PosKF.** The 6-state filter predicts
   kinematics from raw body specific force with no accel-bias state.

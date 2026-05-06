@@ -6,7 +6,15 @@
 // State transitions:
 //
 //   Disarmed ──(all checks pass + arm switch)──→ Armed
-//   Armed ──(disarm switch OR failsafe OR check fail)──→ Disarmed
+//   Armed ──(disarm switch OR IMU loss)──→ Disarmed
+//   Armed ──(RC loss)──→ Armed + failsafe_active
+//                        (control loop engages GPS rescue)
+//
+// RC loss no longer disarms immediately — that would crash the
+// quad. Instead, the FSM stays Armed and sets `failsafe_active`
+// so the control loop can switch to GPS rescue mode. If GPS home
+// was never latched, RC loss falls back to disarm (no safe RTH
+// possible).
 //
 // Pre-arm checks:
 //   1. Throttle low (< 5%)    — prevents arming at high throttle
@@ -14,11 +22,7 @@
 //   3. IMU data fresh (< 50ms)— prevents arming with stale sensors
 //   4. RC link active (< 500ms)— prevents arming without RC
 //   5. GPS home latched       — prevents arming without a trusted
-//      altitude reference. Rationale: the onboard MEMS baro has
-//      shown intermittency (see project_altitude_sensor_fusion.md).
-//      Requiring a GPS home as the altitude floor means take-off is
-//      never baro-only. Consequence: cannot arm indoors — acceptable
-//      for the Alpha (outdoor target).
+//      altitude reference.
 //
 // The arm switch must transition from OFF→ON (edge-triggered) to
 // prevent accidental re-arm after a failsafe disarm.
@@ -56,6 +60,10 @@ pub struct ArmingStateMachine {
     pub state: ArmState,
     /// Previous arm switch state (for edge detection)
     prev_arm_switch: bool,
+    /// True when the RC link is lost while armed. The control loop
+    /// reads this to engage GPS rescue. Cleared automatically when
+    /// RC recovers, or on disarm.
+    pub failsafe_active: bool,
     /// Thresholds
     pub throttle_threshold: f32,
     pub max_arm_angle_deg: f32,
@@ -70,6 +78,7 @@ impl ArmingStateMachine {
         Self {
             state: ArmState::Disarmed,
             prev_arm_switch: false,
+            failsafe_active: false,
             throttle_threshold: 0.05,
             max_arm_angle_deg: 25.0,
             max_imu_age_ms: 50,
@@ -114,15 +123,32 @@ impl ArmingStateMachine {
             ArmState::Disarmed => {
                 if arm_edge && checks.all_pass() {
                     self.state = ArmState::Armed;
+                    self.failsafe_active = false;
                 }
             }
             ArmState::Armed => {
-                // Disarm on: switch off, failsafe, or critical check failure
                 if !arm_switch {
+                    // Pilot disarm — always honoured.
                     self.state = ArmState::Disarmed;
-                } else if !checks.rc_link_active || !checks.imu_fresh {
-                    // Failsafe: disarm on sensor/RC loss
+                    self.failsafe_active = false;
+                } else if !checks.imu_fresh {
+                    // IMU loss — no safe recovery, must disarm.
                     self.state = ArmState::Disarmed;
+                    self.failsafe_active = false;
+                } else if !checks.rc_link_active {
+                    // RC loss — stay armed, signal failsafe so the
+                    // control loop can engage GPS rescue.
+                    // If GPS home was never latched, we can't RTH,
+                    // so fall back to disarm.
+                    if gps_home_latched {
+                        self.failsafe_active = true;
+                    } else {
+                        self.state = ArmState::Disarmed;
+                        self.failsafe_active = false;
+                    }
+                } else {
+                    // RC recovered — clear failsafe.
+                    self.failsafe_active = false;
                 }
                 // Note: we do NOT disarm on throttle_high or attitude —
                 // that would cause mid-flight disarms.
@@ -153,9 +179,10 @@ impl ArmingStateMachine {
         }
     }
 
-    /// Force disarm (for emergency stop / panic button).
+    /// Force disarm (for emergency stop / panic button / auto-land complete).
     pub fn force_disarm(&mut self) {
         self.state = ArmState::Disarmed;
+        self.failsafe_active = false;
     }
 
     pub fn is_armed(&self) -> bool {
@@ -247,16 +274,50 @@ mod tests {
     }
 
     #[test]
-    fn test_failsafe_disarm_on_rc_loss() {
+    fn test_failsafe_on_rc_loss_with_gps() {
         let mut sm = ArmingStateMachine::new();
         let (_, thr, roll, pitch, imu, _, gps) = good_conditions();
 
         sm.update(true, thr, roll, pitch, imu, 50, gps);
         assert_eq!(sm.state, ArmState::Armed);
 
-        // RC loss while armed → disarm
+        // RC loss while armed with GPS home → stay armed, failsafe active
         sm.update(true, thr, roll, pitch, imu, 1000, gps);
+        assert_eq!(sm.state, ArmState::Armed);
+        assert!(sm.failsafe_active);
+    }
+
+    #[test]
+    fn test_disarm_on_rc_loss_without_gps() {
+        let mut sm = ArmingStateMachine::new();
+        let (_, thr, roll, pitch, imu, _, _) = good_conditions();
+
+        // Arm without GPS requirement
+        sm.require_gps = false;
+        sm.update(true, thr, roll, pitch, imu, 50, false);
+        assert_eq!(sm.state, ArmState::Armed);
+
+        // RC loss without GPS home → must disarm (can't RTH)
+        sm.update(true, thr, roll, pitch, imu, 1000, false);
         assert_eq!(sm.state, ArmState::Disarmed);
+    }
+
+    #[test]
+    fn test_failsafe_clears_on_rc_recovery() {
+        let mut sm = ArmingStateMachine::new();
+        let (_, thr, roll, pitch, imu, _, gps) = good_conditions();
+
+        sm.update(true, thr, roll, pitch, imu, 50, gps);
+        assert_eq!(sm.state, ArmState::Armed);
+
+        // RC loss → failsafe
+        sm.update(true, thr, roll, pitch, imu, 1000, gps);
+        assert!(sm.failsafe_active);
+
+        // RC recovers → failsafe clears, stays armed
+        sm.update(true, thr, roll, pitch, imu, 50, gps);
+        assert_eq!(sm.state, ArmState::Armed);
+        assert!(!sm.failsafe_active);
     }
 
     #[test]
@@ -302,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_rearm_after_failsafe() {
+    fn test_rearm_after_failsafe_recovery() {
         let mut sm = ArmingStateMachine::new();
         let (_, thr, roll, pitch, imu, _, gps) = good_conditions();
 
@@ -310,19 +371,19 @@ mod tests {
         sm.update(true, thr, roll, pitch, imu, 50, gps);
         assert_eq!(sm.state, ArmState::Armed);
 
-        // RC loss → failsafe disarm
+        // RC loss → failsafe (stays armed with GPS)
         sm.update(true, thr, roll, pitch, imu, 1000, gps);
-        assert_eq!(sm.state, ArmState::Disarmed);
+        assert_eq!(sm.state, ArmState::Armed);
+        assert!(sm.failsafe_active);
 
-        // Switch is still ON, RC comes back — should NOT re-arm
-        // because there's no OFF→ON edge
-        sm.update(true, thr, roll, pitch, imu, 50, gps);
-        assert_eq!(sm.state, ArmState::Disarmed);
-
-        // Must toggle switch OFF then ON to re-arm
-        sm.update(false, thr, roll, pitch, imu, 50, gps);
+        // RC recovers → back to normal armed
         sm.update(true, thr, roll, pitch, imu, 50, gps);
         assert_eq!(sm.state, ArmState::Armed);
+        assert!(!sm.failsafe_active);
+
+        // Pilot can now disarm normally
+        sm.update(false, thr, roll, pitch, imu, 50, gps);
+        assert_eq!(sm.state, ArmState::Disarmed);
     }
 
     #[test]

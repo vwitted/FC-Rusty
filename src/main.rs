@@ -40,6 +40,7 @@ use embassy_stm32::usart::{self, Uart, UartRx};
 use embassy_stm32::{bind_interrupts, peripherals};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
+use embassy_sync::watch::Watch;
 use embassy_time::{Duration, Instant, Ticker};
 
 use panic_probe as _; // panic handler that works with probe
@@ -61,6 +62,7 @@ mod control {
     pub mod mixer;
     pub mod mpc;
     pub mod pid;
+    pub mod position;
 }
 mod attitude_mekf;
 mod estimation;
@@ -73,6 +75,7 @@ use control::arming::{ArmState, ArmingStateMachine};
 use control::mixer::{ControlDemand, QUAD_X};
 use control::mpc::AttitudeMpc;
 use control::pid::{PidGains, PidLimits, RatePidController};
+use control::position::{PositionController, PositionGains};
 use drivers::baro::{self, BaroSample};
 use drivers::crsf::RcChannels;
 use drivers::dshot_hw::DshotQuad;
@@ -80,9 +83,48 @@ use uf_dshot::{Command, DshotSpeed, DshotTx, EncodedFrame};
 use drivers::icm42688::RawImu;
 use drivers::nmea::{FixMode, GpsData, NmeaParser};
 use drivers::wt901b::{
-    ImuData, UPDATED_ACCEL, UPDATED_ANGLE, UPDATED_GYRO, UPDATED_QUAT, Wt901bParser,
+    ImuData, UPDATED_ACCEL, UPDATED_ANGLE, UPDATED_GYRO, UPDATED_QUAT,
 };
 use estimation::{PosKf, geodetic_to_local_ned};
+
+// ---- Flight modes ----
+
+/// Active flight mode — determines how RC sticks, the position
+/// controller, and the altitude controller interact in the control
+/// loop. Selected by RC channel 5 (3-position mode switch), channel 6
+/// (GPS rescue override), or the arming FSM’s failsafe flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, defmt::Format)]
+enum FlightMode {
+    /// Sticks → angle (MPC) → rate (PID). Direct throttle.
+    Acro,
+    /// Sticks → angle (MPC) → rate (PID). Altitude held by
+    /// controller; throttle stick commands climb/descend rate.
+    AltHold,
+    /// Altitude + horizontal position held. Sticks command velocity.
+    PosHold,
+    /// Autonomous return to GPS home at a safe altitude. Triggered by switch.
+    GpsHome,
+    /// Failsafe mode: hover in place without moving.
+    GpsRescue,
+}
+
+// ---- GPS rescue parameters ----
+/// Altitude to climb to during GPS rescue (metres, positive-up).
+const RESCUE_ALT_M: f32 = 50.0;
+/// Horizontal distance to home at which we consider “arrived” (metres).
+const RESCUE_ARRIVAL_RADIUS_M: f32 = 5.0;
+/// Descent rate during auto-land phase (m/s, positive value).
+const RESCUE_LAND_RATE_MPS: f32 = 0.5;
+/// Time loitering at home before auto-landing if RC stays lost (seconds).
+const RESCUE_LAND_TIMEOUT_S: f32 = 30.0;
+/// Altitude below which auto-land disarms (metres, positive-up).
+const RESCUE_DISARM_ALT_M: f32 = 1.0;
+/// Throttle stick deadband for alt-hold climb/descend (0–1 normalised).
+const ALT_HOLD_DEADBAND: f32 = 0.05;
+/// Max climb/descend rate when throttle stick is fully deflected (m/s).
+const ALT_HOLD_MAX_RATE_MPS: f32 = 2.0;
+/// Max velocity when sticks are fully deflected in PosHold (m/s).
+const POS_HOLD_MAX_VEL_MPS: f32 = 5.0;
 
 // ---- Interrupt bindings ----
 
@@ -103,6 +145,20 @@ static IMU_DATA: Signal<CriticalSectionRawMutex, ImuData> = Signal::new();
 /// averaged across both sensors when both are online).
 /// Consumed at ~8 kHz by the MEKF attitude filter.
 static RAW_IMU: Signal<CriticalSectionRawMutex, RawImu> = Signal::new();
+
+/// Dedicated signal for the navigation task so it doesn't steal IMU_DATA from the fast inner loop.
+static IMU_DATA_FOR_NAV: Signal<CriticalSectionRawMutex, ImuData> = Signal::new();
+
+/// Command output from the 50 Hz navigation outer loop, read by the 8 kHz fast inner loop.
+#[derive(Clone, Copy)]
+pub struct OuterLoopCommand {
+    pub thrust: f32,
+    pub rate_sp_degs: [f32; 3],
+    pub armed: bool,
+}
+
+static OUTER_CMD: Watch<CriticalSectionRawMutex, OuterLoopCommand, 2> = Watch::new();
+
 
 /// Counters for the ICM monitor task. Live regardless of whether the
 /// read task is making progress, so a silent INT pin still shows up
@@ -371,7 +427,10 @@ async fn main(spawner: Spawner) {
     dshot.log_config();
     defmt::info!("DShot (TIM2+TIM3+TIM4, DShot600) initialised");
 
-    // ---- Run the control loop on the main task ----
+    // ---- Run the 50 Hz outer loop as a spawned task ----
+    spawner.spawn(navigation_task()).unwrap();
+
+    // ---- Run the fast 8 kHz inner loop on the main task ----
     // This is deliberate: the control loop is the highest priority
     // work, so it runs on the main executor rather than being
     // spawned as a separate task.
@@ -701,6 +760,7 @@ async fn mekf_task() {
             updated: UPDATED_ACCEL | UPDATED_GYRO | UPDATED_ANGLE | UPDATED_QUAT,
         };
         IMU_DATA.signal(imu);
+        IMU_DATA_FOR_NAV.signal(imu);
         // Feed the position KF at 100 Hz — matches the accel-update
         // cadence so the signalled sample is the freshest fused one.
         if on_kf_tick {
@@ -1230,13 +1290,13 @@ async fn baro_task(
 //
 // This runs as the main task — it never returns.
 
-async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
+#[embassy_executor::task]
+async fn navigation_task() {
     use core::f32::consts::PI;
     const DEG2RAD: f32 = PI / 180.0;
     const RAD2DEG: f32 = 180.0 / PI;
 
     // ---- Arming state machine ----
-    // TODO: re-enable GPS requirement before outdoor flight
     let mut arming = ArmingStateMachine::new();
     arming.require_gps = false; // bench mode — no GPS indoors
 
@@ -1254,25 +1314,10 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
     let mut alt_ctrl = AltitudeController::new(alt_gains, hover_throttle);
     let mut current_thrust = hover_throttle;
 
-    // ---- PID rate inner loop (200 Hz) ----
-    // Gains tuned for real hardware with motor lag (~30ms ESC+motor).
-    // Adjust Kp/Ki/Kd during bench testing with props off first.
-    let rate_gains = PidGains {
-        kp: 0.02,
-        ki: 0.005,
-        kd: 0.001,
-    };
-    let yaw_gains = PidGains {
-        kp: 0.03,
-        ki: 0.005,
-        kd: 0.0,
-    };
-    let limits = PidLimits {
-        integral_max: 0.3,
-        output_max: 0.5,
-        d_lpf_tau_s: 0.008,
-    };
-    let mut rate_pid = RatePidController::new(rate_gains, rate_gains, yaw_gains, limits);
+    // ---- Position hold / GPS rescue (50 Hz) ----
+    let mut pos_ctrl = PositionController::new(PositionGains::default());
+
+
 
     // ---- Sensor state ----
     let mut last_rc = RcChannels {
@@ -1284,6 +1329,14 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
     let mut imu_last_seen = Instant::now();
     let mut control_demand = ControlDemand::default();
     let mut last_armed = false;
+
+    // ---- Flight mode state ----
+    let mut flight_mode = FlightMode::Acro;
+    let mut prev_mode = FlightMode::Acro;
+    let mut alt_target: f32 = 0.0;      // metres, positive-up
+    let mut pos_target: [f32; 2] = [0.0, 0.0]; // [north, east] metres
+    let mut rescue_loiter_start: Option<Instant> = None;
+    let mut rescue_landing = false;
 
     // ---- Loop timing instrumentation ----
     // Tracks how long each control loop iteration takes.
@@ -1298,9 +1351,9 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
     let mut timing_sample_count: u32 = 0;
 
     // ---- Main loop: 200 Hz ----
-    let mut ticker = Ticker::every(Duration::from_millis(5));
+    let mut ticker = Ticker::every(Duration::from_millis(10));
     let mut cycle_count: u32 = 0;
-    let dt: f32 = 0.005; // 200 Hz
+    let dt: f32 = 0.01; // 100 Hz
 
     // ---- MPC warm-up ----
     // Run one throwaway solve so the first in-flight solve (on arm)
@@ -1325,7 +1378,7 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
         let loop_start = Instant::now();
 
         // ---- 1. Read latest sensor data ----
-        if let Some(imu) = IMU_DATA.try_take() {
+        if let Some(imu) = IMU_DATA_FOR_NAV.try_take() {
             last_imu = imu;
             imu_last_seen = Instant::now();
         }
@@ -1399,26 +1452,75 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
 
 
 
-        // ---- 3. Control computation ----
+        // ---- 3. Flight mode selection ----
+        let pos_ready = last_pos_est.map(|e| e.ready).unwrap_or(false);
+        let home_latched = last_pos_est.map(|e| e.home_latched).unwrap_or(false);
+
+        if !armed {
+            flight_mode = FlightMode::Acro;
+        } else if arming.failsafe_active && home_latched {
+            flight_mode = FlightMode::GpsRescue; // Hover in place on failsafe
+        } else if RcChannels::to_us(last_rc.channels[6]) > 1500 && home_latched {
+            flight_mode = FlightMode::GpsHome; // Return to home on switch
+        } else if RcChannels::to_us(last_rc.channels[5]) > 1600 && pos_ready {
+            flight_mode = FlightMode::PosHold;
+        } else if RcChannels::to_us(last_rc.channels[5]) > 1200 && pos_ready {
+            flight_mode = FlightMode::AltHold;
+        } else {
+            flight_mode = FlightMode::Acro;
+        }
+
+        // ---- Mode entry: capture targets on transition ----
+        if flight_mode != prev_mode {
+            defmt::info!("Flight mode: {} -> {}", prev_mode, flight_mode);
+            if let Some(est) = last_pos_est.filter(|_| pos_ready) {
+                match flight_mode {
+                    FlightMode::AltHold => {
+                        alt_target = est.altitude_up;
+                        alt_ctrl.reset();
+                    }
+                    FlightMode::PosHold => {
+                        alt_target = est.altitude_up;
+                        pos_target = [est.position_ned[0], est.position_ned[1]];
+                        alt_ctrl.reset();
+                    }
+                    FlightMode::GpsRescue => {
+                        // Hover in place (lock current position and altitude)
+                        alt_target = est.altitude_up;
+                        pos_target = [est.position_ned[0], est.position_ned[1]];
+                        alt_ctrl.reset();
+                    }
+                    FlightMode::GpsHome => {
+                        // Climb to rescue alt or hold current if already higher.
+                        alt_target = if est.altitude_up > RESCUE_ALT_M {
+                            est.altitude_up
+                        } else {
+                            RESCUE_ALT_M
+                        };
+                        pos_target = [0.0, 0.0]; // home is NED origin
+                        rescue_loiter_start = None;
+                        rescue_landing = false;
+                        alt_ctrl.reset();
+                    }
+                    FlightMode::Acro => {}
+                }
+            }
+            prev_mode = flight_mode;
+        }
+
+        // ---- 4. Control computation ----
         if armed {
-            // RC stick → desired attitude
             let max_angle: f32 = 30.0;
             let roll_input = RcChannels::to_normalised(last_rc.channels[0]);
             let pitch_input = RcChannels::to_normalised(last_rc.channels[1]);
             let yaw_input = RcChannels::to_normalised(last_rc.channels[3]);
-
-            let desired_roll_rad = roll_input * max_angle * DEG2RAD;
-            let desired_pitch_rad = pitch_input * max_angle * DEG2RAD;
-            let desired_yaw_rad = 0.0; // yaw hold; yaw rate from stick handled separately
+            let throttle_raw = RcChannels::to_unit(last_rc.channels[2]);
 
             // ---- 50 Hz outer loops (every 4th cycle) ----
             if cycle_count % 4 == 0 {
-                // MPC attitude: set reference from RC sticks
-                mpc.set_reference(
-                    [desired_roll_rad, desired_pitch_rad, desired_yaw_rad],
-                    [0.0, 0.0, yaw_input * 200.0 * DEG2RAD], // yaw rate setpoint
-                );
+                let dt_outer: f32 = dt * 4.0; // 50 Hz
 
+                // Current IMU state in radians
                 let angles_rad = [
                     last_imu.angle[0] * DEG2RAD,
                     last_imu.angle[1] * DEG2RAD,
@@ -1429,6 +1531,148 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
                     last_imu.gyro[1] * DEG2RAD,
                     last_imu.gyro[2] * DEG2RAD,
                 ];
+                let yaw_rad = angles_rad[2];
+
+                // -- Determine desired roll/pitch/yaw and thrust per mode --
+                let (desired_roll_rad, desired_pitch_rad, desired_yaw_rad, yaw_rate_dps);
+
+                match flight_mode {
+                    FlightMode::Acro => {
+                        desired_roll_rad = roll_input * max_angle * DEG2RAD;
+                        desired_pitch_rad = pitch_input * max_angle * DEG2RAD;
+                        desired_yaw_rad = 0.0;
+                        yaw_rate_dps = yaw_input * 200.0;
+                        // Direct throttle pass-through
+                        current_thrust = throttle_raw.clamp(0.0, 1.0);
+                    }
+                    FlightMode::AltHold => {
+                        desired_roll_rad = roll_input * max_angle * DEG2RAD;
+                        desired_pitch_rad = pitch_input * max_angle * DEG2RAD;
+                        desired_yaw_rad = 0.0;
+                        yaw_rate_dps = yaw_input * 200.0;
+                        // Throttle stick → climb/descend rate → alt target adjustment
+                        let thr_centered = throttle_raw - 0.5; // -0.5..+0.5
+                        if libm::fabsf(thr_centered) > ALT_HOLD_DEADBAND {
+                            let rate = thr_centered * 2.0 * ALT_HOLD_MAX_RATE_MPS;
+                            alt_target += rate * dt_outer;
+                        }
+                        if let Some(est) = last_pos_est.filter(|e| e.ready) {
+                            current_thrust =
+                                alt_ctrl.update(alt_target, est.altitude_up, est.vz_up, dt_outer);
+                        }
+                    }
+                    FlightMode::PosHold => {
+                        yaw_rate_dps = yaw_input * 200.0;
+                        // Sticks → velocity → position target offset
+                        if libm::fabsf(roll_input) > ALT_HOLD_DEADBAND
+                            || libm::fabsf(pitch_input) > ALT_HOLD_DEADBAND
+                        {
+                            let cos_yaw = libm::cosf(yaw_rad);
+                            let sin_yaw = libm::sinf(yaw_rad);
+                            let vn = (cos_yaw * pitch_input + sin_yaw * roll_input)
+                                * POS_HOLD_MAX_VEL_MPS;
+                            let ve = (-sin_yaw * pitch_input + cos_yaw * roll_input)
+                                * POS_HOLD_MAX_VEL_MPS;
+                            pos_target[0] += vn * dt_outer;
+                            pos_target[1] += ve * dt_outer;
+                        }
+                        // Throttle → altitude target
+                        let thr_centered = throttle_raw - 0.5;
+                        if libm::fabsf(thr_centered) > ALT_HOLD_DEADBAND {
+                            alt_target += thr_centered * 2.0 * ALT_HOLD_MAX_RATE_MPS * dt_outer;
+                        }
+                        if let Some(est) = last_pos_est.filter(|e| e.ready) {
+                            let pos_out = pos_ctrl.update(
+                                [est.position_ned[0], est.position_ned[1]],
+                                [est.velocity_ned[0], est.velocity_ned[1]],
+                                pos_target,
+                                yaw_rad,
+                            );
+                            desired_roll_rad = pos_out.roll_rad;
+                            desired_pitch_rad = pos_out.pitch_rad;
+                            current_thrust =
+                                alt_ctrl.update(alt_target, est.altitude_up, est.vz_up, dt_outer);
+                        } else {
+                            desired_roll_rad = 0.0;
+                            desired_pitch_rad = 0.0;
+                            current_thrust = hover_throttle;
+                        }
+                        desired_yaw_rad = 0.0;
+                    }
+                    FlightMode::GpsRescue => {
+                        // Failsafe: just hover in place
+                        yaw_rate_dps = 0.0;
+                        desired_yaw_rad = 0.0;
+                        if let Some(est) = last_pos_est.filter(|e| e.ready) {
+                            let pos_out = pos_ctrl.update(
+                                [est.position_ned[0], est.position_ned[1]],
+                                [est.velocity_ned[0], est.velocity_ned[1]],
+                                pos_target,
+                                yaw_rad,
+                            );
+                            desired_roll_rad = pos_out.roll_rad;
+                            desired_pitch_rad = pos_out.pitch_rad;
+                            current_thrust =
+                                alt_ctrl.update(alt_target, est.altitude_up, est.vz_up, dt_outer);
+                        } else {
+                            desired_roll_rad = 0.0;
+                            desired_pitch_rad = 0.0;
+                            current_thrust = hover_throttle;
+                        }
+                    }
+                    FlightMode::GpsHome => {
+                        // Return to home
+                        yaw_rate_dps = 0.0;
+                        desired_yaw_rad = 0.0;
+                        if let Some(est) = last_pos_est.filter(|e| e.ready) {
+                            let dist_home = libm::sqrtf(est.position_ned[0] * est.position_ned[0] + est.position_ned[1] * est.position_ned[1]);
+
+                            // Auto-land sequence
+                            if rescue_landing {
+                                alt_target -= RESCUE_LAND_RATE_MPS * dt_outer;
+                                if est.altitude_up < RESCUE_DISARM_ALT_M {
+                                    defmt::info!("GPS Home: auto-land complete, disarming");
+                                    arming.force_disarm();
+                                }
+                            } else if dist_home < RESCUE_ARRIVAL_RADIUS_M {
+                                // Arrived — start loiter timer
+                                if rescue_loiter_start.is_none() {
+                                    defmt::info!("GPS Home: arrived at home, loitering");
+                                    rescue_loiter_start = Some(Instant::now());
+                                }
+                                if let Some(t) = rescue_loiter_start {
+                                    let loiter_s = t.elapsed().as_millis() as f32 / 1000.0;
+                                    // If we are actually in failsafe (or just loiter timeout on switch), land
+                                    if loiter_s > RESCUE_LAND_TIMEOUT_S {
+                                        defmt::info!("GPS Home: loiter timeout, auto-landing");
+                                        rescue_landing = true;
+                                    }
+                                }
+                            }
+
+                            let pos_out = pos_ctrl.update(
+                                [est.position_ned[0], est.position_ned[1]],
+                                [est.velocity_ned[0], est.velocity_ned[1]],
+                                pos_target,
+                                yaw_rad,
+                            );
+                            desired_roll_rad = pos_out.roll_rad;
+                            desired_pitch_rad = pos_out.pitch_rad;
+                            current_thrust =
+                                alt_ctrl.update(alt_target, est.altitude_up, est.vz_up, dt_outer);
+                        } else {
+                            desired_roll_rad = 0.0;
+                            desired_pitch_rad = 0.0;
+                            current_thrust = hover_throttle;
+                        }
+                    }
+                }
+
+                // ---- MPC solve (all modes) ----
+                mpc.set_reference(
+                    [desired_roll_rad, desired_pitch_rad, desired_yaw_rad],
+                    [0.0, 0.0, yaw_rate_dps * DEG2RAD],
+                );
 
                 let mpc_start = Instant::now();
                 let mpc_out = mpc.solve(angles_rad, rates_rad);
@@ -1446,59 +1690,29 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
                     mpc_out.rate_setpoints_rads[1] * RAD2DEG,
                     mpc_out.rate_setpoints_rads[2] * RAD2DEG,
                 ];
-
-                // Altitude hold — closes on the PosKF estimate (baro-fused
-                // today, baro+GPS once `update_gps` is wired in Phase 4c).
-                // Gated on `ready`: the p_ref latch takes ~1 s from first
-                // baro sample, and closing the loop before then would
-                // chase garbage. With no PosKF lock (bench / GPS-denied
-                // arm), fall through to direct stick → thrust so motor
-                // bring-up can verify throttle response without GPS.
-                if let Some(est) = last_pos_est.filter(|e| e.ready) {
-                    let target_alt = est.altitude_up; // hold current altitude
-                    current_thrust =
-                        alt_ctrl.update(target_alt, est.altitude_up, est.vz_up, dt * 4.0);
-                } else {
-                    current_thrust = throttle_raw.clamp(0.0, 1.0);
-                }
             }
 
-            // ---- 200 Hz PID rate inner loop ----
-            let pid_output = rate_pid.update(rate_sp_degs, last_imu.gyro, dt);
-
-            control_demand = ControlDemand {
+            // ---- Publish to fast inner loop ----
+            OUTER_CMD.sender().send(OuterLoopCommand {
                 thrust: current_thrust,
-                roll: pid_output[0],
-                pitch: pid_output[1],
-                yaw: pid_output[2],
-            };
+                rate_sp_degs,
+                armed: true,
+            });
         } else {
             // Disarmed — zero everything, reset controllers
-            control_demand = ControlDemand::default();
-            rate_pid.reset();
             mpc.reset();
             alt_ctrl.reset();
             rate_sp_degs = [0.0; 3];
             current_thrust = hover_throttle;
-        }
+            rescue_loiter_start = None;
+            rescue_landing = false;
 
-        // ---- 4. Mixer ----
-        let motor_outputs = QUAD_X.apply(&control_demand);
-
-        // ---- 5. DShot output ----
-        let mut frames: [EncodedFrame; 4] = [DshotTx::standard().command(Command::MotorStop); 4];
-        if armed {
-            for i in 0..4 {
-                let v = motor_outputs.motors[i];
-                if v <= 0.0 {
-                    frames[i] = DshotTx::standard().command(Command::MotorStop);
-                } else {
-                    let throttle = (v * 1999.0) as u16;
-                    frames[i] = DshotTx::standard().throttle_clamped(throttle);
-                }
-            }
+            OUTER_CMD.sender().send(OuterLoopCommand {
+                thrust: 0.0,
+                rate_sp_degs: [0.0; 3],
+                armed: false,
+            });
         }
-        dshot.send(frames).await;
 
         // ---- 6. Loop timing ----
         let loop_us = loop_start.elapsed().as_micros() as u32;
@@ -1519,20 +1733,18 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
                 0
             };
 
-            // stick_thr    = raw RC stick throttle input (0-100%)
-            // thrust_cmd   = altitude controller's current thrust command (0-100%);
-            //                while disarmed this is held at `hover_throttle`, so
-            //                seeing a non-zero value with armed=false is expected.
-            let stick_thr_pct = (throttle_raw * 100.0) as u8;
+            let stick_thr_pct = (RcChannels::to_unit(last_rc.channels[2]) * 100.0) as u8;
             let thrust_cmd_pct = (current_thrust * 100.0) as u8;
             defmt::info!(
-                "armed={} roll={:?}° pitch={:?}° yaw={:?}° stick_thr={}% thrust_cmd={}% sats={}",
+                "mode={} armed={} roll={:?}° pitch={:?}° yaw={:?}° thr={}% cmd={}% alt_t={=f32}m sats={}",
+                flight_mode,
                 armed,
                 last_imu.angle[0],
                 last_imu.angle[1],
                 last_imu.angle[2],
                 stick_thr_pct,
                 thrust_cmd_pct,
+                alt_target,
                 last_gps.satellites,
             );
             defmt::info!(
@@ -1552,6 +1764,81 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
             mpc_time_us_max = 0;
             mpc_iters_max = 0;
             timing_sample_count = 0;
+        }
+    }
+}
+
+// ---- Fast Inner Loop (8 kHz) ----
+// Runs strictly synchronised to the MEKF output (which runs at 8 kHz).
+// Reads the latest target rates and thrust from the outer loop, runs
+// the rate PID, and pushes commands to the ESCs via DShot.
+
+async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
+    defmt::info!("Fast inner loop started (8 kHz synced to IMU_DATA)");
+
+    // ---- PID rate inner loop (8 kHz) ----
+    // Gain scaling: since dt is 40x smaller (125us vs 5ms), the D-term filter
+    // needs adjustment if it was tuned for 200 Hz. For now we use the same gains,
+    // but tuning will likely be required.
+    let rate_gains = PidGains {
+        kp: 0.02,
+        ki: 0.005,
+        kd: 0.001,
+    };
+    let yaw_gains = PidGains {
+        kp: 0.03,
+        ki: 0.005,
+        kd: 0.0,
+    };
+    let limits = PidLimits {
+        integral_max: 0.3,
+        output_max: 0.5,
+        d_lpf_tau_s: 0.008,
+    };
+    let mut rate_pid = RatePidController::new(rate_gains, rate_gains, yaw_gains, limits);
+
+    let dt: f32 = 0.000125; // 8 kHz
+    let mut receiver = OUTER_CMD.receiver().unwrap();
+
+    loop {
+        // Wait for the next 8 kHz IMU sample
+        let imu = IMU_DATA.wait().await;
+
+        // Get the latest commands from the outer loop
+        // We use try_get() so it never blocks the fast loop
+        let cmd = receiver.try_get().unwrap_or(OuterLoopCommand {
+            thrust: 0.0,
+            rate_sp_degs: [0.0; 3],
+            armed: false,
+        });
+
+        if cmd.armed {
+            let pid_output = rate_pid.update(cmd.rate_sp_degs, imu.gyro, dt);
+
+            let control_demand = ControlDemand {
+                thrust: cmd.thrust,
+                roll: pid_output[0],
+                pitch: pid_output[1],
+                yaw: pid_output[2],
+            };
+
+            let motor_outputs = QUAD_X.apply(&control_demand);
+
+            let mut frames: [EncodedFrame; 4] = [DshotTx::standard().command(Command::MotorStop); 4];
+            for i in 0..4 {
+                let v = motor_outputs.motors[i];
+                if v <= 0.0 {
+                    frames[i] = DshotTx::standard().command(Command::MotorStop);
+                } else {
+                    let throttle = (v * 1999.0) as u16;
+                    frames[i] = DshotTx::standard().throttle_clamped(throttle);
+                }
+            }
+            dshot.send(frames).await;
+        } else {
+            rate_pid.reset();
+            let frames: [EncodedFrame; 4] = [DshotTx::standard().command(Command::MotorStop); 4];
+            dshot.send(frames).await;
         }
     }
 }
