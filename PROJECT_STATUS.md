@@ -46,30 +46,6 @@ material hardware or design change lands (see `CLAUDE.md`).
 
 ## What's Verified on Hardware
 
-<<<<<<< HEAD
-- **Attitude**: dual ICM-42688P at 8 kHz. Both sensors read back-to-back
-  and averaged (IMU1 ROTATION_ROLL_180, IMU2 ROTATION_PITCH_180). MEKF
-  fuses accel at 100 Hz and gyro at 8 kHz. Gyro bias bounded to 0.3–0.5
-  dps; innovation gate rejects ~0% at rest and ~25% under aggressive
-  motion. Single-IMU fallback path if IMU2 fails to init.
-- **Position**: 6-state linear PosKF (pn, pe, pz, vn, ve, vz) at 100 Hz.
-  - GPS home latches on first fix with FIX3D, ≥5 sats, HDOP < 3.5
-    (relaxed for Alpha; post-Alpha: 7 sats / HDOP < 2.0).
-  - Baro self-calibrates once ≥2 GPS fuses have landed post-home-latch.
-    After cal, baro (σ=0.3 m) dominates altitude; GPS (σ=5 m) keeps
-    it honest long-term.
-  - GPS-only path is safe if baro is absent or dead.
-- **Comms**: CRSF RC (6 channels on UART5), NMEA GPS (USART1), defmt
-  logger (USART6).
-- **Control loop**: MEKF predict at 8 kHz (gyro integration); accel
-  update at 100 Hz. PID inner loop at 200 Hz; MPC outer loop at 50 Hz
-  (every 4th PID cycle). The control loop reads the MEKF's published
-  `IMU_DATA` at 200 Hz — the 8 kHz MEKF and 200 Hz PID are decoupled
-  tasks. Timing well within budget.
-- **Motors**: DShot600 via TIM2 DMAR burst write. All four ESC channels
-  decode correctly; motors spin on arm. Alpha milestone reached
-  2026-05-03.
-=======
 (The specifics here are largely validated on older hardware, but the overall functionality has now been implemented and enhanced for the STM32H743).
 
 - **Attitude**: Dual ICM-42688P sensors read at 8 kHz via SPI. MEKF fusing accel (100 Hz update)
@@ -91,47 +67,52 @@ material hardware or design change lands (see `CLAUDE.md`).
 - **Control loop**: Asynchronous dual-loop architecture communicating via lock-free `Watch` channel:
   - **Outer Loop (100 Hz)**: `navigation_task` handles Attitude MPC, altitude hold, position hold, and RC processing.
   - **Inner Loop (8 kHz)**: `control_loop` executes the rate PID and DShot output, fully synchronized to the MEKF gyro predicts without arbitrary timers.
->>>>>>> 3ee0c5a (feat: introduce flight modes and implementnavigation task with position control and GPS rescue functionality.)
 
 ---
 
-## ★ Alpha Complete — 2026-05-03
+## Deprecated - Look to revert functionality as GPS and Baro both work well
 
-Full stack running on DAKEFPV H743: dual-IMU MEKF → PosKF → MPC →
-rate PID → mixer → DShot → four motors. Arming, failsafe, and GPS
-home-latch all functional.
+- **GPS-gated arm + baro self-calibration** — commit `a7feea0` on
+  `feat/icm42688-mekf`.
+  - Arming requires `gps_home_ready`. Mid-flight GPS loss does not
+    disarm (arm-time gate only).
+  - pos_kf_task drops the boot-time p_ref average. Once home has
+    latched and ≥2 GPS fixes have fused, the next baro sample
+    self-calibrates: `p_ref = p_now / (1 - kf_alt_up/44330.77)^5.2558`.
+  - Rationale: the onboard baro's intermittency makes a baro-only
+    take-off unsafe. GPS home is the new altitude floor.
+  - Verification checklist lives in the session pickup memory; the
+    short version: `gps=false` in "arm rejected" until home latches,
+    `baro_cal=false` until the 2-fuse window passes, no altitude
+    jump at calibration.
+
+Correct functionality now will be to rely on either baro or GPS as an altitude start (GPS with fix requirements as documented) and for this data to be fused as independent sources of truth with regards altitude specifically
 
 ---
 
-## Post-Alpha Tweaks (near-term)
+## What's Next
 
-These are the first things to do now that Alpha is declared.
+1. ~~**Flash + outdoor verify `a7feea0`.**~~ Flashed 2026-04-21.
+   GPS-latch thresholds relaxed to 5 sats / HDOP < 3.5 for Alpha
+   testing. Push once verified.
+   Tighten GPS thresholds post Alpha for more reliable prearm (7 sats / HDOP < 2.5)
+   **~~Motor bring-up on F722~~**
+   ~~blocked, under investigation~~
+   Resolved: Record kept for reference as of around 25-04-26:
+   Driver or peripheral config is implicated, not the ESCs. Three
+   of the four ESCs are proven healthy on TIM2's signal; a fourth
+   is unproven. Arm attempts at 29 % thrust did not produce clean
+   spin on any motor. Full session observations and hypotheses in
+   `docs/motor-bringup-log.md`. Captured
+   oscilloscope waveforms and eventually traced malformed bitstream to various embassy issues populating DMAR. We implemented this functionality directly to avoid the issue (src/drivers/dshot_hw.rs) so the ESCs now receive the correct bitstream and the motors spin up on arm.
+  
+2. **Close the loop on hardware.** Rate-PID-only hover first, then
+   enable the MPC outer loop and tune for transfer from sim.
 
-<<<<<<< HEAD
-1. **Fix arming to not require GPS.** `arming.require_gps = false` is
-   currently a bench-mode override; the underlying logic still hard-gates
-   on GPS home. Correct behaviour: arm on either baro or GPS being
-   available. If a GPS fix meeting quality thresholds is present at arm
-   time, latch the home co-ordinates then; otherwise arm baro-only and
-   latch home whenever the fix arrives. Baro and GPS are independent
-   altitude sources — neither gates the other.
-2. **Tighten GPS home-latch thresholds.** Alpha used 5 sats / HDOP < 3.5.
-   Tighten to 7 sats / HDOP < 2.0 for outdoor reliability.
-4. **CRSF channel assignments.** Assign pilot-selectable switches for
-   GPS rescue, position hold, and altitude hold. Currently all three
-   modes are always-on or unreachable from the transmitter.
-5. **Revert bench-mode throttle behaviour.** The manual-throttle
-   pass-through (stick → thrust when PosKF not ready) may need a stick
-   scaling factor in the mixer rather than being a special code path.
-=======
    *(Status Verification: This point remains **TRUE**. While the logic and loop decoupling have been heavily validated in the simulation environments (`sim_gps_rescue`, `sim_hover`), we are still awaiting the delivery of the final target hardware to begin the physical motor bring-up and physical PID tuning.)*
->>>>>>> 3ee0c5a (feat: introduce flight modes and implementnavigation task with position control and GPS rescue functionality.)
 
----
+## ****Alpha Complete 03-05-2026****
 
-<<<<<<< HEAD
-## Backlog (pre-Beta, north-star-aligned)
-=======
 ### post-Alpha tweaks
 
 - [ ] GPS thresholds tightened to 7 sats / HDOP < 2.0
@@ -141,7 +122,6 @@ These are the first things to do now that Alpha is declared.
 - [ ] revert throttle changes implemented for bench motor testing (posssibly this is done by adding a stick scaling factor in the mixer)
 
 ### Items for Beta build
->>>>>>> 3ee0c5a (feat: introduce flight modes and implementnavigation task with position control and GPS rescue functionality.)
 
 - **Accel bias estimation in PosKF.** The 6-state filter predicts
   kinematics from raw body specific force with no accel-bias state.
