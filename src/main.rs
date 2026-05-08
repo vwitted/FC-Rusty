@@ -52,6 +52,7 @@ mod drivers {
     pub mod dshot_diag;
     pub mod dshot_hw;
     pub mod icm42688;
+    pub mod ism6hg256x;
     pub mod nmea;
     pub mod ubx;
     pub mod wt901b;

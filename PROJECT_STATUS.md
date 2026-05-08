@@ -164,6 +164,35 @@ Correct functionality now will be to rely on either baro or GPS as an altitude s
   not yet wired into the control loop. Gates on reliable baro + GPS
   fusion and sufficient PID tuning in flight.
 
+- **ISM6HG256X breakout (Beta).** STMicro 6-axis IMU (LGA-14) — driver
+  `drivers/ism6hg256x.rs` is written, compiles, and is intentionally
+  unreferenced from `main.rs` until the breakout is built and wired.
+  Configured for ±16 g / ±4000 dps / 7.68 kHz ODR / high-perf mode,
+  push-pull pulsed DRDY on INT1 — same control-loop shape as the
+  ICM-42688P so it can substitute or supplement. ±4000 dps (vs the
+  ICM's ±2000 max) chosen because the gyro is already noise-floor-
+  limited at ±2000, so the wider FS is strictly more saturation
+  headroom for crash/recovery scenarios. Fancy features (high-g 256 g
+  channel, FSM, MLC, SFLP, OIS, EIS, sensor hub, FIFO) deliberately
+  left out.
+  - **Bring-up gotchas** (worth re-reading before flashing):
+    - Output registers are **little-endian** (L then H) — opposite of
+      the ICM-42688P's big-endian. Don't blindly cross-reference
+      decoding logic between the two drivers.
+    - `WHO_AM_I` returns `0x73` (vs `0x47` on the ICM); the init path
+      will hard-fail with `WhoAmIMismatch` if the wrong driver is
+      pointed at the wrong chip.
+    - `Orientation` parameter must match how the breakout is soldered
+      into the airframe — `Identity` is the safe default for bench work
+      but won't be right in flight.
+    - Temperature uses the standard ST formula `raw/256 + 25` (1 LSB =
+      1/256 °C). Diagnostic only, not on the control path.
+    - Chip max ODR is 7.68 kHz (not 8 kHz like the ICM); decimation
+      math in any task that fuses both must account for that.
+    - Gyro LSB is 140 mdps (not 70 mdps as at ±2000 dps); any code
+      cross-checking against ICM samples needs to scale, not compare
+      raw counts.
+
 ---
 
 ## Implemented Modules
@@ -185,6 +214,7 @@ All host-tested (`cargo test --lib --no-default-features --target x86_64-unknown
 | UBX parser       | `drivers/ubx.rs`         | u-blox binary protocol — written, not yet active             |
 | WT901B parser    | `drivers/wt901b.rs`      | All packet types; `ImuData` type still used internally        |
 | SPL06 driver     | `drivers/baro.rs`        | 128 Hz / 1× OSR, correct cal from 0x18; DPS310 retained     |
+| ISM6HG256X driver | `drivers/ism6hg256x.rs` | ±16 g / ±4000 dps / 7.68 kHz, SPI; written for Beta breakout, unreferenced |
 | DShot driver     | `drivers/dshot_hw.rs`    | TIM2 DMAR burst, DShot600, all 4 channels simultaneously     |
 | Physics sim      | `sim/sim.rs`             | 6DOF rigid body, τ=30ms motor lag, NED, ground collision     |
 | Sensor sim       | `sim/sensors.rs`         | GPS (10 Hz + noise), baro (50 Hz + noise/drift), xorshift64  |
