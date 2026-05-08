@@ -29,7 +29,7 @@
 // quadruple-product-deep), but covariance symmetry is enforced after
 // each update for numerical hygiene.
 
-use nalgebra::{Matrix3, SMatrix, SVector, Vector3};
+use nalgebra::{Matrix3, SMatrix, SVector, Vector2, Vector3};
 
 pub const KF_NX: usize = 6;
 
@@ -210,6 +210,54 @@ impl PosKf {
         self.symmetrise();
     }
 
+    /// GPS horizontal-velocity measurement update.
+    ///
+    /// `vn`, `ve` are NED ground-velocity components (m/s), typically
+    /// derived from NMEA RMC/VTG ground speed × course over ground.
+    /// Vertical GPS velocity is intentionally *not* fused — it is noisy
+    /// on consumer modules and the baro channel already constrains
+    /// vz via cross-covariance with pz.
+    ///
+    /// This path is independent of position fusion and of GPS home
+    /// latching. It can run as soon as the receiver reports a fix —
+    /// useful for damping pre-home dead-reckoning drift from O(t²) to
+    /// O(t), and for keeping a rough velocity solution alive during
+    /// position dropouts.
+    pub fn update_gps_velocity(&mut self, vn: f32, ve: f32) {
+        // 1σ GPS horizontal-velocity noise. Consumer modules quote
+        // 0.05–0.1 m/s on ground speed; 0.3 leaves headroom for the
+        // course-induced cross-axis error at low speeds.
+        const SIGMA_GPS_VEL: f32 = 0.3;
+
+        // H = picks vn (state 3) and ve (state 4) out of the 6-state
+        // vector. y = z − H·x.
+        let y = Vector2::new(vn - self.x[3], ve - self.x[4]);
+
+        // S = H·P·H^T + R = P[3:5, 3:5] + σ²·I₂
+        let p_vv = self.p_cov.fixed_view::<2, 2>(3, 3).into_owned();
+        let mut s = p_vv;
+        s[(0, 0)] += SIGMA_GPS_VEL * SIGMA_GPS_VEL;
+        s[(1, 1)] += SIGMA_GPS_VEL * SIGMA_GPS_VEL;
+
+        let s_inv = match s.try_inverse() {
+            Some(m) => m,
+            None => return,
+        };
+
+        // K = P·H^T · S^-1.  P·H^T is columns 3..5 of P (6×2).
+        let p_ht = self.p_cov.fixed_view::<KF_NX, 2>(0, 3).into_owned();
+        let k: SMatrix<f32, KF_NX, 2> = p_ht * s_inv;
+
+        // x ← x + K·y
+        self.x += k * y;
+
+        // P ← P − K·H·P  (H·P is rows 3..5 of P, 2×6)
+        let h_p = self.p_cov.fixed_view::<2, KF_NX>(3, 0).into_owned();
+        self.p_cov -= k * h_p;
+
+        self.symmetrise();
+    }
+
     /// Barometer altitude measurement update.
     ///
     /// `altitude_up` is metres above ground, positive up. Internally
@@ -327,6 +375,45 @@ mod tests {
         assert!((kf.x[0] - truth[0]).abs() < 0.5, "x={}", kf.x[0]);
         assert!((kf.x[1] - truth[1]).abs() < 0.5, "y={}", kf.x[1]);
         assert!((kf.x[2] - truth[2]).abs() < 0.5, "z={}", kf.x[2]);
+    }
+
+    /// Velocity updates should converge the velocity state to the truth and
+    /// shrink its variance, even without any position fixes.
+    #[test]
+    fn velocity_updates_converge_without_gps_position() {
+        let mut kf = PosKf::new_at([0.0, 0.0, 0.0], 0.5, 2.0, 5.0, 0.3);
+
+        // Inject 30 noise-free velocity measurements at constant cruise.
+        // No update_gps() — pure velocity fusion, no position anchor.
+        let truth = (3.0_f32, -2.0_f32);
+        for _ in 0..30 {
+            kf.predict([0.0, 0.0, 0.0], 0.1);
+            kf.update_gps_velocity(truth.0, truth.1);
+        }
+
+        assert!((kf.x[3] - truth.0).abs() < 0.2, "vn={}", kf.x[3]);
+        assert!((kf.x[4] - truth.1).abs() < 0.2, "ve={}", kf.x[4]);
+
+        // Velocity covariance should have shrunk well below initial.
+        assert!(kf.p_cov[(3, 3)] < 0.1, "P_vn={}", kf.p_cov[(3, 3)]);
+        assert!(kf.p_cov[(4, 4)] < 0.1, "P_ve={}", kf.p_cov[(4, 4)]);
+    }
+
+    /// Velocity fusion should not touch the vertical channels (vz, pz).
+    #[test]
+    fn velocity_updates_dont_touch_vertical() {
+        let mut kf = PosKf::new_at([0.0, 0.0, -3.0], 0.1, 2.0, 5.0, 0.3);
+        // Seed a non-zero vz via prediction.
+        kf.predict([0.0, 0.0, 1.0], 0.5); // vz = 0.5 m/s
+        let vz_before = kf.x[5];
+        let pz_before = kf.x[2];
+
+        kf.update_gps_velocity(2.0, 0.0);
+
+        // Horizontal velocity should respond, vertical should not.
+        assert!(kf.x[3].abs() > 0.0);
+        assert!((kf.x[5] - vz_before).abs() < 1e-3, "vz drifted: {} → {}", vz_before, kf.x[5]);
+        assert!((kf.x[2] - pz_before).abs() < 0.05, "pz changed by velocity update");
     }
 
     /// Baro updates should fix altitude without touching horizontal position.

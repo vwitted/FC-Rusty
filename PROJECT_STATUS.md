@@ -53,40 +53,54 @@ material hardware or design change lands (see `CLAUDE.md`).
   gate rejects ~0% at rest and ~25% under aggressive motion. Sensor
   frame mapped to NED via `BODY_SIGN=[+1,-1,-1]`.
 - **Position**: 6-state linear PosKF (pn, pe, pz, vn, ve, vz) running
-  at 100 Hz predict.
-  - GPS home latches on the first fix with `FIX3D && sats ≥ 5 && HDOP < 3.5`
-    (relaxed for Alpha testing; see backlog for post-Alpha tightening).
-  - GPS altitude fuses with σ_gps_v = 5 m; baro (when alive) with
-    σ_baro = 0.3 m. Baro dominates the short term; GPS keeps altitude
-    honest long-term via cross-covariance.
-  - Outdoor verification 2026-04-20: clean `alt-ready → ready`
-    transition, baro 26 reads/s with 0 errors across the run,
+  at 100 Hz predict. Baro and GPS fuse as independent measurement
+  paths — pilot decides what to fly with via the soft arm gate
+  (`baro_ready || gps_home_latched`).
+  - **GPS position**: home latches on the first fix with
+    `FIX3D && sats ≥ 5 && HDOP < 3.5` (relaxed for Alpha; see backlog).
+    Subsequent good fixes fuse as local NED. σ_gps_h = 2 m,
+    σ_gps_v = 5 m.
+  - **GPS velocity** (NMEA RMC ground speed × course) fuses
+    independently of home latching at σ = 0.3 m/s, via the new
+    `PosKf::update_gps_velocity(vn, ve)` method. This caps DR
+    position drift from O(t²) to O(t) and means PosHold without GPS
+    home is best-effort but useful for tens of seconds rather than
+    diverging immediately. Below 0.3 m/s ground speed the path
+    fuses (0, 0) since RMC course is undefined at low speeds —
+    actively damps drift while stationary.
+  - **Baro** is *not* fused before arm. On the Disarmed→Armed event
+    the `ARM_LATCH` signal makes pos_kf_task latch `p_ref = current
+    pressure` and zero the KF's vertical state, so altitude reads
+    ~0 at arm. From arm forward baro fuses every sample at σ_baro =
+    0.3 m, which dominates GPS altitude over the short term.
+  - **Readiness flags**: `altitude_ready` (= `baro_calibrated ||
+    home_latched`, gates AltHold and PosHold) and `home_latched`
+    (gates GpsRescue / GpsHome / RTH).
+  - Outdoor verification 2026-04-20 (under the prior GPS-anchored
+    design): clean ready transition, baro 26 reads/s with 0 errors,
     post-home-latch IMU-only drift (~1500 m) corrected in one GPS
-    tick as expected.
+    tick. Re-verification of the new pilot-discretion design plus
+    velocity fusion is on the post-Alpha checklist.
+
+- **Failsafe descent**: RC loss never auto-disarms. The control loop
+  picks one of three failsafe modes based on what's still alive:
+  - `GpsRescue` (existing): home_latched → climb to safe alt + RTH
+    + auto-land at home.
+  - `FailsafeLand` (new): altitude_ready, no home → closed-loop
+    descent at 0.7 m/s, level attitude, auto-disarm when
+    `altitude_up < 0.3 m`.
+  - `FailsafeBlind` (new): no altitude, no home → open-loop throttle
+    at 90 % of hover, level attitude. **No auto-disarm** — without
+    altitude data there's no safe stop criterion. Descent runs until
+    pilot regains RC or battery cuts. Impact-signature disarm is a
+    Beta backlog item.
+
+  IMU loss is the only mid-flight auto-disarm path: there's no safe
+  recovery from losing attitude.
 - **Comms**: CRSF RC (6 channels), NMEA GPS, defmt over USART3.
 - **Control loop**: Asynchronous dual-loop architecture communicating via lock-free `Watch` channel:
   - **Outer Loop (100 Hz)**: `navigation_task` handles Attitude MPC, altitude hold, position hold, and RC processing.
   - **Inner Loop (8 kHz)**: `control_loop` executes the rate PID and DShot output, fully synchronized to the MEKF gyro predicts without arbitrary timers.
-
----
-
-## Deprecated - Look to revert functionality as GPS and Baro both work well
-
-- **GPS-gated arm + baro self-calibration** — commit `a7feea0` on
-  `feat/icm42688-mekf`.
-  - Arming requires `gps_home_ready`. Mid-flight GPS loss does not
-    disarm (arm-time gate only).
-  - pos_kf_task drops the boot-time p_ref average. Once home has
-    latched and ≥2 GPS fixes have fused, the next baro sample
-    self-calibrates: `p_ref = p_now / (1 - kf_alt_up/44330.77)^5.2558`.
-  - Rationale: the onboard baro's intermittency makes a baro-only
-    take-off unsafe. GPS home is the new altitude floor.
-  - Verification checklist lives in the session pickup memory; the
-    short version: `gps=false` in "arm rejected" until home latches,
-    `baro_cal=false` until the 2-fuse window passes, no altitude
-    jump at calibration.
-
-Correct functionality now will be to rely on either baro or GPS as an altitude start (GPS with fix requirements as documented) and for this data to be fused as independent sources of truth with regards altitude specifically
 
 ---
 
@@ -116,12 +130,24 @@ Correct functionality now will be to rely on either baro or GPS as an altitude s
 ### post-Alpha tweaks
 
 - [ ] GPS thresholds tightened to 7 sats / HDOP < 2.0
-- [x] Re-enable arming on baro only, but if GPS fix is available set home co-ords. (Implemented in `arming.rs` FSM)
+- [x] Re-enable arming on baro only, but if GPS fix is available set home co-ords. Implemented 2026-05-08: arming gate is now soft (`baro_ready || gps_home_latched`); baro p_ref latches on the Disarmed→Armed transition via `ARM_LATCH` signal; `PosEstimate` exposes split `altitude_ready` / `home_latched` flags. `arming::ArmingStateMachine.require_gps` renamed to `require_altitude_ref`.
 - [x] Assign CRSF channels for user-initiated GPS Rescue, pos-hold and alt-hold functionality. (Implemented: CH5 for mode, CH6 for RTH trigger)
 - [ ] ESC Bidirectional Dshot functionality
 - [ ] revert throttle changes implemented for bench motor testing (posssibly this is done by adding a stick scaling factor in the mixer)
 
 ### Items for Beta build
+
+- **Impact-signature disarm.** Currently `FailsafeBlind` (RC lost,
+  no altitude reference) has no auto-disarm — the descent runs
+  until pilot recovery or battery cut. With ICM accel data we can
+  detect a hard-landing impulse (peak accel magnitude ≫ 1 g for
+  short duration) and disarm on that signature. Bonus feature:
+  generalise to a non-failsafe "crash detected → cut motors" gate
+  for any flight mode, which would save props on a botched landing.
+  - Design: rolling-window peak detection on body-frame accel
+    magnitude, threshold ≈ 4–5 g for ≥10 ms. Disable while throttle
+    is high (avoid thrust-axis noise during aggressive manoeuvres).
+  - **Schedule: with ICM telemetry features in Beta.**
 
 - **Accel bias estimation in PosKF.** The 6-state filter predicts
   kinematics from raw body specific force with no accel-bias state.
@@ -193,6 +219,21 @@ Correct functionality now will be to rely on either baro or GPS as an altitude s
       cross-checking against ICM samples needs to scale, not compare
       raw counts.
 
+- **LIS2MDL magnetometer breakout (Beta).** STMicro 3-axis mag (LGA-12)
+  — driver `drivers/lis2mdl.rs` is written, compiles, and is
+  intentionally unreferenced from `main.rs` until the breakout
+  arrives. I2C-only path (fixed addr `0x1E`); intended to share the
+  same I2C peripheral as the SPL06 baro. Configured for 100 Hz
+  continuous mode in high-resolution power mode with COMP_TEMP_EN,
+  OFF_CANC, BDU and the digital LPF (BW = 25 Hz) all on. WHO_AM_I =
+  `0x40`; output registers are **little-endian**. Sensitivity is
+  1.5 mgauss/LSB (`SENS_UT_PER_LSB = 0.15`) — diagnostic temperature
+  is the internal die sensor at 8 LSB/°C with no documented zero
+  offset. No interrupt pin wired; `data_ready()` polls
+  `STATUS_REG.Zyxda`. Hard-iron calibration / world-frame heading
+  fusion is still a separate post-Alpha task — see
+  "Magnetometer calibration" in the backlog above.
+
 ---
 
 ## Implemented Modules
@@ -206,8 +247,8 @@ All host-tested (`cargo test --lib --no-default-features --target x86_64-unknown
 | Altitude hold    | `control/altitude.rs`    | PID + hover feedforward, anti-windup, gated on PosKF.ready   |
 | Position PD      | `control/position.rs`    | Horizontal hold, world→body rotation, tilt-limited — **written, not yet wired** |
 | Quad-X mixer     | `control/mixer.rs`       | Airmode + no-airmode paths, phantom-thrust prevention         |
-| Arming FSM       | `control/arming.rs`      | Pre-arm (thr/lvl/imu/rc/gps), failsafe, re-arm lockout       |
-| PosKF            | `estimation.rs`          | 6-state linear KF; GPS + baro + IMU predict                  |
+| Arming FSM       | `control/arming.rs`      | Pre-arm (thr/lvl/imu/rc/altitude_ref), soft baro-or-GPS gate, failsafe-on-RC-loss (never disarms; control loop chooses descent), IMU-loss-only auto-disarm |
+| PosKF            | `estimation.rs`          | 6-state linear KF; GPS position + GPS velocity + baro + IMU predict |
 | MEKF             | `attitude_mekf.rs`       | Quaternion MEKF with gyro-bias state, 8 kHz predict          |
 | CRSF parser      | `drivers/crsf.rs`        | Byte streaming, 11-bit unpack, link stats, CRC8              |
 | NMEA parser      | `drivers/nmea.rs`        | GGA/RMC/GSA/VTG, 3D fix detection, checksum                  |
@@ -215,6 +256,7 @@ All host-tested (`cargo test --lib --no-default-features --target x86_64-unknown
 | WT901B parser    | `drivers/wt901b.rs`      | All packet types; `ImuData` type still used internally        |
 | SPL06 driver     | `drivers/baro.rs`        | 128 Hz / 1× OSR, correct cal from 0x18; DPS310 retained     |
 | ISM6HG256X driver | `drivers/ism6hg256x.rs` | ±16 g / ±4000 dps / 7.68 kHz, SPI; written for Beta breakout, unreferenced |
+| LIS2MDL driver   | `drivers/lis2mdl.rs`     | 3-axis mag, I2C addr 0x1E, 100 Hz HR + LPF + OFF_CANC; written for Beta breakout, unreferenced |
 | DShot driver     | `drivers/dshot_hw.rs`    | TIM2 DMAR burst, DShot600, all 4 channels simultaneously     |
 | Physics sim      | `sim/sim.rs`             | 6DOF rigid body, τ=30ms motor lag, NED, ground collision     |
 | Sensor sim       | `sim/sensors.rs`         | GPS (10 Hz + noise), baro (50 Hz + noise/drift), xorshift64  |

@@ -53,6 +53,7 @@ mod drivers {
     pub mod dshot_hw;
     pub mod icm42688;
     pub mod ism6hg256x;
+    pub mod lis2mdl;
     pub mod nmea;
     pub mod ubx;
     pub mod wt901b;
@@ -102,11 +103,22 @@ enum FlightMode {
     /// controller; throttle stick commands climb/descend rate.
     AltHold,
     /// Altitude + horizontal position held. Sticks command velocity.
+    /// Without GPS home, horizontal hold is best-effort dead-reckoning
+    /// damped by NMEA velocity fusion — drift accumulates linearly
+    /// rather than quadratically and is acceptable for tens of seconds.
     PosHold,
     /// Autonomous return to GPS home at a safe altitude. Triggered by switch.
     GpsHome,
-    /// Failsafe mode: hover in place without moving.
+    /// Failsafe mode (RC lost, GPS home available): hover at home.
     GpsRescue,
+    /// Failsafe mode (RC lost, no GPS home, baro alive): closed-loop
+    /// controlled descent. Level attitude, alt-hold target ramps down,
+    /// auto-disarm at low altitude or 30-s timeout.
+    FailsafeLand,
+    /// Failsafe mode (RC lost, no altitude reference at all): open-loop
+    /// blind descent. Level attitude, fixed throttle slightly below
+    /// hover, auto-disarm at 30-s timeout.
+    FailsafeBlind,
 }
 
 // ---- GPS rescue parameters ----
@@ -126,6 +138,19 @@ const ALT_HOLD_DEADBAND: f32 = 0.05;
 const ALT_HOLD_MAX_RATE_MPS: f32 = 2.0;
 /// Max velocity when sticks are fully deflected in PosHold (m/s).
 const POS_HOLD_MAX_VEL_MPS: f32 = 5.0;
+
+// ---- Failsafe descent (no GPS home) ----
+/// Descent rate during FailsafeLand (closed-loop, baro-driven), m/s.
+const FAILSAFE_DESCENT_RATE_MPS: f32 = 0.7;
+/// Altitude (above arm reference) below which FailsafeLand auto-disarms.
+const FAILSAFE_LAND_DISARM_ALT_M: f32 = 0.3;
+/// Open-loop throttle for FailsafeBlind, expressed as a fraction of
+/// hover_throttle (so 0.9 means "10 % below hover" → gentle descent).
+/// FailsafeBlind has no auto-disarm — without altitude data we
+/// can't tell when to cut motors. The descent runs until the pilot
+/// regains RC or the battery cuts. Impact-signature-based disarm is
+/// a Beta-target backlog item (see PROJECT_STATUS.md).
+const FAILSAFE_BLIND_THROTTLE_FRAC: f32 = 0.9;
 
 // ---- Interrupt bindings ----
 
@@ -212,25 +237,30 @@ static IMU_DATA_FOR_KF: Signal<CriticalSectionRawMutex, ImuData> = Signal::new()
 /// Fused position / velocity estimate published by `pos_kf_task`.
 #[derive(Clone, Copy, Debug, defmt::Format)]
 struct PosEstimate {
-    /// Position in NED world frame (m), relative to the home point once
-    /// the GPS home latch completes. Before home latch the horizontal
-    /// components are from dead-reckoning the accel since boot — only
-    /// useful once `home_latched` is true.
+    /// Position in NED world frame (m), relative to the GPS home point
+    /// once the GPS home latch completes. Before home latch the
+    /// horizontal components are dead-reckoned and only the altitude
+    /// channel is meaningful.
     position_ned: [f32; 3],
     /// Velocity in NED world frame (m/s).
     velocity_ned: [f32; 3],
-    /// Altitude above boot reference (m, positive up).
+    /// Altitude (m, positive up). Reference is whichever sensor latched
+    /// first: pressure altitude relative to arm (baro present) or
+    /// height above GPS-home origin (GPS only).
     altitude_up: f32,
     /// Vertical velocity (m/s, positive up).
     vz_up: f32,
-    /// Reference pressure latched from the first seconds of boot baro
-    /// readings (Pa). 0.0 until latching completes.
+    /// Reference pressure latched at arm time (Pa). 0.0 if baro is
+    /// absent or arm has not yet fired.
     p_ref_pa: f32,
     /// Milliseconds since the last baro update was applied.
     baro_age_ms: u32,
-    /// False until the p_ref latch completes and the first update_baro
-    /// has fired. Control loop altitude hold should gate on this.
-    ready: bool,
+    /// True once at least one altitude sensor is anchored:
+    ///   - baro: p_ref latched at arm and at least one fuse fired, OR
+    ///   - GPS:  home latched and fixes are fusing.
+    /// Altitude-hold and any throttle controller that consumes
+    /// `altitude_up` / `vz_up` must gate on this.
+    altitude_ready: bool,
     /// True once a sufficiently good GPS fix has been captured as the
     /// home origin. Horizontal `position_ned` is meaningful only when
     /// this is true; any GPS-rescue or position-hold behaviour must
@@ -239,6 +269,13 @@ struct PosEstimate {
 }
 
 static POS_ESTIMATE: Signal<CriticalSectionRawMutex, PosEstimate> = Signal::new();
+
+/// Fired by `navigation_task` on the Disarmed→Armed transition. The
+/// `pos_kf_task` consumes this to latch the baro reference pressure
+/// against the current sample (so `altitude_up` reads ~0 at arm) and
+/// to zero the KF's vertical state. Position-NED is left untouched so
+/// any GPS-home anchoring is preserved.
+static ARM_LATCH: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 
 
@@ -801,30 +838,33 @@ async fn mekf_task() {
 //     so every prediction uses a gravity-corrected attitude).
 //   - GPS position updates at ~1 Hz (NMEA default) — fuses once home
 //     is latched.
-//   - Baro altitude updates at ~25 Hz — fuses only after GPS has
-//     anchored the filter and baro has self-calibrated (see below).
+//   - Baro altitude updates at ~25 Hz — fuses once `p_ref` is latched
+//     at arm time.
 //
-// Altitude frame = GPS. The original design averaged the first N baro
-// readings at boot as ground pressure and let altitude hold engage
-// baro-only. That was abandoned after the onboard DPS310 proved
-// intermittent (2026-04-20): a drone that arms and takes off on a
-// sensor that might vanish mid-flight is unsafe. The current design
-// is:
-//   1. Home origin latches on the first GPS fix clearing `FIX3D`,
+// The two sensor paths are independent. The KF runs on whichever is
+// available — GPS-only, baro-only, both, or (briefly) neither. The
+// soft arm gate in `arming.rs` requires *one* of the two to be live.
+//
+// GPS path:
+//   1. Home origin latches on the first fix clearing `FIX3D`,
 //      `≥ MIN_SATS_FOR_LATCH`, and `HDOP < MAX_HDOP_FOR_LATCH`.
-//   2. Subsequent GPS fixes fuse as local NED (home_lat/lon/alt_msl
-//      as the reference). KF altitude converges toward home = 0 m AGL.
-//   3. Once at least `MIN_GPS_FUSES_FOR_BARO_CAL` GPS updates have
-//      fused, the *next* baro sample triggers p_ref self-calibration:
-//      compute the reference pressure that makes baro altitude agree
-//      with the KF's current altitude. From that sample forward, baro
-//      fuses normally (and its σ=0.3 m dominates the altitude axis
-//      over GPS σ=5 m).
-//   4. If baro is never alive, the filter runs GPS-only — noisier
-//      vertical but safe.
+//   2. Subsequent good fixes fuse as local NED relative to that home.
+//   3. Home is never re-latched — GPS rescue has to return to the
+//      *original* origin, not wherever the receiver sees us now.
 //
-// Home is never re-latched — GPS rescue has to return to the *original*
-// origin, not wherever the receiver sees us now.
+// Baro path:
+//   1. Baro samples flow continuously but are *not* fused before arm.
+//   2. On the Disarmed→Armed transition (signalled via `ARM_LATCH`)
+//      the current pressure becomes `p_ref`, so altitude reads ~0 at
+//      arm. The KF's vertical state (`pz`, `vz`) is also zeroed at
+//      that instant to avoid a one-fuse transient.
+//   3. From arm forward, every baro sample fuses as `update_baro`.
+//
+// History note: the previous design coupled baro p_ref to GPS-anchored
+// KF altitude (baro waited for ≥2 GPS fuses, then self-calibrated
+// against KF altitude). That coupling was a defensive measure against
+// the prior board's intermittent DPS310. The DAKEFPV H743's SPL06 is
+// reliable, so the simpler arm-time latch is back in.
 
 #[embassy_executor::task]
 async fn pos_kf_task() {
@@ -839,17 +879,9 @@ async fn pos_kf_task() {
     const MIN_SATS_FOR_LATCH: u8 = 5;
     const MAX_HDOP_FOR_LATCH: f32 = 3.5;
 
-    // Wait for at least this many GPS fuses (post-home) before
-    // self-calibrating the baro. Each fuse pulls KF altitude closer to
-    // truth; one is technically enough since the init covariance (2 m)
-    // puts a single σ_gps_v=5 m fix at Kalman gain ~0.14 — but two
-    // fuses get us well inside σ_gps_v before we lock in the baro
-    // reference, which is cheap insurance against a one-off noisy fix.
-    const MIN_GPS_FUSES_FOR_BARO_CAL: u32 = 2;
-
     // σ_a = 0.5 m/s² matches the sim tuning — loose enough to track
     // gust transients without treating baro noise as truth. σ_baro =
-    // 0.3 m is the DPS310 spec at 16× OSR plus a bit of headroom.
+    // 0.3 m is the SPL06 spec at 1× OSR plus a bit of headroom.
     // σ_gps_h / σ_gps_v are typical consumer-module noise; the KF will
     // rightly let baro dominate altitude via the much-smaller σ_baro.
     let mut kf = PosKf::new_at(
@@ -860,13 +892,12 @@ async fn pos_kf_task() {
         0.3, // σ_baro
     );
 
-    // Baro self-calibration state. p_ref is the pressure that, if
-    // plugged into the hypsometric formula with the baro's current
-    // reading, yields the KF altitude at the moment of calibration.
-    // `baro_calibrated` gates baro fusion — before it flips true,
-    // baro samples are ignored.
+    // Baro state. `p_ref_pa` is latched on the Disarmed→Armed event
+    // (see ARM_LATCH below); `baro_calibrated` gates fusion. Until
+    // arm, baro samples are stored but not fused.
     let mut p_ref_pa: f32 = 0.0;
     let mut baro_calibrated = false;
+    let mut last_baro_pressure: Option<f32> = None;
 
     // Home-origin latch state. Stored as f64 for lat/lon to preserve
     // sub-metre resolution; the geodetic helper handles the cast.
@@ -874,10 +905,6 @@ async fn pos_kf_task() {
     let mut home_lon: f64 = 0.0;
     let mut home_alt_msl: f32 = 0.0;
     let mut home_latched = false;
-    // How many GPS updates have fused since home latched. Gates baro
-    // self-calibration so we don't lock in the reference against a
-    // wildly noisy first fix.
-    let mut gps_fuses_post_home: u32 = 0;
 
     let mut last_imu: Option<ImuData> = None;
     let mut last_baro_t = Instant::now();
@@ -942,10 +969,6 @@ async fn pos_kf_task() {
                     );
                 }
             } else if good_fix {
-                // Convert to local NED and fuse. Z-channel uses
-                // GPS altitude (σ=5 m) so baro still dominates the
-                // short-term once calibrated; the GPS keeps altitude
-                // honest over the long term via cross-covariance.
                 let ned = geodetic_to_local_ned(
                     gps.latitude,
                     gps.longitude,
@@ -956,37 +979,31 @@ async fn pos_kf_task() {
                 );
                 kf.update_gps(ned);
                 gps_updates_sec = gps_updates_sec.wrapping_add(1);
-                gps_fuses_post_home = gps_fuses_post_home.saturating_add(1);
+            }
+
+            // Velocity fusion runs on any fix (independent of home
+            // latching). Below ~0.3 m/s the receiver's course report
+            // is noise — clamp to (0, 0), which actively damps
+            // position drift while stationary.
+            if gps.fix_mode != FixMode::NoFix && gps.satellites >= 3 {
+                let (vn, ve) = if gps.ground_speed_ms < 0.3 {
+                    (0.0, 0.0)
+                } else {
+                    let crs = gps.course_deg.to_radians();
+                    (gps.ground_speed_ms * libm::cosf(crs),
+                     gps.ground_speed_ms * libm::sinf(crs))
+                };
+                kf.update_gps_velocity(vn, ve);
             }
         }
 
         // ---- Baro update (sensor-driven; None on non-25-Hz ticks) ----
-        // Two-phase: self-calibrate once GPS has anchored the KF, then
-        // fuse as an altitude sensor. No boot-time averaging — the
-        // reference pressure is whatever makes baro altitude agree with
-        // the GPS-anchored KF at the moment of calibration.
+        // Pressure is stored on every sample so ARM_LATCH can latch
+        // p_ref against the most recent reading. Fusion is gated on
+        // `baro_calibrated`, which flips true at arm.
         if let Some(baro) = BARO_DATA.try_take() {
-            if !baro_calibrated {
-                if home_latched && gps_fuses_post_home >= MIN_GPS_FUSES_FOR_BARO_CAL {
-                    // p_ref = p_now / (1 - kf_alt_up/44330.77)^5.2558
-                    let kf_alt_up = kf.altitude_up();
-                    let ratio_base = 1.0 - kf_alt_up / 44330.77_f32;
-                    // Guard the pow() against a nonsensical KF alt
-                    // (shouldn't happen post-fuse, but cheap to check).
-                    if ratio_base > 0.0 && baro.pressure_pa > 0.0 {
-                        p_ref_pa = baro.pressure_pa / libm::powf(ratio_base, 5.2558);
-                        baro_calibrated = true;
-                        last_baro_t = Instant::now();
-                        defmt::info!(
-                            "PosKF baro self-cal: p_ref={=f32}Pa @ kf_alt={=f32}m (p_now={=f32}Pa)",
-                            p_ref_pa,
-                            kf_alt_up,
-                            baro.pressure_pa,
-                        );
-                    }
-                }
-                // Pre-calibration: don't fuse, don't count toward baro_updates_sec.
-            } else {
+            last_baro_pressure = Some(baro.pressure_pa);
+            if baro_calibrated {
                 let alt_up = baro::pressure_to_altitude_m(baro.pressure_pa, p_ref_pa);
                 kf.update_baro(alt_up);
                 last_baro_t = Instant::now();
@@ -994,13 +1011,33 @@ async fn pos_kf_task() {
             }
         }
 
+        // ---- Arm-time baro reference latch ----
+        // Fired once on Disarmed→Armed by the navigation task. Latches
+        // the current pressure so post-arm altitude reads ~0, and
+        // zeroes the KF's vertical state to avoid a one-fuse transient.
+        // Horizontal NED is left untouched: if GPS home is latched, the
+        // pilot may have armed away from home and that offset is real.
+        if ARM_LATCH.try_take().is_some() {
+            if let Some(p) = last_baro_pressure {
+                p_ref_pa = p;
+                baro_calibrated = true;
+                kf.x[2] = 0.0; // pz
+                kf.x[5] = 0.0; // vz
+                defmt::info!("PosKF arm latch: p_ref={=f32}Pa, KF z/vz zeroed", p_ref_pa);
+            } else if home_latched {
+                defmt::info!("PosKF arm latch: GPS-only (no baro), altitude from GPS NED");
+            } else {
+                defmt::warn!("PosKF arm latch: no baro AND no GPS home — altitude unreferenced");
+            }
+        }
+
         // ---- Readiness ----
-        // GPS home latch is the sole gate. Altitude is GPS-anchored from
-        // that point; baro is a nice-to-have that tightens the estimate
-        // once it self-calibrates. Arming requires `home_latched` too
-        // (see `ArmingStateMachine`) — so the control loop never sees
-        // `ready` and `home_latched` disagree at arm time.
-        let ready = home_latched;
+        // Altitude is meaningful if either sensor is anchored: baro post-
+        // arm latch, or GPS once home is set. The two flags are exposed
+        // separately so altitude-only modes (alt-hold) can engage on
+        // baro alone while position-modes (pos-hold, RTH, rescue) stay
+        // gated on `home_latched`.
+        let altitude_ready = baro_calibrated || home_latched;
 
         // ---- Publish estimate ----
         let s = kf.state();
@@ -1011,7 +1048,7 @@ async fn pos_kf_task() {
             vz_up: kf.vz_up(),
             p_ref_pa,
             baro_age_ms: last_baro_t.elapsed().as_millis() as u32,
-            ready,
+            altitude_ready,
             home_latched,
         };
         POS_ESTIMATE.signal(est);
@@ -1021,23 +1058,25 @@ async fn pos_kf_task() {
             let (sats, hdop, fix) = last_gps
                 .map(|g| (g.satellites, g.hdop, g.fix_mode as u8))
                 .unwrap_or((0, 99.99, 0));
-            if ready {
+            if altitude_ready {
                 defmt::info!(
-                    "PosKF ready: alt={=f32}m vz={=f32}m/s | N={=f32}m E={=f32}m | baro_cal={} | {} baro/s {} gps/s",
+                    "PosKF: alt={=f32}m vz={=f32}m/s | N={=f32}m E={=f32}m | baro={} home={} | {} baro/s {} gps/s",
                     est.altitude_up,
                     est.vz_up,
                     est.position_ned[0],
                     est.position_ned[1],
                     baro_calibrated,
+                    home_latched,
                     baro_updates_sec,
                     gps_updates_sec,
                 );
             } else {
                 defmt::info!(
-                    "PosKF waiting: GPS sats={} hdop={=f32} fix={} | {} gps/s",
+                    "PosKF waiting: GPS sats={} hdop={=f32} fix={} baro_seen={} | {} gps/s",
                     sats,
                     hdop,
                     fix,
+                    last_baro_pressure.is_some(),
                     gps_updates_sec,
                 );
             }
@@ -1299,7 +1338,9 @@ async fn navigation_task() {
 
     // ---- Arming state machine ----
     let mut arming = ArmingStateMachine::new();
-    arming.require_gps = false; // bench mode — no GPS indoors
+    // Soft arm gate — baro alone is enough on a normal FC. Bench mode
+    // only needs `require_altitude_ref = false` if neither baro nor
+    // GPS hardware is present.
 
     // ---- MPC attitude outer loop (50 Hz) ----
     let mut mpc = AttitudeMpc::new();
@@ -1398,9 +1439,12 @@ async fn navigation_task() {
         let throttle_raw = RcChannels::to_unit(last_rc.channels[2]);
         let imu_age_ms = imu_last_seen.elapsed().as_millis() as u32;
         let rc_age_ms = rc_task::rc_last_seen_ms();
-        // GPS-home is a hard arm-time gate (see arming.rs comments).
-        // Before the PosKF has published anything, treat as not-ready.
-        let gps_home_ready = last_pos_est.map(|e| e.home_latched).unwrap_or(false);
+        // Either sensor satisfies the soft altitude-reference gate.
+        // Baro counts as "ready" when the PosKF has at least seen it
+        // recently (age < 500 ms). Before the PosKF has published
+        // anything, treat both as not-ready.
+        let baro_ready = last_pos_est.map(|e| e.baro_age_ms < 500).unwrap_or(false);
+        let gps_home_latched = last_pos_est.map(|e| e.home_latched).unwrap_or(false);
 
         let arm_state = arming.update(
             arm_switch,
@@ -1409,15 +1453,25 @@ async fn navigation_task() {
             last_imu.angle[1], // pitch deg
             imu_age_ms,
             rc_age_ms,
-            gps_home_ready,
+            baro_ready,
+            gps_home_latched,
         );
         let armed = arm_state == ArmState::Armed;
         if armed && !last_armed {
-            let pos_ready = last_pos_est.map(|e| e.ready).unwrap_or(false);
-            if !pos_ready {
-                defmt::warn!(
-                    "ARMED without PosKF lock — MANUAL THROTTLE pass-through (no altitude hold)"
-                );
+            // Tell the PosKF to latch p_ref against the current baro
+            // sample (if any) and zero the vertical KF state.
+            ARM_LATCH.signal(());
+
+            // Surface the available references so the pilot knows
+            // which modes will engage.
+            let alt_ready = last_pos_est.map(|e| e.altitude_ready).unwrap_or(false);
+            match (alt_ready, gps_home_latched) {
+                (true, true)  => {} // full lock — quiet
+                (true, false) => defmt::info!("ARMED with baro only — alt-hold OK, no position modes"),
+                (false, true) => defmt::warn!("ARMED with GPS only — position modes OK; alt source is GPS"),
+                (false, false) => defmt::warn!(
+                    "ARMED with no altitude reference — manual throttle, no alt-hold or position modes"
+                ),
             }
         }
         last_armed = armed;
@@ -1432,20 +1486,23 @@ async fn navigation_task() {
                 last_imu.angle[1],
                 imu_age_ms,
                 rc_age_ms,
-                gps_home_ready,
+                baro_ready,
+                gps_home_latched,
             );
             defmt::info!(
-                "arm rejected: thr_low={} level={} imu={} rc={} gps={} | thr={}% roll={}° pitch={}° imu_age={}ms rc_age={}ms ch4={} ch5={}",
+                "arm rejected: thr_low={} level={} imu={} rc={} alt_ref={} | thr={}% roll={}° pitch={}° imu_age={}ms rc_age={}ms baro={} gps_home={} ch4={} ch5={}",
                 c.throttle_low,
                 c.attitude_level,
                 c.imu_fresh,
                 c.rc_link_active,
-                c.gps_home_ready,
+                c.altitude_ref_ready,
                 (throttle_raw * 100.0) as i32,
                 last_imu.angle[0] as i32,
                 last_imu.angle[1] as i32,
                 imu_age_ms,
                 rc_age_ms,
+                baro_ready,
+                gps_home_latched,
                 last_rc.channels[4],
                 last_rc.channels[5],
             );
@@ -1454,18 +1511,31 @@ async fn navigation_task() {
 
 
         // ---- 3. Flight mode selection ----
-        let pos_ready = last_pos_est.map(|e| e.ready).unwrap_or(false);
+        // `altitude_ready` (baro OR GPS) gates altitude-aware modes;
+        // `home_latched` (GPS) gates NED-frame modes. Failsafe picks
+        // the best descent strategy for what we still have.
+        let altitude_ready = last_pos_est.map(|e| e.altitude_ready).unwrap_or(false);
         let home_latched = last_pos_est.map(|e| e.home_latched).unwrap_or(false);
 
         if !armed {
             flight_mode = FlightMode::Acro;
-        } else if arming.failsafe_active && home_latched {
-            flight_mode = FlightMode::GpsRescue; // Hover in place on failsafe
+        } else if arming.failsafe_active {
+            // Pick the best descent we can run with what's available.
+            flight_mode = if home_latched {
+                FlightMode::GpsRescue
+            } else if altitude_ready {
+                FlightMode::FailsafeLand
+            } else {
+                FlightMode::FailsafeBlind
+            };
         } else if RcChannels::to_us(last_rc.channels[6]) > 1500 && home_latched {
             flight_mode = FlightMode::GpsHome; // Return to home on switch
-        } else if RcChannels::to_us(last_rc.channels[5]) > 1600 && pos_ready {
+        } else if RcChannels::to_us(last_rc.channels[5]) > 1600 && altitude_ready {
+            // PosHold: GPS home gives true position hold; without it,
+            // PosKF velocity-fusion damps DR drift and the controller
+            // does best-effort horizontal hold for tens of seconds.
             flight_mode = FlightMode::PosHold;
-        } else if RcChannels::to_us(last_rc.channels[5]) > 1200 && pos_ready {
+        } else if RcChannels::to_us(last_rc.channels[5]) > 1200 && altitude_ready {
             flight_mode = FlightMode::AltHold;
         } else {
             flight_mode = FlightMode::Acro;
@@ -1474,7 +1544,15 @@ async fn navigation_task() {
         // ---- Mode entry: capture targets on transition ----
         if flight_mode != prev_mode {
             defmt::info!("Flight mode: {} -> {}", prev_mode, flight_mode);
-            if let Some(est) = last_pos_est.filter(|_| pos_ready) {
+            // AltHold + FailsafeLand need altitude; PosHold + GPS modes
+            // need NED. FailsafeBlind needs nothing (open loop).
+            let target_gate = match flight_mode {
+                FlightMode::AltHold | FlightMode::FailsafeLand => altitude_ready,
+                FlightMode::PosHold => altitude_ready, // best-effort horizontal w/o home
+                FlightMode::GpsRescue | FlightMode::GpsHome => home_latched,
+                FlightMode::Acro | FlightMode::FailsafeBlind => false,
+            };
+            if let Some(est) = last_pos_est.filter(|_| target_gate) {
                 match flight_mode {
                     FlightMode::AltHold => {
                         alt_target = est.altitude_up;
@@ -1503,7 +1581,14 @@ async fn navigation_task() {
                         rescue_landing = false;
                         alt_ctrl.reset();
                     }
-                    FlightMode::Acro => {}
+                    FlightMode::FailsafeLand => {
+                        // Start descent from current altitude; the per-
+                        // tick handler ramps alt_target down at
+                        // FAILSAFE_DESCENT_RATE_MPS.
+                        alt_target = est.altitude_up;
+                        alt_ctrl.reset();
+                    }
+                    FlightMode::Acro | FlightMode::FailsafeBlind => {}
                 }
             }
             prev_mode = flight_mode;
@@ -1557,7 +1642,7 @@ async fn navigation_task() {
                             let rate = thr_centered * 2.0 * ALT_HOLD_MAX_RATE_MPS;
                             alt_target += rate * dt_outer;
                         }
-                        if let Some(est) = last_pos_est.filter(|e| e.ready) {
+                        if let Some(est) = last_pos_est.filter(|e| e.altitude_ready) {
                             current_thrust =
                                 alt_ctrl.update(alt_target, est.altitude_up, est.vz_up, dt_outer);
                         }
@@ -1582,7 +1667,7 @@ async fn navigation_task() {
                         if libm::fabsf(thr_centered) > ALT_HOLD_DEADBAND {
                             alt_target += thr_centered * 2.0 * ALT_HOLD_MAX_RATE_MPS * dt_outer;
                         }
-                        if let Some(est) = last_pos_est.filter(|e| e.ready) {
+                        if let Some(est) = last_pos_est.filter(|e| e.home_latched) {
                             let pos_out = pos_ctrl.update(
                                 [est.position_ned[0], est.position_ned[1]],
                                 [est.velocity_ned[0], est.velocity_ned[1]],
@@ -1604,7 +1689,7 @@ async fn navigation_task() {
                         // Failsafe: just hover in place
                         yaw_rate_dps = 0.0;
                         desired_yaw_rad = 0.0;
-                        if let Some(est) = last_pos_est.filter(|e| e.ready) {
+                        if let Some(est) = last_pos_est.filter(|e| e.home_latched) {
                             let pos_out = pos_ctrl.update(
                                 [est.position_ned[0], est.position_ned[1]],
                                 [est.velocity_ned[0], est.velocity_ned[1]],
@@ -1625,7 +1710,7 @@ async fn navigation_task() {
                         // Return to home
                         yaw_rate_dps = 0.0;
                         desired_yaw_rad = 0.0;
-                        if let Some(est) = last_pos_est.filter(|e| e.ready) {
+                        if let Some(est) = last_pos_est.filter(|e| e.home_latched) {
                             let dist_home = libm::sqrtf(est.position_ned[0] * est.position_ned[0] + est.position_ned[1] * est.position_ned[1]);
 
                             // Auto-land sequence
@@ -1666,6 +1751,45 @@ async fn navigation_task() {
                             desired_pitch_rad = 0.0;
                             current_thrust = hover_throttle;
                         }
+                    }
+                    FlightMode::FailsafeLand => {
+                        // RC lost, no GPS home, baro alive: closed-loop
+                        // controlled descent at FAILSAFE_DESCENT_RATE_MPS.
+                        // Disarm when altitude crosses the floor (we're
+                        // back near the arm reference). No timeout —
+                        // altitude-floor is the sole stop condition.
+                        yaw_rate_dps = 0.0;
+                        desired_yaw_rad = 0.0;
+                        desired_roll_rad = 0.0;
+                        desired_pitch_rad = 0.0;
+                        alt_target -= FAILSAFE_DESCENT_RATE_MPS * dt_outer;
+                        if let Some(est) = last_pos_est.filter(|e| e.altitude_ready) {
+                            current_thrust =
+                                alt_ctrl.update(alt_target, est.altitude_up, est.vz_up, dt_outer);
+                            if est.altitude_up < FAILSAFE_LAND_DISARM_ALT_M {
+                                defmt::info!("FailsafeLand: altitude floor reached, disarming");
+                                arming.force_disarm();
+                            }
+                        } else {
+                            // Altitude went stale mid-descent — fall
+                            // through to blind throttle for this tick.
+                            // Mode-selection will switch us to
+                            // FailsafeBlind on the next pass.
+                            current_thrust = hover_throttle * FAILSAFE_BLIND_THROTTLE_FRAC;
+                        }
+                    }
+                    FlightMode::FailsafeBlind => {
+                        // RC lost AND no altitude reference. Open-loop
+                        // throttle slightly below hover, level attitude.
+                        // No auto-disarm — without altitude data we
+                        // can't tell when to stop. The descent runs
+                        // until pilot recovers RC or battery cuts.
+                        // (Beta backlog: impact-signature disarm.)
+                        yaw_rate_dps = 0.0;
+                        desired_yaw_rad = 0.0;
+                        desired_roll_rad = 0.0;
+                        desired_pitch_rad = 0.0;
+                        current_thrust = hover_throttle * FAILSAFE_BLIND_THROTTLE_FRAC;
                     }
                 }
 
