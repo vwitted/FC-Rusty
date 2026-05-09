@@ -83,17 +83,20 @@ pub enum Orientation {
     Roll180,
     /// IMU2: ROTATION_PITCH_180. Sensor X → −X, Y → +Y, Z → −Z.
     Pitch180,
+    /// MPU6000: ROTATION_YAW_90. Sensor X → −Y, Y → +X, Z → +Z.
+    Yaw90,
     /// Pre-averaged / already in body frame. No axis flips.
     Identity,
 }
 
 impl Orientation {
-    /// Sign vector that maps sensor-native axes to FC body frame (NED).
-    pub const fn sign(self) -> [f32; 3] {
+    /// Applies the rotation to map sensor-native axes to FC body frame (NED).
+    pub const fn apply(self, v: [f32; 3]) -> [f32; 3] {
         match self {
-            Self::Roll180  => [ 1.0, -1.0, -1.0],
-            Self::Pitch180 => [-1.0,  1.0, -1.0],
-            Self::Identity => [ 1.0,  1.0,  1.0],
+            Self::Roll180  => [ v[0], -v[1], -v[2]],
+            Self::Pitch180 => [-v[0],  v[1], -v[2]],
+            Self::Yaw90    => [-v[1],  v[0],  v[2]],
+            Self::Identity => [ v[0],  v[1],  v[2]],
         }
     }
 }
@@ -103,30 +106,30 @@ pub struct RawImu {
     pub accel: [i16; 3],
     pub gyro: [i16; 3],
     pub temp: i16,
-    /// Sign vector baked into this sample — set by the producing
-    /// sensor's `Orientation`. `accel_g()` and `gyro_dps()` apply
-    /// this to convert raw counts into body-frame NED floats.
-    sign: [f32; 3],
+    /// Orientation of the sensor used to rotate into body-frame NED.
+    pub orientation: Orientation,
 }
 
 impl RawImu {
     /// Accel in g, rotated into FC body frame (NED).
     /// When stationary and level, this reads ≈(0, 0, −1) g.
     pub fn accel_g(&self) -> [f32; 3] {
-        [
-            self.accel[0] as f32 / ACCEL_LSB_PER_G * self.sign[0],
-            self.accel[1] as f32 / ACCEL_LSB_PER_G * self.sign[1],
-            self.accel[2] as f32 / ACCEL_LSB_PER_G * self.sign[2],
-        ]
+        let v = [
+            self.accel[0] as f32 / ACCEL_LSB_PER_G,
+            self.accel[1] as f32 / ACCEL_LSB_PER_G,
+            self.accel[2] as f32 / ACCEL_LSB_PER_G,
+        ];
+        self.orientation.apply(v)
     }
 
     /// Gyro in deg/s, rotated into FC body frame (NED).
     pub fn gyro_dps(&self) -> [f32; 3] {
-        [
-            self.gyro[0] as f32 / GYRO_LSB_PER_DPS * self.sign[0],
-            self.gyro[1] as f32 / GYRO_LSB_PER_DPS * self.sign[1],
-            self.gyro[2] as f32 / GYRO_LSB_PER_DPS * self.sign[2],
-        ]
+        let v = [
+            self.gyro[0] as f32 / GYRO_LSB_PER_DPS,
+            self.gyro[1] as f32 / GYRO_LSB_PER_DPS,
+            self.gyro[2] as f32 / GYRO_LSB_PER_DPS,
+        ];
+        self.orientation.apply(v)
     }
 
     /// Accel in g, sensor native frame — for driver/diagnostic use only.
@@ -187,7 +190,7 @@ impl RawImu {
             accel: fused_accel,
             gyro: fused_gyro,
             temp: fused_temp,
-            sign: Orientation::Identity.sign(),
+            orientation: Orientation::Identity,
         }
     }
 }
@@ -272,7 +275,7 @@ impl<'d> Icm42688<'d> {
                 i16::from_be_bytes([d[10], d[11]]),
                 i16::from_be_bytes([d[12], d[13]]),
             ],
-            sign: self.orientation.sign(),
+            orientation: self.orientation,
         })
     }
 

@@ -1,11 +1,11 @@
 // logger.rs — defmt global logger over USART6 TX (PC6)
 //
-// Target board: DAKEFPVH743
+// Target board: GEPRCTAKERH743
 // USART6 TX is on PC6 (AF7). This maps to SERIAL6 / T6 pad — a
 // physically accessible user/GP port, leaving all protocol-assigned
 // ports free:
-//   USART1 → GPS, USART2 → MAVLink/Telem, USART3 → ESC telem,
-//   UART4 → VTX/DisplayPort, UART5 → RC input, UART7/8 → user.
+//   USART1 → DisplayPort/VTX, USART2 → RC input, USART3 → BT
+//   UART4 → GPS, UART5 → (reserved), UART7/8 → user.
 //
 // Implementation notes:
 //   * We bypass Embassy's UART driver and poke USART6 registers

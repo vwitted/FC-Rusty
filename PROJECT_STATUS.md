@@ -1,6 +1,6 @@
 # FC-Rusty — Project Status
 
-A Rust flight controller targeting the **DAKEFPV H743** (STM32H743VIT6,
+A Rust flight controller targeting the **GEPRC TAKER H743 BT** (STM32H743VIT6,
 Cortex-M7F @ 480 MHz). The north-star is **stable, high-authority
 attitude control via MPC**; everything else — estimation, sensors,
 arming, comms — exists to feed or protect that loop.
@@ -10,25 +10,26 @@ material hardware or design change lands (see `CLAUDE.md`).
 
 ---
 
-## Current Hardware — DAKEFPV H743
+## Current Hardware — GEPRC TAKER H743 BT
 
 ### Peripherals
 
-| Peripheral             | Role                              | Status                                        |
-|------------------------|-----------------------------------|-----------------------------------------------|
-| USART6 TX (PC6)        | defmt logger (115200, T6 pad)     | ✅ verified                                    |
-| UART5 RX (PB5)         | CRSF RC receiver (R5, 416666)     | ✅ verified — 6 channels parsing               |
-| USART1 (PA9/PA10)      | GPS (NMEA, 9600, T1/R1)           | ✅ verified — 3D fix, home latches             |
-| SPI1 + PA4             | ICM-42688P IMU1 (onboard)         | ✅ verified — 8 kHz reads, MEKF fusing         |
-| SPI4 + PB1             | ICM-42688P IMU2 (onboard)         | ✅ verified — 8 kHz reads, averaged with IMU1  |
-| I2C2 (PB10/PB11)       | SPL06 barometer (onboard)         | ✅ proper driver — 128 Hz, correct calibration              |
-| TIM2 (PA0/PA1/PA2/PA3) | DShot600, motors M1–M4            | ✅ verified — all four motors spin on arm      |
-| PD10                   | Status LED (active low)           | ✅ heartbeat blink task                        |
-| USB-C                  | DFU flashing                      | ✅ verified — no SWD on this board             |
-| UART4 (PD1/PD0)        | DisplayPort / VTX (T4/R4)         | ⚪ not wired                                   |
-| USART3                 | ESC telemetry (T3/R3)             | ⚪ not wired                                   |
-| UART7 / UART8          | General purpose (T7/R7, T8/R8)   | ⚪ available                                   |
-| SPI2 (PB13/14/15) + PB12 | AT7456E OSD (MAX7456-compatible) | ⚪ no driver yet                               |
+| Peripheral               | Role                               | Status                                        |
+|--------------------------|------------------------------------|-----------------------------------------------|
+| USART6 TX (PC6)          | defmt logger (115200)              | ✅ verified                                    |
+| USART2 RX (PA3)          | CRSF RC receiver (416666)          | ✅ verified — 6 channels parsing               |
+| UART4 (PA0/PA1)          | GPS (NMEA, 9600)                   | ✅ verified — 3D fix, home latches             |
+| SPI1 + PA4               | MPU6000 IMU1 (onboard)             | ✅ verified — 8 kHz reads, MEKF fusing         |
+| SPI2 + PB12              | ICM-42688P IMU2 (onboard)          | ✅ verified — 8 kHz reads, averaged with IMU1  |
+| I2C1 (PB8/PB9)           | SPL06 barometer (onboard)          | ✅ proper driver — 128 Hz, correct calibration |
+| TIM3 (PB0/PB1/PB5/PB4)   | DShot600, motors M1–M4             | ✅ verified — all four motors spin on arm      |
+| PD10                     | Status LED (active low)            | ✅ heartbeat blink task                        |
+| USB-C                    | DFU flashing                       | ✅ verified — no SWD on this board             |
+| USART1 (PA9/PA10)        | DisplayPort / VTX                  | ⚪ not wired                                   |
+| UART8 (PE0/PE1)          | ESC telemetry                      | ⚪ not wired                                   |
+| USART3 (PB10/PB11)       | Bluetooth module (internal)        | ⚪ not wired                                   |
+| UART7 (PE7/PE8)          | General purpose                    | ⚪ available                                   |
+| SPI4 + PE4               | AT7456E OSD (MAX7456-compatible)   | ⚪ no driver yet                               |
 
 ### Why this board
 
@@ -41,6 +42,7 @@ material hardware or design change lands (see `CLAUDE.md`).
   TIM2 (no multi-timer synchronisation problem), USB-C DFU flashing.
   The DShot fix (direct DMAR burst write) carries straight over and
   works cleanly on the H743.
+- **GEPRC TAKER H743 BT**: Current board. Migrated from DAKEFPV H743 to utilize its standard JST connector layout. Features an STM32H743 with an MPU6000 + ICM-42688P dual IMU setup, SPL06 baro, and up to 9 PWM/DShot outputs. Peripherals were relocated (e.g. TIM3 for DShot, UART4 for GPS, USART2 for RC) to match hardware defaults.
 
 ---
 
@@ -48,10 +50,10 @@ material hardware or design change lands (see `CLAUDE.md`).
 
 (The specifics here are largely validated on older hardware, but the overall functionality has now been implemented and enhanced for the STM32H743).
 
-- **Attitude**: Dual ICM-42688P sensors read at 8 kHz via SPI. MEKF fusing accel (100 Hz update)
+- **Attitude**: MPU6000 and ICM-42688P dual IMUs read at 8 kHz via SPI. MEKF fusing accel (100 Hz update)
   and gyro (8 kHz predict). Gyro bias bounded to 0.3–0.5 dps; innovation
   gate rejects ~0% at rest and ~25% under aggressive motion. Sensor
-  frame mapped to NED via `BODY_SIGN=[+1,-1,-1]`.
+  frames mapped to NED.
 - **Position**: 6-state linear PosKF (pn, pe, pz, vn, ve, vz) running
   at 100 Hz predict. Baro and GPS fuse as independent measurement
   paths — pilot decides what to fly with via the soft arm gate
@@ -85,7 +87,7 @@ material hardware or design change lands (see `CLAUDE.md`).
 - **Failsafe descent**: RC loss never auto-disarms. The control loop
   picks one of three failsafe modes based on what's still alive:
   - `GpsRescue` (existing): home_latched → climb to safe alt + RTH
-    + auto-land at home.
+    - auto-land at home.
   - `FailsafeLand` (new): altitude_ready, no home → closed-loop
     descent at 0.7 m/s, level attitude, auto-disarm when
     `altitude_up < 0.3 m`.
@@ -256,6 +258,8 @@ All host-tested (`cargo test --lib --no-default-features --target x86_64-unknown
 | WT901B parser    | `drivers/wt901b.rs`      | All packet types; `ImuData` type still used internally        |
 | SPL06 driver     | `drivers/baro.rs`        | 128 Hz / 1× OSR, correct cal from 0x18; DPS310 retained     |
 | ISM6HG256X driver | `drivers/ism6hg256x.rs` | ±16 g / ±4000 dps / 7.68 kHz, SPI; written for Beta breakout, unreferenced |
+| MPU6000 driver   | `drivers/mpu6000.rs`     | ±16 g / ±2000 dps / 8 kHz, SPI; written for GEPRC TAKER H743 (IMU1)      |
+| ICM42688P driver | `drivers/icm42688.rs`    | ±16 g / ±2000 dps / 8 kHz, SPI; written for H743 boards (IMU1 &2 on DAKEFPV and IMU2 on GEPRC TAKER H743)      |
 | LIS2MDL driver   | `drivers/lis2mdl.rs`     | 3-axis mag, I2C addr 0x1E, 100 Hz HR + LPF + OFF_CANC; written for Beta breakout, unreferenced |
 | DShot driver     | `drivers/dshot_hw.rs`    | TIM2 DMAR burst, DShot600, all 4 channels simultaneously     |
 | Physics sim      | `sim/sim.rs`             | 6DOF rigid body, τ=30ms motor lag, NED, ground collision     |
