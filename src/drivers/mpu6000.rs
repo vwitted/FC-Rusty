@@ -144,9 +144,9 @@ impl<'d> Mpu6000<'d> {
     }
 
     async fn write_reg(&mut self, reg: u8, value: u8) -> Result<(), InitError> {
-        let buf = [reg & !READ_MASK, value];
+        let mut buf = [reg & !READ_MASK, value];
         self.cs.set_low();
-        let res = self.spi.write(&buf).await;
+        let res = self.spi.transfer_in_place(&mut buf).await;
         self.cs.set_high();
         res.map_err(|_| InitError::Spi)
     }

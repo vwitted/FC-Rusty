@@ -87,6 +87,9 @@ pub enum Orientation {
     /// Sensor X → +Y, Y → −X, Z → −Z.
     /// Maps to NED: Forward = -Y, Right = X, Down = -Z.
     Yaw90ZFlip,
+    /// Alternate orientation if the chip is rotated 180 instead of 90.
+    /// Sensor X → -X, Y → -Y, Z → -Z.
+    Yaw180ZFlip,
     /// Pre-averaged / already in body frame. No axis flips.
     Identity,
 }
@@ -98,6 +101,7 @@ impl Orientation {
             Self::Roll180  => [ v[0], -v[1], -v[2]],
             Self::Pitch180 => [-v[0],  v[1], -v[2]],
             Self::Yaw90ZFlip => [-v[1],  v[0], -v[2]],
+            Self::Yaw180ZFlip => [-v[0], -v[1], -v[2]],
             Self::Identity => [ v[0],  v[1],  v[2]],
         }
     }
