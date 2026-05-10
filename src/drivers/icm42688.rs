@@ -87,6 +87,10 @@ pub enum Orientation {
     /// Sensor X → +Y, Y → −X, Z → −Z.
     /// Maps to NED: Forward = -Y, Right = X, Down = -Z.
     Yaw90ZFlip,
+    /// IMU2: CW90FLIP (Yaw 90 + Roll 180). Sensor X → −Y, Y → −X, Z → −Z.
+    Cw90Flip,
+    /// CW270FLIP (Yaw 270 + Roll 180). Sensor X → Y, Y → X, Z → −Z.
+    Cw270Flip,
     /// Alternate orientation if the chip is rotated 180 instead of 90.
     /// Sensor X → -X, Y → -Y, Z → -Z.
     Yaw180ZFlip,
@@ -101,6 +105,8 @@ impl Orientation {
             Self::Roll180  => [ v[0], -v[1], -v[2]],
             Self::Pitch180 => [-v[0],  v[1], -v[2]],
             Self::Yaw90ZFlip => [-v[1],  v[0], -v[2]],
+            Self::Cw90Flip => [-v[1], -v[0], -v[2]],
+            Self::Cw270Flip => [ v[1],  v[0], -v[2]],
             Self::Yaw180ZFlip => [-v[0], -v[1], -v[2]],
             Self::Identity => [ v[0],  v[1],  v[2]],
         }
@@ -251,6 +257,10 @@ impl<'d> Icm42688<'d> {
         dev.write_reg(REG_PWR_MGMT0, PWR_LN_BOTH).await?;
         // Gyro startup is 30–45 ms per datasheet §14.1; accel <10 ms.
         Timer::after(Duration::from_millis(50)).await;
+
+        let mut cfg = embassy_stm32::spi::Config::default();
+        cfg.frequency = embassy_stm32::time::Hertz(10_000_000);
+        dev.spi.set_config(&cfg).unwrap();
 
         Ok(dev)
     }

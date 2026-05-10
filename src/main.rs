@@ -332,9 +332,9 @@ async fn main(spawner: Spawner) {
     // DAKEFPVH743 has LED0 on PD10 (active low). We spawn a quick blink
     // task so we have an immediate visual indicator that the firmware
     // has booted and is running, without needing to check the UART logs.
-    use embassy_stm32::gpio::{Level, Output, Speed};
-    let led = Output::new(p.PD10, Level::High, Speed::Low);
-    spawner.spawn(blink_task(led)).unwrap();
+    //use embassy_stm32::gpio::{Level, Output, Speed};
+    //let led = Output::new(p.PA8, Level::High, Speed::Low);
+    //spawner.spawn(blink_task(led)).unwrap();
 
     defmt::info!("Flight controller starting");
 
@@ -376,9 +376,9 @@ async fn main(spawner: Spawner) {
         );
         let cs1 = Output::new(p.PA4, Level::High, Speed::VeryHigh);
 
-        match Mpu6000::new(spi1, cs1, Orientation::Yaw90ZFlip).await {
+        match Mpu6000::new(spi1, cs1, Orientation::Pitch180).await {
             Ok(imu1) => {
-                defmt::info!("MPU6000 IMU1 (SPI1, Yaw90ZFlip) initialised OK");
+                defmt::info!("MPU6000 IMU1 (SPI1, Pitch180) initialised OK");
 
                 // ---- IMU2 (SPI2 - ICM42688) ----
                 let spi2 = Spi::new(
@@ -451,7 +451,8 @@ async fn main(spawner: Spawner) {
         p.PB1,
         p.PB5,
         p.PB4,
-        p.DMA1_CH7, // TIM3_UP
+        p.DMA1_CH7, // TIM3_UP (Tx)
+        p.DMA1_CH6, // TIM3_UP (Rx)
         DshotSpeed::Dshot600,
     );
 
@@ -470,15 +471,15 @@ async fn main(spawner: Spawner) {
 
 // ---- Heartbeat Task ----
 
-#[embassy_executor::task]
-async fn blink_task(mut led: embassy_stm32::gpio::Output<'static>) {
-    loop {
-        led.set_low(); // Turn LED ON
-        embassy_time::Timer::after(embassy_time::Duration::from_millis(100)).await;
-        led.set_high(); // Turn LED OFF
-        embassy_time::Timer::after(embassy_time::Duration::from_millis(900)).await;
-    }
-}
+// #[embassy_executor::task]
+//async fn blink_task(mut led: embassy_stm32::gpio::Output<'static>) {
+//    loop {
+//        led.set_low(); // Turn LED ON
+//        embassy_time::Timer::after(embassy_time::Duration::from_millis(100)).await;
+//        led.set_high(); // Turn LED OFF
+//        embassy_time::Timer::after(embassy_time::Duration::from_millis(900)).await;
+//    }
+//}
 
 // ---- GPS Task ----
 // Reads NMEA sentences from the GPS module, publishes via GPS_DATA signal.
@@ -733,6 +734,28 @@ async fn mekf_task() {
         mekf.euler()[1] * RAD2DEG,
         mekf.euler()[2] * RAD2DEG,
     );
+
+    defmt::info!("Waiting 3 seconds for board to settle before gyro calibration...");
+    embassy_time::Timer::after(embassy_time::Duration::from_secs(3)).await;
+
+    defmt::info!("MEKF zero-rate gyro calibration started (1 sec)... Keep drone perfectly still!");
+    let mut gyro_sum = [0.0f32; 3];
+    let calib_samples = 8000;
+    for _ in 0..calib_samples {
+        let raw = RAW_IMU.wait().await;
+        let g = raw.gyro_dps();
+        gyro_sum[0] += g[0] * DEG2RAD;
+        gyro_sum[1] += g[1] * DEG2RAD;
+        gyro_sum[2] += g[2] * DEG2RAD;
+    }
+    let bias_calib = [
+        gyro_sum[0] / (calib_samples as f32),
+        gyro_sum[1] / (calib_samples as f32),
+        gyro_sum[2] / (calib_samples as f32),
+    ];
+    mekf.set_bias(bias_calib);
+    defmt::info!("MEKF gyro calibration complete: bias=[{=f32},{=f32},{=f32}] dps",
+        bias_calib[0] * RAD2DEG, bias_calib[1] * RAD2DEG, bias_calib[2] * RAD2DEG);
 
     let mut last_predict = Instant::now();
     let mut sample_count: u32 = 0;
@@ -1942,21 +1965,43 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
 
             let motor_outputs = QUAD_X.apply(&control_demand);
 
-            let mut frames: [EncodedFrame; 4] = [DshotTx::standard().command(Command::MotorStop); 4];
+            let mut frames: [EncodedFrame; 4] = [DshotTx::bidirectional().command(Command::MotorStop); 4];
             for i in 0..4 {
                 let v = motor_outputs.motors[i];
                 if v <= 0.0 {
-                    frames[i] = DshotTx::standard().command(Command::MotorStop);
+                    frames[i] = DshotTx::bidirectional().command(Command::MotorStop);
                 } else {
                     let throttle = (v * 1999.0) as u16;
-                    frames[i] = DshotTx::standard().throttle_clamped(throttle);
+                    frames[i] = DshotTx::bidirectional().throttle_clamped(throttle);
                 }
             }
-            dshot.send(frames).await;
+            
+            let telemetry = dshot.send_throttles_and_receive(frames).await;
+            
+            // Log eRPM telemetry at ~10Hz
+            static mut LOG_COUNTER: u32 = 0;
+            unsafe {
+                LOG_COUNTER = LOG_COUNTER.wrapping_add(1);
+                if LOG_COUNTER % 800 == 0 {
+                    let get_erpm = |res: &Result<uf_dshot::TelemetryFrame, uf_dshot::TelemetryError>| -> u32 {
+                        if let Ok(uf_dshot::TelemetryFrame::Erpm(r)) = res {
+                            r.mechanical_rpm(1) // 1 pole pair = eRPM
+                        } else {
+                            0
+                        }
+                    };
+                    
+                    let e1 = get_erpm(&telemetry[0]);
+                    let e2 = get_erpm(&telemetry[1]);
+                    let e3 = get_erpm(&telemetry[2]);
+                    let e4 = get_erpm(&telemetry[3]);
+                    defmt::info!("DShot eRPM: M1={} M2={} M3={} M4={}", e1, e2, e3, e4);
+                }
+            }
         } else {
             rate_pid.reset();
-            let frames: [EncodedFrame; 4] = [DshotTx::standard().command(Command::MotorStop); 4];
-            dshot.send(frames).await;
+            let frames: [EncodedFrame; 4] = [DshotTx::bidirectional().command(Command::MotorStop); 4];
+            let _ = dshot.send_throttles_and_receive(frames).await;
         }
     }
 }

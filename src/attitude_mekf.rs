@@ -121,6 +121,11 @@ impl AttitudeMekf {
         self.bias = Vector3::zeros();
     }
 
+    /// Seed the initial gyro bias (e.g. from a zero-rate calibration at boot).
+    pub fn set_bias(&mut self, bias_rad_s: [f32; 3]) {
+        self.bias = Vector3::new(bias_rad_s[0], bias_rad_s[1], bias_rad_s[2]);
+    }
+
     /// Predict one step. `gyro_body` is measured gyro in rad/s (body NED).
     /// Pass `dt` in seconds — the task should clamp to a sane range in
     /// case of missed samples; we don't clamp here.
