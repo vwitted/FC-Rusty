@@ -64,17 +64,21 @@ impl<'d> Mpu6000<'d> {
         dev.cs.set_high();
         Timer::after(Duration::from_millis(1)).await;
 
-        // Soft reset
+        // Device reset
         dev.write_reg(REG_PWR_MGMT_1, PWR_RESET).await?;
         Timer::after(Duration::from_millis(100)).await;
 
-        // Wake up and select X-axis gyro clock
-        dev.write_reg(REG_PWR_MGMT_1, PWR_CLKSEL).await?;
-        Timer::after(Duration::from_millis(10)).await;
+        // Signal path reset (Betaflight does this to un-stick clones)
+        dev.write_reg(0x68, 0x07).await?; 
+        Timer::after(Duration::from_millis(100)).await;
+
+        // Wake up and select Z-axis gyro clock (Betaflight uses 0x03, we used 0x01. 0x03 is safer on some clones)
+        dev.write_reg(REG_PWR_MGMT_1, 0x03).await?;
+        Timer::after(Duration::from_millis(15)).await;
 
         // Disable I2C interface
         dev.write_reg(REG_USER_CTRL, USER_CTRL_VAL).await?;
-        Timer::after(Duration::from_millis(1)).await;
+        Timer::after(Duration::from_millis(15)).await;
 
         let id = dev.read_reg(REG_WHO_AM_I).await?;
         if id != WHO_AM_I_VALUE {
@@ -148,6 +152,10 @@ impl<'d> Mpu6000<'d> {
         self.cs.set_low();
         let res = self.spi.transfer_in_place(&mut buf).await;
         self.cs.set_high();
+        
+        // MPU6000 (especially clones) can require extra CS high time between writes
+        Timer::after(Duration::from_micros(10)).await;
+        
         res.map_err(|_| InitError::Spi)
     }
 }

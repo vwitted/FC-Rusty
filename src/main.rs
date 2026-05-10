@@ -363,7 +363,7 @@ async fn main(spawner: Spawner) {
         use embassy_stm32::time::Hertz;
 
         let mut spi_cfg = SpiConfig::default();
-        spi_cfg.frequency = Hertz(10_000_000);
+        spi_cfg.frequency = Hertz(1_000_000);
 
         // ---- IMU1 (SPI1 - MPU6000) ----
         let spi1 = Spi::new(
