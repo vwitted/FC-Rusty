@@ -376,9 +376,9 @@ async fn main(spawner: Spawner) {
         );
         let cs1 = Output::new(p.PA4, Level::High, Speed::VeryHigh);
 
-        match Mpu6000::new(spi1, cs1, Orientation::Yaw90).await {
+        match Mpu6000::new(spi1, cs1, Orientation::Yaw90ZFlip).await {
             Ok(imu1) => {
-                defmt::info!("MPU6000 IMU1 (SPI1, Yaw90) initialised OK");
+                defmt::info!("MPU6000 IMU1 (SPI1, Yaw90ZFlip) initialised OK");
 
                 // ---- IMU2 (SPI2 - ICM42688) ----
                 let spi2 = Spi::new(

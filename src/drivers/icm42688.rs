@@ -83,8 +83,10 @@ pub enum Orientation {
     Roll180,
     /// IMU2: ROTATION_PITCH_180. Sensor X → −X, Y → +Y, Z → −Z.
     Pitch180,
-    /// MPU6000: ROTATION_YAW_90. Sensor X → −Y, Y → +X, Z → +Z.
-    Yaw90,
+    /// MPU6000: User-verified orientation (Yaw 90 + Z flip).
+    /// Sensor X → +Y, Y → −X, Z → −Z.
+    /// Maps to NED: Forward = -Y, Right = X, Down = -Z.
+    Yaw90ZFlip,
     /// Pre-averaged / already in body frame. No axis flips.
     Identity,
 }
@@ -95,7 +97,7 @@ impl Orientation {
         match self {
             Self::Roll180  => [ v[0], -v[1], -v[2]],
             Self::Pitch180 => [-v[0],  v[1], -v[2]],
-            Self::Yaw90    => [-v[1],  v[0],  v[2]],
+            Self::Yaw90ZFlip => [-v[1],  v[0], -v[2]],
             Self::Identity => [ v[0],  v[1],  v[2]],
         }
     }

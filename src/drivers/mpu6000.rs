@@ -54,6 +54,12 @@ impl<'d> Mpu6000<'d> {
     ) -> Result<Self, InitError> {
         let mut dev = Self { spi, cs, orientation: orient };
 
+        // Temporarily lower SPI frequency to 1 MHz for setup writes
+        // (MPU6000 requires <= 1 MHz for register writes)
+        let mut cfg = embassy_stm32::spi::Config::default();
+        cfg.frequency = embassy_stm32::time::Hertz(1_000_000);
+        dev.spi.set_config(&cfg).unwrap();
+
         // CS idle high
         dev.cs.set_high();
         Timer::after(Duration::from_millis(1)).await;
@@ -83,6 +89,10 @@ impl<'d> Mpu6000<'d> {
 
         // Give sensors time to settle
         Timer::after(Duration::from_millis(50)).await;
+
+        // Restore SPI frequency to 10 MHz for reading
+        cfg.frequency = embassy_stm32::time::Hertz(10_000_000);
+        dev.spi.set_config(&cfg).unwrap();
 
         Ok(dev)
     }
