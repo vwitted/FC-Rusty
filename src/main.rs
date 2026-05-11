@@ -1041,7 +1041,7 @@ async fn pos_kf_task() {
         // separately so altitude-only modes (alt-hold) can engage on
         // baro alone while position-modes (pos-hold, RTH, rescue) stay
         // gated on `home_latched`.
-        let altitude_ready = baro_calibrated || home_latched;
+         let altitude_ready =(last_baro_t.elapsed() < Duration::from_secs(1)) || home_latched;
 
         // ---- Publish estimate ----
         let s = kf.state();
