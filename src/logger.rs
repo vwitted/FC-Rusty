@@ -1,55 +1,54 @@
-// logger.rs — defmt global logger over USART6 TX (PC6)
+// logger.rs — defmt global logger over UART7 TX (PE8)
 //
 // Target board: GEPRCTAKERH743
-// USART6 TX is on PC6 (AF7). This maps to SERIAL6 / T6 pad — a
-// physically accessible user/GP port, leaving all protocol-assigned
-// ports free:
+// UART7 TX is on PE8 (AF7). This maps to SERIAL7 — a physically
+// accessible user/GP port, leaving all protocol-assigned ports free:
 //   USART1 → DisplayPort/VTX, USART2 → RC input, USART3 → BT
-//   UART4 → GPS, UART5 → (reserved), UART7/8 → user.
+//   UART4 → GPS, UART5 → (reserved), USART6 → user, UART8 → ESC telem.
 //
 // Implementation notes:
-//   * We bypass Embassy's UART driver and poke USART6 registers
+//   * We bypass Embassy's UART driver and poke UART7 registers
 //     directly using the `pac` module. The logger is called from many
 //     tasks and interrupts; keeping it raw avoids lock contention with
 //     any Embassy-owned DMA transfers and keeps the Logger trait
 //     implementation entirely synchronous.
-//   * `init_usart6()` MUST be called after `embassy_stm32::init()`
-//     has configured the clock tree — it assumes APB2 = 120 MHz.
-//   * Defmt calls made before `init_usart6()` silently drop their
+//   * `init_uart7()` MUST be called after `embassy_stm32::init()`
+//     has configured the clock tree — it assumes APB1 = 120 MHz.
+//   * Defmt calls made before `init_uart7()` silently drop their
 //     bytes (guarded by the INITIALIZED flag).
 
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_stm32::pac;
 
-/// Configure USART6 TX on PC6 at 115200 baud 8N1.
+/// Configure UART7 TX on PE8 at 115200 baud 8N1.
 ///
 /// Call once after `embassy_stm32::init()` — this function assumes
-/// the clock tree is already set up with APB2 = 120 MHz.
-pub fn init_usart6() {
-    // USART6 is on APB2 (not APB1 like UART4–8).
-    const APB2_HZ: u32 = 120_000_000;
+/// the clock tree is already set up with APB1 = 120 MHz.
+pub fn init_uart7() {
+    // UART7 is on APB1.
+    const APB1_HZ: u32 = 120_000_000;
     const BAUD: u32 = 115_200;
     // BRR = fck / baud for OVER8=0 (the reset default).
-    let brr = (APB2_HZ + BAUD / 2) / BAUD;
+    let brr = (APB1_HZ + BAUD / 2) / BAUD;
 
     // Enable peripheral clocks using PAC
-    // For STM32H7, GPIOC is on AHB4. USART6 is on APB2.
-    pac::RCC.ahb4enr().modify(|w| w.set_gpiocen(true));
-    pac::RCC.apb2enr().modify(|w| w.set_usart6en(true));
+    // For STM32H7, GPIOE is on AHB4. UART7 is on APB1.
+    pac::RCC.ahb4enr().modify(|w| w.set_gpioeen(true));
+    pac::RCC.apb1lenr().modify(|w| w.set_uart7en(true));
 
-    let gpioc = pac::GPIOC;
+    let gpioe = pac::GPIOE;
 
-    // PC6 -> AF7 (USART6_TX)
-    // PC6 is pin 6, which lives in AFRL (afr(0)), position 6.
-    gpioc.moder().modify(|w| w.set_moder(6, pac::gpio::vals::Moder::ALTERNATE));
-    gpioc.otyper().modify(|w| w.set_ot(6, pac::gpio::vals::Ot::PUSH_PULL));
-    gpioc.ospeedr().modify(|w| w.set_ospeedr(6, pac::gpio::vals::Ospeedr::VERY_HIGH_SPEED));
-    gpioc.pupdr().modify(|w| w.set_pupdr(6, pac::gpio::vals::Pupdr::FLOATING));
-    gpioc.afr(0).modify(|w| w.set_afr(6, 7)); // AF7
+    // PE8 -> AF7 (UART7_TX)
+    // PE8 is pin 8, which lives in AFRH (afr(1)), position 0.
+    gpioe.moder().modify(|w| w.set_moder(8, pac::gpio::vals::Moder::ALTERNATE));
+    gpioe.otyper().modify(|w| w.set_ot(8, pac::gpio::vals::Ot::PUSH_PULL));
+    gpioe.ospeedr().modify(|w| w.set_ospeedr(8, pac::gpio::vals::Ospeedr::VERY_HIGH_SPEED));
+    gpioe.pupdr().modify(|w| w.set_pupdr(8, pac::gpio::vals::Pupdr::FLOATING));
+    gpioe.afr(1).modify(|w| w.set_afr(0, 7)); // AF7
 
-    // USART6
-    let usart = pac::USART6;
+    // UART7
+    let usart = pac::UART7;
     usart.brr().write(|w| w.set_brr(brr as u16));
     usart.cr1().write(|w| {
         w.set_ue(true);
@@ -68,7 +67,7 @@ fn putc(byte: u8) {
     if !INITIALIZED.load(Ordering::Relaxed) {
         return; // pre-init defmt calls are dropped
     }
-    let usart = pac::USART6;
+    let usart = pac::UART7;
     while !usart.isr().read().txe() {}
     usart.tdr().write(|w| w.set_dr(byte as u16));
 }
@@ -105,7 +104,7 @@ unsafe impl defmt::Logger for Logger {
     }
 
     unsafe fn flush() {
-        let usart = pac::USART6;
+        let usart = pac::UART7;
         while !usart.isr().read().tc() {}
     }
 

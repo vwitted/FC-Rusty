@@ -9,7 +9,8 @@
 //   SERIAL2 -> USART2 (RC Input/CRSF, TX=PA2, RX=PA3)
 //   SERIAL3 -> USART3 (Bluetooth, TX=PB10, RX=PB11)
 //   SERIAL4 -> UART4  (GPS, TX=PA0, RX=PA1)
-//   SERIAL6 -> USART6 (User / Logger, TX=PC6, RX=PC7)
+//   SERIAL6 -> USART6 (User, TX=PC6, RX=PC7)
+//   SERIAL7 -> UART7  (Logger, TX=PE8, RX=PE7)
 //   SERIAL8 -> UART8  (ESC Telemetry, TX=PE1, RX=PE0)
 //
 // The onboard MPU6000 and ICM-42688P sensors are used as the dual IMU:
@@ -153,7 +154,7 @@ const FAILSAFE_BLIND_THROTTLE_FRAC: f32 = 0.9;
 
 // ---- Interrupt bindings ----
 
-// USART6 is owned by `logger::init_usart6()` (raw register TX for defmt)
+// UART7 is owned by `logger::init_uart7()` (raw register TX for defmt)
 // — no Embassy interrupt handler needed here.
 bind_interrupts!(struct Irqs {
     USART2 => usart::InterruptHandler<peripherals::USART2>;
@@ -324,9 +325,9 @@ async fn main(spawner: Spawner) {
     let mut core = cortex_m::Peripherals::take().unwrap();
     core.SCB.disable_dcache(&mut core.CPUID);
 
-    // Bring up USART6 TX (PC6) for defmt output before anything else
+    // Bring up UART7 TX (PE8) for defmt output before anything else
     // so the first defmt::info! below actually lands on the wire.
-    logger::init_usart6();
+    logger::init_uart7();
 
     // ---- Status LED Heartbeat ----
     // DAKEFPVH743 has LED0 on PD10 (active low). We spawn a quick blink

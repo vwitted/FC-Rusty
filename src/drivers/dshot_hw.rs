@@ -251,6 +251,10 @@ impl<'d> DshotQuad<'d> {
 
         self.frame_count = self.frame_count.wrapping_add(1);
 
+        if self.frame_count.is_multiple_of(800) {
+            self.log_runtime_state();
+        }
+
         [frame1, frame2, frame3, frame4]
     }
 
