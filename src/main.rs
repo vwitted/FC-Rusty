@@ -1001,12 +1001,16 @@ async fn pos_kf_task() {
         // Pressure is stored on every sample so ARM_LATCH can latch
         // p_ref against the most recent reading. Fusion is gated on
         // `baro_calibrated`, which flips true at arm.
+        // `last_baro_t` tracks sample freshness (not fusion) so the
+        // arm FSM's `baro_ready` gate can clear before arm — otherwise
+        // baro-only arming deadlocks against the ARM_LATCH that would
+        // enable fusion.
         if let Some(baro) = BARO_DATA.try_take() {
             last_baro_pressure = Some(baro.pressure_pa);
+            last_baro_t = Instant::now();
             if baro_calibrated {
                 let alt_up = baro::pressure_to_altitude_m(baro.pressure_pa, p_ref_pa);
                 kf.update_baro(alt_up);
-                last_baro_t = Instant::now();
                 baro_updates_sec = baro_updates_sec.wrapping_add(1);
             }
         }
