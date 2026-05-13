@@ -32,6 +32,18 @@
 //   than `accel_gate` — rejects high-g and free-fall, and a small
 //   dead-band suppresses update-chatter during hover.
 //
+// Update (mag heading reference): runs at the magnetometer rate (100 Hz
+// for the LIS2MDL). Same shape as the accel update:
+//   h(q) = R(q)ᵀ · m_ref_nav   (unit reference field rotated into body)
+//   H    = [ [h]×, 0 ]          (body-frame error convention)
+//   z    = m_body / ‖m_body‖
+//   Innovation-gated: skipped if the normalised innovation magnitude
+//   exceeds `mag_gate`. The reference field is a *unit* vector; magnitude
+//   information is discarded, so hard-iron / scale errors don't leak into
+//   attitude. Yaw becomes fully observable once this update is fusing;
+//   roll/pitch are jointly constrained by accel+mag (the accel update
+//   dominates because gravity is a much stiffer reference at 1 g).
+//
 // Output units (caller's responsibility to convert):
 //   `euler()` returns radians; main.rs converts to degrees for ImuData.
 //   Accel input is in g; main.rs converts g → m/s² at the ImuData boundary.
@@ -56,6 +68,16 @@ pub struct MekfParams {
     pub sigma_a: f32,
     /// Reject accel update if |‖a‖g − 1| > this. 0.3 rejects >1.3g / <0.7g.
     pub accel_gate: f32,
+    /// Mag measurement noise (unit-vector scale). LIS2MDL HR+LPF is ~3
+    /// mgauss RMS on a nominal ~500 mgauss field → noise/signal ≈ 0.006;
+    /// inflated here to cover hard/soft-iron and motor-current disturbance.
+    pub sigma_m: f32,
+    /// Reject mag update if the unit-vector innovation magnitude
+    /// (‖z − h‖) exceeds this. ~0.5 corresponds to a ~30° deviation
+    /// from the reference direction — rejects severe local disturbance
+    /// (current-carrying wires, ferrous structure) without choking the
+    /// filter during normal manoeuvring.
+    pub mag_gate: f32,
     /// Initial attitude 1σ (rad) on [roll, pitch, yaw].
     pub init_sigma_att: [f32; 3],
     /// Initial bias 1σ (rad/s) per axis.
@@ -69,6 +91,8 @@ impl Default for MekfParams {
             sigma_bw:   1.0e-5,  // rad/s/√Hz  — slow bias walk
             sigma_a:    0.08,    // unit vector — accounts for vibration
             accel_gate: 0.3,
+            sigma_m:    0.1,     // unit vector — covers hard/soft iron + EMI
+            mag_gate:   0.5,     // ~30° from reference direction
             // Seeded from accel → roll/pitch ~observable (~2°), yaw not (~90°).
             init_sigma_att: [0.035, 0.035, FRAC_PI_2],
             init_sigma_bias: 0.02, // ~1.1 °/s
@@ -85,6 +109,13 @@ pub struct AttitudeMekf {
     bias: Vector3<f32>,
     /// Error-state covariance: diag blocks are δθ (3) then δb (3).
     p: SMatrix<f32, 6, 6>,
+    /// Reference geomagnetic field as a unit vector in the nav frame
+    /// (NED). Zero when no reference has been set — `update_mag` is a
+    /// no-op in that state.
+    mag_ref: Vector3<f32>,
+    /// True once `mag_ref` has been seeded (either by the caller or
+    /// auto-seeded from the first reading). `update_mag` requires this.
+    mag_ref_set: bool,
     params: MekfParams,
 }
 
@@ -99,6 +130,8 @@ impl AttitudeMekf {
             q: [1.0, 0.0, 0.0, 0.0],
             bias: Vector3::zeros(),
             p,
+            mag_ref: Vector3::zeros(),
+            mag_ref_set: false,
             params,
         }
     }
@@ -262,6 +295,122 @@ impl AttitudeMekf {
         true
     }
 
+    /// Set the nav-frame reference geomagnetic field directly. The
+    /// stored reference is always a unit vector — magnitude is
+    /// discarded so hard-iron / scale errors can't leak into attitude.
+    /// Returns false if the input has effectively zero magnitude.
+    pub fn set_mag_reference(&mut self, mag_ref_nav: [f32; 3]) -> bool {
+        let v = Vector3::new(mag_ref_nav[0], mag_ref_nav[1], mag_ref_nav[2]);
+        let n = v.norm();
+        if n < 1e-6 {
+            return false;
+        }
+        self.mag_ref = v / n;
+        self.mag_ref_set = true;
+        true
+    }
+
+    /// Seed `mag_ref` from the first body-frame mag reading using the
+    /// current quaternion (which should already have been seeded from
+    /// accel). The filter then treats the boot heading as 0 yaw — the
+    /// reference encodes "the field, in nav coords, at boot". Subsequent
+    /// `update_mag` calls keep yaw self-consistent with that boot
+    /// heading; absolute (true-north) heading needs an external source
+    /// (declination + GPS) and a follow-up `set_mag_reference`.
+    pub fn initialize_mag_from_first(&mut self, mag_body: [f32; 3]) -> bool {
+        // Rotate body → nav with current q, then unit-normalise.
+        let v_body = Vector3::new(mag_body[0], mag_body[1], mag_body[2]);
+        if v_body.norm() < 1e-6 {
+            return false;
+        }
+        let v_nav = r_bn_mul(&self.q, &v_body);
+        self.set_mag_reference([v_nav[0], v_nav[1], v_nav[2]])
+    }
+
+    /// Whether `mag_ref` has been seeded (true after either
+    /// `set_mag_reference` or `initialize_mag_from_first`).
+    pub fn mag_initialized(&self) -> bool {
+        self.mag_ref_set
+    }
+
+    /// Magnetometer-reference update. `mag_body` is the raw field in any
+    /// consistent unit (µT, mgauss, …) — only the direction is used.
+    /// Returns true if the update was applied (innovation gate passed
+    /// and the reference is set).
+    pub fn update_mag(&mut self, mag_body: [f32; 3]) -> bool {
+        if !self.mag_ref_set {
+            return false;
+        }
+        let m = Vector3::new(mag_body[0], mag_body[1], mag_body[2]);
+        let norm = m.norm();
+        if norm < 1e-6 {
+            return false;
+        }
+        let z = m / norm;
+
+        // Predicted unit field in body: h = R(q)ᵀ · m_ref_nav.
+        // r_bn_mul gives R(q) · v_body; we want R(q)ᵀ · v_nav, so reuse
+        // the helper with the inverse rotation.
+        let h = r_nb_mul(&self.q, &self.mag_ref);
+
+        // Innovation y = z − h. Magnitude-gate before paying for the
+        // matrix ops — a saturated mag reading or strong local field
+        // distortion blows past `mag_gate` and we skip the update.
+        let y = z - h;
+        if y.norm() > self.params.mag_gate {
+            return false;
+        }
+
+        // H = [ [h]×, 0 ]  (body-frame error convention — same shape as
+        // the accel update; only the reference vector changes).
+        let hx = skew(&h);
+
+        let p_tt = self.p.fixed_view::<3, 3>(0, 0).into_owned();
+        let p_tb = self.p.fixed_view::<3, 3>(0, 3).into_owned();
+        let hp_tt = hx * p_tt;
+        let mut s = hp_tt * hx.transpose();
+        let r_meas = self.params.sigma_m * self.params.sigma_m;
+        for i in 0..3 {
+            s[(i, i)] += r_meas;
+        }
+
+        let p_bt = p_tb.transpose();
+        let ph_top = p_tt * hx.transpose();
+        let ph_bot = p_bt * hx.transpose();
+        let s_inv = match s.try_inverse() {
+            Some(m) => m,
+            None => return false,
+        };
+        let k_top = ph_top * s_inv;
+        let k_bot = ph_bot * s_inv;
+
+        let d_theta = k_top * y;
+        let d_bias  = k_bot * y;
+
+        let dq = [1.0, d_theta[0] * 0.5, d_theta[1] * 0.5, d_theta[2] * 0.5];
+        self.q = quat_mul(self.q, dq);
+        quat_normalize(&mut self.q);
+
+        self.bias += d_bias;
+
+        let kh_tt = k_top * hx;
+        let kh_bt = k_bot * hx;
+        let mut kh = SMatrix::<f32, 6, 6>::zeros();
+        for i in 0..3 {
+            for j in 0..3 {
+                kh[(i, j)]         = kh_tt[(i, j)];
+                kh[(3 + i, j)]     = kh_bt[(i, j)];
+            }
+        }
+        let i6 = SMatrix::<f32, 6, 6>::identity();
+        self.p = (i6 - kh) * self.p;
+
+        let pt = self.p.transpose();
+        self.p = (self.p + pt) * 0.5;
+
+        true
+    }
+
     /// Euler angles [roll, pitch, yaw] in radians (3-2-1 Tait-Bryan).
     pub fn euler(&self) -> [f32; 3] {
         quat_to_euler(&self.q)
@@ -310,6 +459,47 @@ fn r_bn_row_z(q: &[f32; 4]) -> Vector3<f32> {
         2.0 * (x * z - w * y),
         2.0 * (y * z + w * x),
         w * w - x * x - y * y + z * z,
+    )
+}
+
+/// Apply R(q) to a body-frame vector (returns the vector in nav frame).
+/// Direct quaternion sandwich: v_nav = q ⊗ [0, v_body] ⊗ q*.
+fn r_bn_mul(q: &[f32; 4], v: &Vector3<f32>) -> Vector3<f32> {
+    let w = q[0]; let x = q[1]; let y = q[2]; let z = q[3];
+    // R(q) row-by-row (body→nav rotation matrix from Hamilton quaternion).
+    let r00 = w * w + x * x - y * y - z * z;
+    let r01 = 2.0 * (x * y - w * z);
+    let r02 = 2.0 * (x * z + w * y);
+    let r10 = 2.0 * (x * y + w * z);
+    let r11 = w * w - x * x + y * y - z * z;
+    let r12 = 2.0 * (y * z - w * x);
+    let r20 = 2.0 * (x * z - w * y);
+    let r21 = 2.0 * (y * z + w * x);
+    let r22 = w * w - x * x - y * y + z * z;
+    Vector3::new(
+        r00 * v[0] + r01 * v[1] + r02 * v[2],
+        r10 * v[0] + r11 * v[1] + r12 * v[2],
+        r20 * v[0] + r21 * v[1] + r22 * v[2],
+    )
+}
+
+/// Apply R(q)ᵀ to a nav-frame vector (returns the vector in body frame).
+fn r_nb_mul(q: &[f32; 4], v: &Vector3<f32>) -> Vector3<f32> {
+    let w = q[0]; let x = q[1]; let y = q[2]; let z = q[3];
+    let r00 = w * w + x * x - y * y - z * z;
+    let r01 = 2.0 * (x * y - w * z);
+    let r02 = 2.0 * (x * z + w * y);
+    let r10 = 2.0 * (x * y + w * z);
+    let r11 = w * w - x * x + y * y - z * z;
+    let r12 = 2.0 * (y * z - w * x);
+    let r20 = 2.0 * (x * z - w * y);
+    let r21 = 2.0 * (y * z + w * x);
+    let r22 = w * w - x * x - y * y + z * z;
+    // R(q)ᵀ — transpose of the above.
+    Vector3::new(
+        r00 * v[0] + r10 * v[1] + r20 * v[2],
+        r01 * v[0] + r11 * v[1] + r21 * v[2],
+        r02 * v[0] + r12 * v[1] + r22 * v[2],
     )
 }
 
@@ -393,5 +583,81 @@ mod tests {
         let p = [0.5, 0.5, 0.5, 0.5];
         assert_eq!(quat_mul(q, p), p);
         assert_eq!(quat_mul(p, q), p);
+    }
+
+    #[test]
+    fn mag_update_no_op_without_reference() {
+        let mut m = AttitudeMekf::new(MekfParams::default());
+        m.initialize_from_accel([0.0, 0.0, -1.0]);
+        assert!(!m.mag_initialized());
+        // Should be a no-op (no panic, returns false) without a reference.
+        assert!(!m.update_mag([20.0, 0.0, 35.0]));
+    }
+
+    #[test]
+    fn mag_update_corrects_yaw_drift() {
+        // Sit level; seed reference from "north pointing" body field.
+        let mut m = AttitudeMekf::new(MekfParams::default());
+        m.initialize_from_accel([0.0, 0.0, -1.0]);
+
+        // Mid-latitude-ish: 60° inclination, all in NED.
+        // Body == nav at boot, so the body reading equals the reference.
+        let mag_body_boot = [0.5_f32, 0.0, 0.866];
+        assert!(m.initialize_mag_from_first(mag_body_boot));
+        assert!(m.mag_initialized());
+
+        // Now rotate the *quaternion* by +30° yaw — simulating gyro
+        // drift the filter doesn't know about. The body-frame mag a
+        // stationary chip would read becomes the reference rotated by
+        // R(q_drift)ᵀ.
+        let yaw_drift = 30.0_f32.to_radians();
+        m.q = euler_to_quat(0.0, 0.0, yaw_drift);
+
+        // Measured body field (truth chip at yaw=0): rotate the nav
+        // reference into the *true* (yaw=0) body, which is the same as
+        // the boot reading — but the filter believes the body frame is
+        // rotated 30° from nav, so it expects something else.
+        let z = mag_body_boot;
+
+        // Fuse the mag a few times; level accel stays consistent so the
+        // accel update doesn't pull pitch/roll either.
+        for _ in 0..200 {
+            m.predict([0.0, 0.0, 0.0], 1.0 / 8000.0);
+            m.update_accel([0.0, 0.0, -1.0]);
+            m.update_mag(z);
+        }
+
+        let [_r, _p, y] = m.euler();
+        // Filter should have walked yaw back toward 0.
+        assert!(y.abs() < 5.0_f32.to_radians(), "residual yaw = {} deg",
+                y.to_degrees());
+    }
+
+    #[test]
+    fn mag_update_innovation_gate_rejects_garbage() {
+        let mut m = AttitudeMekf::new(MekfParams::default());
+        m.initialize_from_accel([0.0, 0.0, -1.0]);
+        m.set_mag_reference([1.0, 0.0, 0.0]); // pure north for the test
+        // Reading 180° flipped from reference — innovation magnitude is 2,
+        // which exceeds the default gate of 0.5.
+        assert!(!m.update_mag([-1.0, 0.0, 0.0]));
+    }
+
+    #[test]
+    fn mag_reference_is_normalised() {
+        let mut m = AttitudeMekf::new(MekfParams::default());
+        // Pass a non-unit reference; stored vector must be a unit vector.
+        assert!(m.set_mag_reference([300.0, 0.0, 400.0]));
+        let n = m.mag_ref.norm();
+        assert!((n - 1.0).abs() < 1e-6, "mag_ref norm = {}", n);
+    }
+
+    #[test]
+    fn r_bn_and_r_nb_are_inverse() {
+        // Random-ish quaternion (45° about x).
+        let q = euler_to_quat(0.5, -0.3, 0.7);
+        let v = Vector3::new(1.0, 2.0, 3.0);
+        let rt = r_nb_mul(&q, &r_bn_mul(&q, &v));
+        assert!((rt - v).norm() < 1e-5);
     }
 }

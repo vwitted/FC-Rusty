@@ -22,6 +22,7 @@ material hardware or design change lands (see `CLAUDE.md`).
 | SPI1 + PA4               | MPU6000 IMU1 (onboard)             | ✅ verified — 8 kHz reads, MEKF fusing         |
 | SPI2 + PB12              | ICM-42688P IMU2 (onboard)          | ✅ verified — 8 kHz reads, averaged with IMU1  |
 | I2C1 (PB8/PB9)           | SPL06 barometer (onboard)          | ✅ proper driver — 128 Hz, correct calibration |
+| I2C1 (PB8/PB9)           | LIS2MDL magnetometer (breakout)    | ✅ wired in — 100 Hz, fused into MEKF for yaw  |
 | TIM3 (PB0/PB1/PB5/PB4)   | DShot600, motors M1–M4             | ✅ verified — all four motors spin on arm      |
 | PD10                     | Status LED (active low)            | ✅ heartbeat blink task                        |
 | USB-C                    | DFU flashing                       | ✅ verified — no SWD on this board             |
@@ -53,7 +54,15 @@ material hardware or design change lands (see `CLAUDE.md`).
 - **Attitude**: MPU6000 and ICM-42688P dual IMUs read at 8 kHz via SPI. MEKF fusing accel (100 Hz update)
   and gyro (8 kHz predict). Gyro bias bounded to 0.3–0.5 dps; innovation
   gate rejects ~0% at rest and ~25% under aggressive motion. Sensor
-  frames mapped to NED.
+  frames mapped to NED. **Yaw is observable**: LIS2MDL magnetometer
+  on I2C1 (shared with SPL06) at 100 Hz feeds `AttitudeMekf::update_mag`
+  with a 3-vector body-frame measurement model and innovation gate.
+  Reference field is auto-seeded from the first reading after the
+  accel seed (so boot heading defines yaw = 0); true-north requires a
+  future `set_mag_reference` call from a GPS/declination source.
+  Hard-iron / soft-iron calibration is still on the post-Alpha
+  backlog — for now we rely on `OFF_CANC` and unit-vector update
+  semantics to absorb modest residuals.
 - **Position**: 6-state linear PosKF (pn, pe, pz, vn, ve, vz) running
   at 100 Hz predict. Baro and GPS fuse as independent measurement
   paths — pilot decides what to fly with via the soft arm gate
@@ -175,13 +184,18 @@ material hardware or design change lands (see `CLAUDE.md`).
   USART3 (ESC telemetry pad) is free; needs wiring and a bidirectional
   DShot + telemetry-decode driver.
 
-- **Magnetometer calibration.** The onboard magnetometer is not yet used
-  (zeroed out in `ImuData`). Before it can correct yaw drift, a
-  calibration mode is needed: ~1 minute where the pilot can move the
-  drone through full rotation on all three axes, collecting min/max field
-  readings for sphere-fitting (hard-iron + soft-iron correction). The FC
-  needs to detect when sufficient coverage has been collected and store
-  the result. No implementation exists yet.
+- **Magnetometer calibration.** The LIS2MDL is now fused into the
+  MEKF (3-vector update at 100 Hz, gated on innovation magnitude) and
+  the chip's own `OFF_CANC` handles small hard-iron offsets, but full
+  sphere-fit hard-iron + soft-iron calibration is still pending. The
+  fusion currently auto-seeds the nav-frame reference from the first
+  reading, which makes boot heading the zero-yaw datum — fine for
+  drift correction but not for true-north heading. Calibration mode
+  needed: ~1 minute where the pilot moves the drone through full
+  rotation on all three axes, collecting min/max field readings, FC
+  detects when coverage is sufficient and persists the result; then
+  inject local declination + sphere-fit centre to lock yaw to
+  true-north. No implementation yet.
 
 - ~~**SPL06 barometer driver.**~~ Done. `drivers/baro.rs` now has a
   proper `Spl06` struct reading calibration from the correct register
@@ -221,20 +235,19 @@ material hardware or design change lands (see `CLAUDE.md`).
       cross-checking against ICM samples needs to scale, not compare
       raw counts.
 
-- **LIS2MDL magnetometer breakout (Beta).** STMicro 3-axis mag (LGA-12)
-  — driver `drivers/lis2mdl.rs` is written, compiles, and is
-  intentionally unreferenced from `main.rs` until the breakout
-  arrives. I2C-only path (fixed addr `0x1E`); intended to share the
-  same I2C peripheral as the SPL06 baro. Configured for 100 Hz
-  continuous mode in high-resolution power mode with COMP_TEMP_EN,
-  OFF_CANC, BDU and the digital LPF (BW = 25 Hz) all on. WHO_AM_I =
-  `0x40`; output registers are **little-endian**. Sensitivity is
-  1.5 mgauss/LSB (`SENS_UT_PER_LSB = 0.15`) — diagnostic temperature
-  is the internal die sensor at 8 LSB/°C with no documented zero
-  offset. No interrupt pin wired; `data_ready()` polls
-  `STATUS_REG.Zyxda`. Hard-iron calibration / world-frame heading
-  fusion is still a separate post-Alpha task — see
-  "Magnetometer calibration" in the backlog above.
+- **LIS2MDL magnetometer.** Wired in 2026-05-13. STMicro 3-axis mag
+  (LGA-12) over I2C1 at fixed addr `0x1E`, sharing the bus with the
+  SPL06 baro and owned by the same `baro_task` so no bus arbitration
+  is needed. Configured for 100 Hz continuous HR mode with
+  COMP_TEMP_EN, OFF_CANC, BDU and the digital LPF (BW = 25 Hz) all on.
+  Polled at 125 Hz alongside the baro; fresh samples are published on
+  `MAG_DATA` and consumed by `mekf_task` via `try_take`. The mekf
+  calls `update_mag` with a unit-vector 3-axis measurement model that
+  mirrors the accel update structure (body-frame δθ Jacobian,
+  innovation-gated at ~30° deviation). A mag-init failure leaves the
+  MEKF running without yaw fusion exactly as before. Outstanding:
+  hard/soft-iron sphere-fit calibration and declination-based
+  true-north reference — see "Magnetometer calibration" backlog.
 
 ---
 
@@ -251,7 +264,7 @@ All host-tested (`cargo test --lib --no-default-features --target x86_64-unknown
 | Quad-X mixer     | `control/mixer.rs`       | Airmode + no-airmode paths, phantom-thrust prevention         |
 | Arming FSM       | `control/arming.rs`      | Pre-arm (thr/lvl/imu/rc/altitude_ref), soft baro-or-GPS gate, failsafe-on-RC-loss (never disarms; control loop chooses descent), IMU-loss-only auto-disarm |
 | PosKF            | `estimation.rs`          | 6-state linear KF; GPS position + GPS velocity + baro + IMU predict |
-| MEKF             | `attitude_mekf.rs`       | Quaternion MEKF with gyro-bias state, 8 kHz predict          |
+| MEKF             | `attitude_mekf.rs`       | Quaternion MEKF with gyro-bias state, 8 kHz predict, 100 Hz accel + 100 Hz mag updates |
 | CRSF parser      | `drivers/crsf.rs`        | Byte streaming, 11-bit unpack, link stats, CRC8              |
 | NMEA parser      | `drivers/nmea.rs`        | GGA/RMC/GSA/VTG, 3D fix detection, checksum                  |
 | UBX parser       | `drivers/ubx.rs`         | u-blox binary protocol — written, not yet active             |
@@ -260,7 +273,7 @@ All host-tested (`cargo test --lib --no-default-features --target x86_64-unknown
 | ISM6HG256X driver | `drivers/ism6hg256x.rs` | ±16 g / ±4000 dps / 7.68 kHz, SPI; written for Beta breakout, unreferenced |
 | MPU6000 driver   | `drivers/mpu6000.rs`     | ±16 g / ±2000 dps / 8 kHz, SPI; written for GEPRC TAKER H743 (IMU1)      |
 | ICM42688P driver | `drivers/icm42688.rs`    | ±16 g / ±2000 dps / 8 kHz, SPI; written for H743 boards (IMU1 &2 on DAKEFPV and IMU2 on GEPRC TAKER H743)      |
-| LIS2MDL driver   | `drivers/lis2mdl.rs`     | 3-axis mag, I2C addr 0x1E, 100 Hz HR + LPF + OFF_CANC; written for Beta breakout, unreferenced |
+| LIS2MDL driver   | `drivers/lis2mdl.rs`     | 3-axis mag, I2C addr 0x1E, 100 Hz HR + LPF + OFF_CANC; wired into baro_task + fused in MEKF |
 | DShot driver     | `drivers/dshot_hw.rs`    | TIM2 DMAR burst, DShot600, all 4 channels simultaneously     |
 | Physics sim      | `sim/sim.rs`             | 6DOF rigid body, τ=30ms motor lag, NED, ground collision     |
 | Sensor sim       | `sim/sensors.rs`         | GPS (10 Hz + noise), baro (50 Hz + noise/drift), xorshift64  |
