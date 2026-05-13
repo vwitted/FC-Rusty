@@ -1,5 +1,7 @@
-// Module is compiled but intentionally unreferenced until the breakout
-// brings the LIS2MDL online — silence dead_code so the build stays quiet.
+// Production firmware uses `init` + `read`; the rest of the driver
+// surface (diagnostic temperature, data-ready polling, alternate unit
+// accessors) is kept available for bring-up and bench debugging but
+// would otherwise trip dead_code in the binary crate.
 #![allow(dead_code)]
 
 // lis2mdl.rs — STMicro LIS2MDL 3-axis magnetometer driver over I2C.

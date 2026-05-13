@@ -82,6 +82,7 @@ use control::pid::{PidGains, PidLimits, RatePidController};
 use control::position::{PositionController, PositionGains};
 use drivers::baro::{self, BaroSample};
 use drivers::crsf::RcChannels;
+use drivers::lis2mdl::{Lis2mdl, MagSample, Orientation as MagOrientation};
 use drivers::dshot_hw::DshotQuad;
 use uf_dshot::{Command, DshotSpeed, DshotTx, EncodedFrame};
 use drivers::icm42688::RawImu;
@@ -228,6 +229,15 @@ static GPS_DATA_FOR_KF: Signal<CriticalSectionRawMutex, GpsData> = Signal::new()
 /// Latest baro sample (pressure_pa + temperature_c) from the baro task.
 /// Consumed by `pos_kf_task` to drive the position-KF `update_baro`.
 static BARO_DATA: Signal<CriticalSectionRawMutex, BaroSample> = Signal::new();
+
+/// Latest LIS2MDL magnetometer sample (body-frame, oriented). Signalled
+/// by the baro task at 100 Hz (the chip's continuous-mode ODR — the
+/// LIS2MDL shares the I2C1 bus with the baro and is owned by the same
+/// task so no bus arbitration is needed). Consumed by `mekf_task`
+/// where it feeds `AttitudeMekf::update_mag`, making yaw observable.
+/// Absent when the breakout failed to init — `mekf_task` simply runs
+/// without the mag update branch in that case.
+static MAG_DATA: Signal<CriticalSectionRawMutex, MagSample> = Signal::new();
 
 /// Latest fused IMU data intended for the position KF (*separate* from
 /// `IMU_DATA`, which the control loop already consumes). Signalled by
@@ -808,6 +818,9 @@ async fn mekf_task() {
     let mut last_report = Instant::now();
     let mut updates_applied: u32 = 0;
     let mut updates_rejected: u32 = 0;
+    let mut mag_applied: u32 = 0;
+    let mut mag_rejected: u32 = 0;
+    let mut last_mag_ut: [f32; 3] = [0.0; 3];
 
     loop {
         let raw = RAW_IMU.wait().await;
@@ -832,6 +845,37 @@ async fn mekf_task() {
                 updates_rejected = updates_rejected.wrapping_add(1);
             }
         }
+
+        // Magnetometer update: try_take is non-blocking and runs on
+        // whichever IMU sample happens to coincide with a fresh mag
+        // reading. The mag task signals at ~100 Hz; at 8 kHz IMU rate
+        // we hit a fresh sample roughly once every 80 iterations,
+        // matching the accel-update cadence by coincidence rather than
+        // by design — they're independent paths.
+        //
+        // The very first mag sample seeds the reference vector using
+        // the current attitude (already accel-seeded plus calibration),
+        // so subsequent updates measure deviation from boot heading.
+        // Absolute (true-north) heading needs a future declination +
+        // GPS heading injection via `set_mag_reference`.
+        if let Some(mag) = MAG_DATA.try_take() {
+            let ut = mag.ut();
+            last_mag_ut = ut;
+            if !mekf.mag_initialized() {
+                if mekf.initialize_mag_from_first(ut) {
+                    defmt::info!(
+                        "MEKF mag reference seeded: ut=[{=f32},{=f32},{=f32}] |M|={=f32}uT",
+                        ut[0], ut[1], ut[2],
+                        libm::sqrtf(ut[0]*ut[0] + ut[1]*ut[1] + ut[2]*ut[2]),
+                    );
+                }
+            } else if mekf.update_mag(ut) {
+                mag_applied = mag_applied.wrapping_add(1);
+            } else {
+                mag_rejected = mag_rejected.wrapping_add(1);
+            }
+        }
+
         sample_count = sample_count.wrapping_add(1);
 
         // Bias-corrected gyro in °/s — this is what downstream PID expects.
@@ -844,6 +888,15 @@ async fn mekf_task() {
 
         let a_g = raw.accel_g();
         let euler_rad = mekf.euler();
+        // Pack body-frame mag into the legacy ImuData mag slot in
+        // mgauss × 10 (so 1 LSB = 0.1 mgauss = 0.01 µT) — wide enough
+        // to hold ±32k mgauss in i16. Downstream consumers don't fuse
+        // this; it's there for logging and future user-facing displays.
+        let mag_i16 = [
+            (last_mag_ut[0] * 100.0) as i16,
+            (last_mag_ut[1] * 100.0) as i16,
+            (last_mag_ut[2] * 100.0) as i16,
+        ];
         let imu = ImuData {
             accel: [a_g[0] * G_MPS2, a_g[1] * G_MPS2, a_g[2] * G_MPS2],
             temperature: raw.temp_c(),
@@ -853,7 +906,7 @@ async fn mekf_task() {
                 euler_rad[1] * RAD2DEG,
                 euler_rad[2] * RAD2DEG,
             ],
-            mag: [0; 3],
+            mag: mag_i16,
             pressure: 0,
             altitude_cm: 0,
             quaternion: mekf.quaternion(),
@@ -877,10 +930,12 @@ async fn mekf_task() {
                     + (bias_rad[2] * RAD2DEG) * (bias_rad[2] * RAD2DEG),
             );
             defmt::info!(
-                "MEKF {} samples/s, upd={}/{}rej, euler=[{=f32},{=f32},{=f32}]deg, |bias|={=f32}dps",
+                "MEKF {} samples/s, accel_upd={}/{}rej, mag_upd={}/{}rej, euler=[{=f32},{=f32},{=f32}]deg, |bias|={=f32}dps",
                 sample_count,
                 updates_applied,
                 updates_rejected,
+                mag_applied,
+                mag_rejected,
                 euler_rad[0] * RAD2DEG,
                 euler_rad[1] * RAD2DEG,
                 euler_rad[2] * RAD2DEG,
@@ -889,6 +944,8 @@ async fn mekf_task() {
             sample_count = 0;
             updates_applied = 0;
             updates_rejected = 0;
+            mag_applied = 0;
+            mag_rejected = 0;
             last_report = now;
         }
     }
@@ -1308,12 +1365,40 @@ async fn baro_task(
         // against the boot-time init budget.
         init_failures = 0;
 
+        // ---- LIS2MDL magnetometer (same bus, optional) ----
+        // The mag shares I2C1 with the baro. We init it here so it can't
+        // get stuck waiting for the bus owner — if absent or DOA, we
+        // continue without mag fusion (yaw stays unobservable in the
+        // MEKF, exactly the pre-magnetometer behaviour). The chip is in
+        // 100 Hz continuous mode after init, so we just poll it once per
+        // tick (125 Hz) and let the chip's own ODR cap effective rate.
+        // Orientation::Identity is correct for the LIS2MDL breakout
+        // soldered with its X+ aligned to body forward; revise here if
+        // the airframe mounts it differently.
+        let mag = match Lis2mdl::init(&mut i2c, MagOrientation::Identity).await {
+            Ok(d) => {
+                defmt::info!("LIS2MDL magnetometer online @ 100 Hz");
+                Some(d)
+            }
+            Err(e) => {
+                defmt::warn!(
+                    "LIS2MDL init failed: {:?} — continuing without mag (yaw will drift)",
+                    e,
+                );
+                None
+            }
+        };
+
         // ---- Read loop ----
         // SPL06 configured at 128 Hz; tick at 8 ms (125 Hz) to consume
-        // each new sample without skipping.
+        // each new sample without skipping. LIS2MDL is 100 Hz so polling
+        // at 125 Hz yields ~20% duplicate samples — harmless, the MEKF
+        // does a try_take and just skips when no new data arrived.
         let mut ticker = Ticker::every(Duration::from_millis(8)); // 125 Hz
         let mut reads: u32 = 0;
         let mut errs: u32 = 0;
+        let mut mag_reads: u32 = 0;
+        let mut mag_errs: u32 = 0;
         let mut streak: u32 = 0;
         let mut last_report = Instant::now();
         let mut last_sample: Option<(BaroSample, Instant)> = None;
@@ -1333,36 +1418,61 @@ async fn baro_task(
                 }
             }
 
+            // Mag read shares the bus and is independent of baro success.
+            // A mag I2C error doesn't extend the baro recovery streak —
+            // they're separate devices and we don't want one bad mag
+            // read forcing a baro bus reset.
+            if let Some(m) = mag.as_ref() {
+                match m.read(&mut i2c) {
+                    Ok(s) => {
+                        MAG_DATA.signal(s);
+                        mag_reads = mag_reads.wrapping_add(1);
+                    }
+                    Err(_) => {
+                        mag_errs = mag_errs.wrapping_add(1);
+                    }
+                }
+            }
+
             if Instant::now() - last_report >= Duration::from_secs(1) {
                 match (reads, last_sample) {
                     (0, Some((s, t))) => {
                         let age_ms = (Instant::now() - t).as_millis() as u32;
                         defmt::info!(
-                            "Baro 0 reads/s, {} errs — bus stuck (last P={=f32}Pa T={=f32}C age={=u32}ms)",
+                            "Baro 0 reads/s, {} errs — bus stuck (last P={=f32}Pa T={=f32}C age={=u32}ms); mag {}/s, {} errs",
                             errs,
                             s.pressure_pa,
                             s.temperature_c,
                             age_ms,
+                            mag_reads,
+                            mag_errs,
                         );
                     }
                     (0, None) => {
-                        defmt::info!("Baro 0 reads/s, {} errs — bus stuck (no sample yet)", errs);
+                        defmt::info!(
+                            "Baro 0 reads/s, {} errs — bus stuck (no sample yet); mag {}/s, {} errs",
+                            errs, mag_reads, mag_errs,
+                        );
                     }
                     _ => {
                         let (p, t) = last_sample
                             .map(|(s, _)| (s.pressure_pa, s.temperature_c))
                             .unwrap_or((0.0, 0.0));
                         defmt::info!(
-                            "Baro {} reads/s, {} errs — P={=f32}Pa T={=f32}C",
+                            "Baro {} reads/s, {} errs — P={=f32}Pa T={=f32}C; mag {}/s, {} errs",
                             reads,
                             errs,
                             p,
                             t,
+                            mag_reads,
+                            mag_errs,
                         );
                     }
                 }
                 reads = 0;
                 errs = 0;
+                mag_reads = 0;
+                mag_errs = 0;
                 last_report = Instant::now();
             }
 
