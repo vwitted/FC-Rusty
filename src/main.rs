@@ -1143,6 +1143,26 @@ async fn pos_kf_task() {
                 gps_pos_fuses_sec = gps_pos_fuses_sec.wrapping_add(1);
                 last_fused_lat = gps.latitude;
                 last_fused_lon = gps.longitude;
+                // Per-fuse trace. One line per actual update_gps (~1/s
+                // post-dedupe). Shows the measurement that hit the
+                // filter (lat/lon → NED) and the filter's resulting
+                // state (post-fuse N/E). Comparing `meas_N/E` against
+                // `post_N/E` is the gain check: a tight match means
+                // the filter is closely tracking GPS; a large delta
+                // means the filter is heavily smoothing toward its
+                // prior. Useful for diagnosing "PosKF drifted away
+                // from GPS" scenarios in field logs.
+                let post_n = kf.x[0];
+                let post_e = kf.x[1];
+                defmt::info!(
+                    "gps_fuse: lat={=f32} lon={=f32} | meas_N={=f32}m E={=f32}m | post_N={=f32}m E={=f32}m",
+                    gps.latitude as f32,
+                    gps.longitude as f32,
+                    ned[0],
+                    ned[1],
+                    post_n,
+                    post_e,
+                );
             }
 
             // Velocity fusion runs independently of position (only on
