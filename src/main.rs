@@ -88,7 +88,10 @@ use drivers::nmea::{FixMode, GpsData, NmeaParser};
 use drivers::wt901b::{
     ImuData, UPDATED_ACCEL, UPDATED_ANGLE, UPDATED_GYRO, UPDATED_QUAT,
 };
-use estimation::{PosKf, geodetic_to_local_ned};
+use estimation::{
+    evaluate_stability, geodetic_to_local_ned, PosKf, StabilityBuffer,
+    StabilityConfig, StabilitySample,
+};
 
 // ---- Flight modes ----
 
@@ -498,7 +501,12 @@ async fn main(spawner: Spawner) {
 #[embassy_executor::task]
 async fn gps_task(mut rx: UartRx<'static, embassy_stm32::mode::Async>) {
     let mut parser = NmeaParser::new();
-    let mut buf = [0u8; 128];
+    // 32-byte buffer at 9600 baud → ~33 ms per wake-up. Larger buffers
+    // (128 used to be the default) collapse multiple back-to-back NMEA
+    // sentences into a single signal event at the consumer, dropping
+    // the effective GPS-to-PosKF latency floor; 32 bytes is a good
+    // compromise between latency and context-switch cost.
+    let mut buf = [0u8; 32];
     let mut sentence_count: u32 = 0;
     let mut last_report = Instant::now();
     let mut announced_first = false;
@@ -948,10 +956,18 @@ async fn pos_kf_task() {
     const PERIOD_MS: u64 = 1000 / HZ;
     const DT: f32 = 1.0 / HZ as f32;
 
-    // GPS home-latch gates. Relaxed for Alpha testing in poor-signal
-    // environments. Post-Alpha: tighten to 6 sats / HDOP < 2.5 or lower.
-    const MIN_SATS_FOR_LATCH: u8 = 5;
-    const MAX_HDOP_FOR_LATCH: f32 = 3.5;
+    // GPS home-latch quality gate. Only samples that clear this gate
+    // are pushed into the stability buffer below — the buffer's
+    // spread / age criterion is the *second* gate on top of quality.
+    // Tightened to the post-Alpha targets: 7 sats / HDOP < 2.0.
+    const MIN_SATS_FOR_LATCH: u8 = 7;
+    const MAX_HDOP_FOR_LATCH: f32 = 2.0;
+    // Stability buffer config. Defaults give a fast-path latch at
+    // ~30 s when the receiver is already locked (spread ≤ 10 m), and
+    // a slow-path fallback at ~60 s after any acquisition wander has
+    // rolled out of the sliding window (spread ≤ 100 m). Both stages
+    // require quality-gated samples only.
+    let stability_cfg = StabilityConfig::default();
 
     // σ_a = 0.5 m/s² matches the sim tuning — loose enough to track
     // gust transients without treating baro noise as truth. σ_baro =
@@ -983,8 +999,26 @@ async fn pos_kf_task() {
     let mut last_imu: Option<ImuData> = None;
     let mut last_baro_t = Instant::now();
     let mut baro_updates_sec: u32 = 0;
-    let mut gps_updates_sec: u32 = 0;
+    // Three GPS counters so the 1 Hz log distinguishes "signal events
+    // received" (driven by the gps_task's UART wake rate) from "actual
+    // measurements fused" (one per GGA / RMC cycle once dedupe kicks in).
+    // Pre-dedupe, the first ballooned to ~5/s while the second stayed at
+    // ~1/s — that gap is the over-fuse bug we're fixing.
+    let mut gps_signals_sec: u32 = 0;
+    let mut gps_pos_fuses_sec: u32 = 0;
+    let mut gps_vel_fuses_sec: u32 = 0;
     let mut last_gps: Option<GpsData> = None;
+
+    // Home-latch stability buffer + last-fused dedupe state. The buffer
+    // only receives quality-gated, deduped samples; the dedupe state
+    // is shared with the live-fuse path so the same lat/lon isn't
+    // re-fused into the KF on every redundant NMEA signal either.
+    let mut stab_buf = StabilityBuffer::new();
+    let mut last_fused_lat: f64 = f64::NAN;
+    let mut last_fused_lon: f64 = f64::NAN;
+    let mut last_fused_speed: f32 = f32::NAN;
+    let mut last_fused_course: f32 = f32::NAN;
+    let mut latch_diag_t = Instant::now();
 
     let mut ticker = Ticker::every(Duration::from_millis(PERIOD_MS));
     let mut last_report = Instant::now();
@@ -1015,34 +1049,88 @@ async fn pos_kf_task() {
             kf.predict([0.0, 0.0, 0.0], DT);
         }
 
-        // ---- GPS update (sensor-driven; None on non-1-Hz ticks) ----
-        // Home-point latch fires once on the first fix that clears the
-        // quality gates; subsequent fixes get converted to local NED
-        // and fused. No re-latch — the original origin is authoritative
-        // for anything that ever needs to return to it.
+        // ---- GPS update (sensor-driven) ----
+        //
+        // Two-stage gate keeps the home anchor stable:
+        //   1. Quality gate (sats / HDOP / Fix3D): only quality-passing
+        //      fixes are eligible at all. Fails-the-gate samples are
+        //      dropped without touching the buffer or the KF.
+        //   2. Stability gate (sliding-window spread / age): the home
+        //      origin is latched at the centroid of the stable window
+        //      rather than at any single sample, so wander during
+        //      acquisition can't permanently bias the reference.
+        //
+        // Once latched, the stability gate is no longer consulted —
+        // every quality-passing fix fuses straight into the KF.
+        // Dedupe (lat/lon changed since last fuse) prevents the
+        // gps_task's per-sentence signal storm from re-fusing the same
+        // GGA reading 3–5× per cycle and over-shrinking P_pp.
         if let Some(gps) = GPS_DATA_FOR_KF.try_take() {
             last_gps = Some(gps);
+            gps_signals_sec = gps_signals_sec.wrapping_add(1);
+
             let good_fix = gps.fix_mode == FixMode::Fix3D
                 && gps.satellites >= MIN_SATS_FOR_LATCH
                 && gps.hdop > 0.0
                 && gps.hdop < MAX_HDOP_FOR_LATCH;
 
+            let pos_fresh =
+                gps.latitude != last_fused_lat || gps.longitude != last_fused_lon;
+
             if !home_latched {
-                if good_fix {
-                    home_lat = gps.latitude;
-                    home_lon = gps.longitude;
-                    home_alt_msl = gps.altitude_m;
-                    home_latched = true;
-                    defmt::info!(
-                        "PosKF home latched: lat={=f32} lon={=f32} alt_msl={=f32}m | sats={} hdop={=f32}",
-                        gps.latitude as f32,
-                        gps.longitude as f32,
-                        gps.altitude_m,
-                        gps.satellites,
-                        gps.hdop,
-                    );
+                if good_fix && pos_fresh {
+                    let now_ms = Instant::now().as_millis();
+                    stab_buf.push(StabilitySample {
+                        lat_deg: gps.latitude,
+                        lon_deg: gps.longitude,
+                        alt_msl_m: gps.altitude_m,
+                        t_ms: now_ms,
+                    });
+                    stab_buf
+                        .trim_older_than(now_ms, stability_cfg.window_s as u64 * 1000);
+                    // Don't update last_fused_lat/lon yet — pre-latch
+                    // we only feed the buffer, not the KF. After
+                    // latch fires below, dedupe state is seeded so
+                    // the *next* incoming sample is recognised as
+                    // fresh and fuses.
+
+                    let decision = evaluate_stability(&stab_buf, &stability_cfg, now_ms);
+                    // 1 Hz diagnostic while we're waiting — lets the
+                    // operator see the buffer filling and the spread
+                    // converging without spamming on every push.
+                    if latch_diag_t.elapsed() >= Duration::from_secs(1) {
+                        defmt::info!(
+                            "PosKF home pending: samples={} age={=f32}s spread={=f32}m | sats={} hdop={=f32}",
+                            decision.samples as u32,
+                            decision.age_s,
+                            decision.spread_m,
+                            gps.satellites,
+                            gps.hdop,
+                        );
+                        latch_diag_t = Instant::now();
+                    }
+                    if decision.latch {
+                        home_lat = decision.lat_deg;
+                        home_lon = decision.lon_deg;
+                        home_alt_msl = decision.alt_msl_m;
+                        home_latched = true;
+                        // Seed dedupe state from the centroid the
+                        // latch was anchored at; the next real GGA
+                        // will have a different lat/lon and fuse.
+                        last_fused_lat = decision.lat_deg;
+                        last_fused_lon = decision.lon_deg;
+                        defmt::info!(
+                            "PosKF home latched: lat={=f32} lon={=f32} alt_msl={=f32}m | n={} age={=f32}s spread={=f32}m",
+                            decision.lat_deg as f32,
+                            decision.lon_deg as f32,
+                            decision.alt_msl_m,
+                            decision.samples as u32,
+                            decision.age_s,
+                            decision.spread_m,
+                        );
+                    }
                 }
-            } else if good_fix {
+            } else if good_fix && pos_fresh {
                 let ned = geodetic_to_local_ned(
                     gps.latitude,
                     gps.longitude,
@@ -1052,22 +1140,33 @@ async fn pos_kf_task() {
                     home_alt_msl,
                 );
                 kf.update_gps(ned);
-                gps_updates_sec = gps_updates_sec.wrapping_add(1);
+                gps_pos_fuses_sec = gps_pos_fuses_sec.wrapping_add(1);
+                last_fused_lat = gps.latitude;
+                last_fused_lon = gps.longitude;
             }
 
-            // Velocity fusion runs on any fix (independent of home
-            // latching). Below ~0.3 m/s the receiver's course report
-            // is noise — clamp to (0, 0), which actively damps
-            // position drift while stationary.
-            if gps.fix_mode != FixMode::NoFix && gps.satellites >= 3 {
+            // Velocity fusion runs independently of position (only on
+            // fresh RMC/VTG) so stationary GPS doesn't keep re-fusing
+            // (0, 0) every signal and over-shrinking P_vv. Below
+            // ~0.3 m/s the receiver's course report is noise — clamp
+            // to (0, 0), which still actively damps drift while
+            // stationary but only once per fresh sample.
+            let vel_fresh = gps.ground_speed_ms != last_fused_speed
+                || gps.course_deg != last_fused_course;
+            if vel_fresh && gps.fix_mode != FixMode::NoFix && gps.satellites >= 3 {
                 let (vn, ve) = if gps.ground_speed_ms < 0.3 {
                     (0.0, 0.0)
                 } else {
                     let crs = gps.course_deg.to_radians();
-                    (gps.ground_speed_ms * libm::cosf(crs),
-                     gps.ground_speed_ms * libm::sinf(crs))
+                    (
+                        gps.ground_speed_ms * libm::cosf(crs),
+                        gps.ground_speed_ms * libm::sinf(crs),
+                    )
                 };
                 kf.update_gps_velocity(vn, ve);
+                gps_vel_fuses_sec = gps_vel_fuses_sec.wrapping_add(1);
+                last_fused_speed = gps.ground_speed_ms;
+                last_fused_course = gps.course_deg;
             }
         }
 
@@ -1134,7 +1233,7 @@ async fn pos_kf_task() {
                 .unwrap_or((0, 99.99, 0));
             if altitude_ready {
                 defmt::info!(
-                    "PosKF: alt={=f32}m vz={=f32}m/s | N={=f32}m E={=f32}m | baro={} home={} | {} baro/s {} gps/s",
+                    "PosKF: alt={=f32}m vz={=f32}m/s | N={=f32}m E={=f32}m | baro={} home={} | {} baro/s | gps {}sig {}pos {}vel /s",
                     est.altitude_up,
                     est.vz_up,
                     est.position_ned[0],
@@ -1142,20 +1241,26 @@ async fn pos_kf_task() {
                     baro_calibrated,
                     home_latched,
                     baro_updates_sec,
-                    gps_updates_sec,
+                    gps_signals_sec,
+                    gps_pos_fuses_sec,
+                    gps_vel_fuses_sec,
                 );
             } else {
                 defmt::info!(
-                    "PosKF waiting: GPS sats={} hdop={=f32} fix={} baro_seen={} | {} gps/s",
+                    "PosKF waiting: GPS sats={} hdop={=f32} fix={} baro_seen={} | gps {}sig {}pos {}vel /s",
                     sats,
                     hdop,
                     fix,
                     last_baro_pressure.is_some(),
-                    gps_updates_sec,
+                    gps_signals_sec,
+                    gps_pos_fuses_sec,
+                    gps_vel_fuses_sec,
                 );
             }
             baro_updates_sec = 0;
-            gps_updates_sec = 0;
+            gps_signals_sec = 0;
+            gps_pos_fuses_sec = 0;
+            gps_vel_fuses_sec = 0;
             last_report = Instant::now();
         }
     }

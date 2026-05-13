@@ -67,10 +67,26 @@ material hardware or design change lands (see `CLAUDE.md`).
   at 100 Hz predict. Baro and GPS fuse as independent measurement
   paths — pilot decides what to fly with via the soft arm gate
   (`baro_ready || gps_home_latched`).
-  - **GPS position**: home latches on the first fix with
-    `FIX3D && sats ≥ 5 && HDOP < 3.5` (relaxed for Alpha; see backlog).
-    Subsequent good fixes fuse as local NED. σ_gps_h = 2 m,
-    σ_gps_v = 5 m.
+  - **GPS position**: home latches on the **centroid of a stable
+    window** of quality-gated fixes. Quality gate is `FIX3D &&
+    sats ≥ 7 && HDOP < 2.0` (tightened from the Alpha-era 5 / 3.5 to
+    match the post-Alpha target). On top of that, a two-stage
+    stability test prevents anchoring the home origin against early
+    acquisition wander:
+    - *Fast path* — ≥ 30 s of samples with spread ≤ 10 m → latch.
+      Handles the "receiver already locked at power-on" case so
+      we don't pay 60 s for a clean fix.
+    - *Slow path* — ≥ 60 s of samples with spread ≤ 100 m → latch.
+      Wandering acquisitions fail the fast test but eventually pass
+      this one once the wander rolls out of the sliding window.
+    Home is latched at the centroid of the stable window, not the
+    latest sample. Once latched the stability gate is no longer
+    consulted — every quality-passing GGA fuses. Subsequent good
+    fixes fuse as local NED. σ_gps_h = 2 m, σ_gps_v = 5 m.
+    Per-sentence signal storms are deduped at the consumer
+    (`pos_kf_task`) so the same GGA isn't fused 3–5× per cycle
+    (which over-shrinks P_pp and dominates the filter with stale
+    noise). Diagnostic now reports `Nsig / Npos / Nvel` per second.
   - **GPS velocity** (NMEA RMC ground speed × course) fuses
     independently of home latching at σ = 0.3 m/s, via the new
     `PosKf::update_gps_velocity(vn, ve)` method. This caps DR
@@ -140,7 +156,12 @@ material hardware or design change lands (see `CLAUDE.md`).
 
 ### post-Alpha tweaks
 
-- [ ] GPS thresholds tightened to 7 sats / HDOP < 2.0
+- [x] GPS thresholds tightened to 7 sats / HDOP < 2.0. Implemented
+  2026-05-14 together with a two-stage stability-windowed home latch
+  (30 s/10 m fast path, 60 s/100 m slow path, anchored at the
+  centroid) and consumer-side dedupe so per-sentence NMEA signal
+  storms can't re-fuse the same GGA into the KF. See "What's
+  Verified → GPS position" for the full design.
 - [x] Re-enable arming on baro only, but if GPS fix is available set home co-ords. Implemented 2026-05-08: arming gate is now soft (`baro_ready || gps_home_latched`); baro p_ref latches on the Disarmed→Armed transition via `ARM_LATCH` signal; `PosEstimate` exposes split `altitude_ready` / `home_latched` flags. `arming::ArmingStateMachine.require_gps` renamed to `require_altitude_ref`.
 - [x] Assign CRSF channels for user-initiated GPS Rescue, pos-hold and alt-hold functionality. (Implemented: CH5 for mode, CH6 for RTH trigger)
 - [ ] ESC Bidirectional Dshot functionality
@@ -263,7 +284,7 @@ All host-tested (`cargo test --lib --no-default-features --target x86_64-unknown
 | Position PD      | `control/position.rs`    | Horizontal hold, world→body rotation, tilt-limited — **written, not yet wired** |
 | Quad-X mixer     | `control/mixer.rs`       | Airmode + no-airmode paths, phantom-thrust prevention         |
 | Arming FSM       | `control/arming.rs`      | Pre-arm (thr/lvl/imu/rc/altitude_ref), soft baro-or-GPS gate, failsafe-on-RC-loss (never disarms; control loop chooses descent), IMU-loss-only auto-disarm |
-| PosKF            | `estimation.rs`          | 6-state linear KF; GPS position + GPS velocity + baro + IMU predict |
+| PosKF            | `estimation.rs`          | 6-state linear KF; GPS position + GPS velocity + baro + IMU predict; stability-windowed home latch |
 | MEKF             | `attitude_mekf.rs`       | Quaternion MEKF with gyro-bias state, 8 kHz predict, 100 Hz accel + 100 Hz mag updates |
 | CRSF parser      | `drivers/crsf.rs`        | Byte streaming, 11-bit unpack, link stats, CRC8              |
 | NMEA parser      | `drivers/nmea.rs`        | GGA/RMC/GSA/VTG, 3D fix detection, checksum                  |
