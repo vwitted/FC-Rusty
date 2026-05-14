@@ -21,6 +21,7 @@ pub mod control {
 
 pub mod drivers {
     pub mod nmea;
+    pub mod ubx;
 }
 
 pub mod estimation;

@@ -43,7 +43,8 @@
       "Bash(python3 -c 'import sys,json; d=json.load\\(sys.stdin\\); [print\\(f\"{c[\\\\\"name\\\\\"]:30} {c[\\\\\"max_version\\\\\"]:10} {c[\\\\\"recent_downloads\\\\\"] or 0:>7} dl/90d — {\\(c[\\\\\"description\\\\\"] or \\\\\"\\\\\"\\)[:80]}\"\\) for c in d.get\\(\"crates\",[]\\)]')",
       "Bash(timeout 30 curl *)",
       "Bash(timeout 20 curl -sL 'https://api.github.com/repos/jettify/uf-dshot/contents/' -H 'User-Agent: claude-research')",
-      "Bash(python3 -c 'import sys,json; [print\\(f\"{f[\\\\\"type\\\\\"]:6} {f[\\\\\"name\\\\\"]}\"\\) for f in json.load\\(sys.stdin\\)]')"
+      "Bash(python3 -c 'import sys,json; [print\\(f\"{f[\\\\\"type\\\\\"]:6} {f[\\\\\"name\\\\\"]}\"\\) for f in json.load\\(sys.stdin\\)]')",
+      "Bash(xargs -I{} grep -n \"fn set_cc[ap1234]\\\\|fn set_ccp\\\\b\\\\|fn ccp\\\\b\" {})"
     ]
   }
 }

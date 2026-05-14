@@ -104,7 +104,7 @@ cortex-m = { version = "0.7", optional = true, features = [
 cortex-m-rt = { version = "0.7", optional = true }
 
 # Debugging / logging
-defmt = { version = "0.3", optional = true }
+defmt = { version = "0.3", optional = true, features = ["encoding-raw"] }
 # `critical-section` provides a portable way to disable interrupts
 # around the defmt logger's encoder state (used in src/logger.rs).
 critical-section = { version = "1.1", optional = true }
