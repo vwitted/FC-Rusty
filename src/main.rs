@@ -68,10 +68,12 @@ mod control {
 }
 mod attitude_mekf;
 mod estimation;
+mod imu_filter;
 mod logger;
 mod rc_task;
 
 use attitude_mekf::{AttitudeMekf, G_MPS2, MekfParams};
+use imu_filter::{ImuFilter, ImuFilterParams};
 use control::altitude::{AltitudeController, AltitudeGains};
 use control::arming::{ArmState, ArmingStateMachine};
 use control::mixer::{ControlDemand, QUAD_X};
@@ -563,6 +565,15 @@ async fn dual_icm_read_task(
     let mut ticker = Ticker::every(Duration::from_micros(125));
     let mut last_diag = Instant::now();
 
+    // Software LPF on the fused IMU stream. Filters the post-average
+    // signal once with one identical chain rather than relying on the
+    // (different) on-chip filters of the MPU6000 and ICM-42688P.
+    // Defaults are 150 Hz gyro / 25 Hz accel — see `imu_filter.rs` for
+    // the design notes. Primed lazily on the first successful sample
+    // so the consumer doesn't see a startup ramp from zero.
+    let mut filter = ImuFilter::new(ImuFilterParams::default());
+    let mut filter_primed = false;
+
     loop {
         ticker.next().await;
 
@@ -572,10 +583,24 @@ async fn dual_icm_read_task(
         match (r1, r2) {
             (Ok(a), Ok(b)) => {
                 let fused = drivers::icm42688::RawImu::averaged(&a, &b);
-                RAW_IMU.signal(fused);
+                if !filter_primed {
+                    filter.prime(fused.accel, fused.gyro);
+                    filter_primed = true;
+                }
+                let (a_filt, g_filt) = filter.apply(fused.accel, fused.gyro);
+                let filtered = drivers::icm42688::RawImu {
+                    accel: a_filt,
+                    gyro: g_filt,
+                    temp: fused.temp,
+                    orientation: fused.orientation,
+                };
+                RAW_IMU.signal(filtered);
                 ICM_SAMPLES.fetch_add(1, Ordering::Relaxed);
 
-                // Snapshot per-sensor diagnostics at ~1 Hz
+                // Snapshot per-sensor diagnostics at ~1 Hz. The
+                // a_fused / g_fused fields reflect the *filtered*
+                // fused output (what the MEKF actually sees), while
+                // a1 / a2 / g1 / g2 stay raw per-sensor.
                 let now = Instant::now();
                 if (now - last_diag) >= Duration::from_secs(1) {
                     IMU_DIAG.signal(ImuDiag {
@@ -583,8 +608,8 @@ async fn dual_icm_read_task(
                         a2: b.accel_g(),
                         g1: a.gyro_dps(),
                         g2: b.gyro_dps(),
-                        a_fused: fused.accel_g(),
-                        g_fused: fused.gyro_dps(),
+                        a_fused: filtered.accel_g(),
+                        g_fused: filtered.gyro_dps(),
                         t1: a.temp_c(),
                         t2: b.temp_c(),
                     });
@@ -592,14 +617,37 @@ async fn dual_icm_read_task(
                 }
             }
             (Ok(a), Err(_)) => {
-                // IMU2 read failed — use IMU1 only this cycle
-                RAW_IMU.signal(a);
+                // IMU2 read failed — use IMU1 only this cycle.
+                // Still filter so the consumer sees a consistent
+                // spectral response across dropouts.
+                if !filter_primed {
+                    filter.prime(a.accel, a.gyro);
+                    filter_primed = true;
+                }
+                let (a_filt, g_filt) = filter.apply(a.accel, a.gyro);
+                let filtered = drivers::icm42688::RawImu {
+                    accel: a_filt,
+                    gyro: g_filt,
+                    temp: a.temp,
+                    orientation: a.orientation,
+                };
+                RAW_IMU.signal(filtered);
                 ICM_SAMPLES.fetch_add(1, Ordering::Relaxed);
                 ICM_ERRORS.fetch_add(1, Ordering::Relaxed);
             }
             (Err(_), Ok(b)) => {
-                // IMU1 read failed — use IMU2 only this cycle
-                RAW_IMU.signal(b);
+                if !filter_primed {
+                    filter.prime(b.accel, b.gyro);
+                    filter_primed = true;
+                }
+                let (a_filt, g_filt) = filter.apply(b.accel, b.gyro);
+                let filtered = drivers::icm42688::RawImu {
+                    accel: a_filt,
+                    gyro: g_filt,
+                    temp: b.temp,
+                    orientation: b.orientation,
+                };
+                RAW_IMU.signal(filtered);
                 ICM_SAMPLES.fetch_add(1, Ordering::Relaxed);
                 ICM_ERRORS.fetch_add(1, Ordering::Relaxed);
             }
@@ -622,12 +670,26 @@ async fn single_icm_read_task(
     defmt::info!("Single ICM read task started (8 kHz ticker, IMU2 unavailable)");
 
     let mut ticker = Ticker::every(Duration::from_micros(125));
+    // Same software LPF as the dual-IMU path; primed lazily.
+    let mut filter = ImuFilter::new(ImuFilterParams::default());
+    let mut filter_primed = false;
 
     loop {
         ticker.next().await;
         match imu.read_raw().await {
             Ok(r) => {
-                RAW_IMU.signal(r);
+                if !filter_primed {
+                    filter.prime(r.accel, r.gyro);
+                    filter_primed = true;
+                }
+                let (a_filt, g_filt) = filter.apply(r.accel, r.gyro);
+                let filtered = drivers::icm42688::RawImu {
+                    accel: a_filt,
+                    gyro: g_filt,
+                    temp: r.temp,
+                    orientation: r.orientation,
+                };
+                RAW_IMU.signal(filtered);
                 ICM_SAMPLES.fetch_add(1, Ordering::Relaxed);
             }
             Err(_) => {
