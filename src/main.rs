@@ -2306,26 +2306,30 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
             }
             
             let telemetry = dshot.send_throttles_and_receive(frames).await;
-            
-            // Log eRPM telemetry at ~10Hz
-            static mut LOG_COUNTER: u32 = 0;
-            unsafe {
-                LOG_COUNTER = LOG_COUNTER.wrapping_add(1);
-                if LOG_COUNTER % 800 == 0 {
-                    let get_erpm = |res: &Result<uf_dshot::TelemetryFrame, uf_dshot::TelemetryError>| -> u32 {
-                        if let Ok(uf_dshot::TelemetryFrame::Erpm(r)) = res {
-                            r.mechanical_rpm(1) // 1 pole pair = eRPM
-                        } else {
-                            0
-                        }
-                    };
-                    
-                    let e1 = get_erpm(&telemetry[0]);
-                    let e2 = get_erpm(&telemetry[1]);
-                    let e3 = get_erpm(&telemetry[2]);
-                    let e4 = get_erpm(&telemetry[3]);
-                    defmt::info!("DShot eRPM: M1={} M2={} M3={} M4={}", e1, e2, e3, e4);
-                }
+
+            // Log eRPM telemetry at ~10 Hz (every 800th 8 kHz tick).
+            // AtomicU32 in place of the old `static mut LOG_COUNTER` —
+            // same single-task access pattern, no `unsafe`.
+            use core::sync::atomic::{AtomicU32, Ordering};
+            static LOG_COUNTER: AtomicU32 = AtomicU32::new(0);
+            let n = LOG_COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+            if n.is_multiple_of(800) {
+                let get_erpm = |res: &Result<uf_dshot::TelemetryFrame, uf_dshot::TelemetryError>| -> u32 {
+                    if let Ok(uf_dshot::TelemetryFrame::Erpm(r)) = res {
+                        // pole_pairs=1 returns eRPM (electrical revs/min).
+                        // For mechanical RPM, divide by the motor's pole
+                        // pair count (typically 7 for 12N14P stators).
+                        r.mechanical_rpm(1)
+                    } else {
+                        0
+                    }
+                };
+
+                let e1 = get_erpm(&telemetry[0]);
+                let e2 = get_erpm(&telemetry[1]);
+                let e3 = get_erpm(&telemetry[2]);
+                let e4 = get_erpm(&telemetry[3]);
+                defmt::info!("DShot eRPM: M1={} M2={} M3={} M4={}", e1, e2, e3, e4);
             }
         } else {
             rate_pid.reset();

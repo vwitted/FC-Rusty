@@ -1,17 +1,42 @@
-// dshot_hw.rs — single-timer DMA-driven DShot600 for DAKEFPVH743.
+// dshot_hw.rs — single-timer DMA-driven bidirectional DShot600 for the
+// GEPRC TAKER H743 BT.
 //
-// The DAKEFPVH743 places all four motor outputs on TIM2:
-//   TIM2 CH1 → PA0 → M1
-//   TIM2 CH2 → PA1 → M2
-//   TIM2 CH3 → PA2 → M3
-//   TIM2 CH4 → PA3 → M4
-//   TIM2_UP  → DMA1 (managed via DMAMUX on H7)
+// Motor pinout on this board (TIM3, not TIM2):
+//   TIM3 CH1 → PB4 → M4
+//   TIM3 CH2 → PB5 → M3
+//   TIM3 CH3 → PB0 → M1
+//   TIM3 CH4 → PB1 → M2
+//   TIM3_UP  → DMA1 (managed via DMAMUX on H7)
 //
 // We drive all four channels simultaneously using a 4-beat burst DMA
-// transfer triggered by the TIM2 Update event. This is done via the
-// `DMAR` register (`DBL=3` -> 4 transfers to CCR1..CCR4).
+// transfer triggered by the TIM3 Update event, via the timer's `DMAR`
+// register (`DBL = 3` → 4 transfers per UEV to CCR1..CCR4).
 //
-// Timer clock: APB1 timers on our H743 run at 240 MHz.
+// ---- Bidirectional DShot wiring conventions ----
+//
+// Bidir DShot inverts the on-wire signal vs standard DShot:
+//   - Line idles HIGH between frames (pull-up + open-drain).
+//   - A "1" data bit is a long-LOW pulse (75 % of the cell).
+//   - A "0" data bit is a short-LOW pulse (37.5 % of the cell).
+//   - After the 16-bit frame the ESC waits ~30 µs then drives the
+//     same wire LOW to transmit a 21-bit GCR-encoded response.
+//
+// Two consequences for this driver:
+//   1. **Pins are open-drain with a pull-up.** Push-pull on the FC
+//      side would short its PMOS through the ESC's NMOS during the
+//      TX→RX handoff if the ESC starts responding earlier than the
+//      reconfiguration completes. Same hazard pattern as the I²C
+//      bus-recovery push-pull issue (see CLAUDE.md).
+//   2. **TIM_CCER.CCxP is set to 1 (active-low) for all four
+//      channels.** PWM Mode 1 keeps "OC active" while counter < CCR
+//      and "OC inactive" otherwise; inverting the polarity means
+//      "active" = LOW and "inactive" = HIGH. With open-drain that
+//      becomes: CCR ticks of driven-LOW, then pull-up-HIGH for the
+//      remainder. Setting CCR = t1h (75 % of period) produces the
+//      bidir "1" pulse; CCR = 0 in the trailing slots leaves the
+//      line at idle-HIGH.
+//
+// Timer clock: APB1 timers on this board run at 240 MHz.
 
 use embassy_stm32::Peri;
 use embassy_stm32::gpio::OutputType;
@@ -75,12 +100,15 @@ impl<'d> DshotQuad<'d> {
         let freq = Hertz(bitrate);
 
         // ---- TIM3: CH3 (PB0), CH4 (PB1), CH2 (PB5), CH1 (PB4) ----
+        // Open-drain so the line can be pulled LOW by either side
+        // without contention; pull-up takes the idle HIGH. See header
+        // comment for the full rationale.
         let mut tim3_pwm = SimplePwm::new(
             tim3,
-            Some(PwmPin::new(pb4, OutputType::PushPull)), // CH1
-            Some(PwmPin::new(pb5, OutputType::PushPull)), // CH2
-            Some(PwmPin::new(pb0, OutputType::PushPull)), // CH3
-            Some(PwmPin::new(pb1, OutputType::PushPull)), // CH4
+            Some(PwmPin::new(pb4, OutputType::OpenDrain)), // CH1 → M4
+            Some(PwmPin::new(pb5, OutputType::OpenDrain)), // CH2 → M3
+            Some(PwmPin::new(pb0, OutputType::OpenDrain)), // CH3 → M1
+            Some(PwmPin::new(pb1, OutputType::OpenDrain)), // CH4 → M2
             freq,
             CountingMode::EdgeAlignedUp,
         );
@@ -89,6 +117,27 @@ impl<'d> DshotQuad<'d> {
             c.set_duty_cycle(0);
             c.enable();
         }
+
+        // Invert each channel's polarity for bidir DShot. With CCxP=1
+        // and PWM Mode 1: the timer drives LOW while counter < CCR,
+        // and "drives" HIGH (open-drain → high-Z → pull-up) otherwise.
+        // CCR = t1h gives a 75 % LOW pulse ("1"), CCR = t0h gives a
+        // 37.5 % LOW pulse ("0"), CCR = 0 leaves the line at idle.
+        pac::TIM3.ccer().modify(|w| {
+            w.set_ccp(0, true); // CH1
+            w.set_ccp(1, true); // CH2
+            w.set_ccp(2, true); // CH3
+            w.set_ccp(3, true); // CH4
+        });
+
+        // Internal pull-up on all four pins so the open-drain HIGH
+        // state is robust independent of any ESC-side pull-up.
+        pac::GPIOB.pupdr().modify(|w| {
+            w.set_pupdr(0, pac::gpio::vals::Pupdr::PULL_UP);
+            w.set_pupdr(1, pac::gpio::vals::Pupdr::PULL_UP);
+            w.set_pupdr(4, pac::gpio::vals::Pupdr::PULL_UP);
+            w.set_pupdr(5, pac::gpio::vals::Pupdr::PULL_UP);
+        });
 
         // DShot DMA buffer — placed in SRAM1
         let buf_tim3: &'static mut [u32; TIM3_BUF_LEN] =
@@ -116,10 +165,14 @@ impl<'d> DshotQuad<'d> {
     }
 
     pub fn log_config(&self) {
-        let a2 = self.buffer_addresses();
-        defmt::info!("DShot buffer: tim2={=u32:08x}", a2);
+        let a = self.buffer_addresses();
+        defmt::info!("DShot buffer: tim3={=u32:08x}", a);
+        // DMA1 lives in the D2 domain on the H7. SRAM1/2/3 (0x3000…)
+        // and AXI_SRAM (0x2400…) are both reachable; DTCM/ITCM
+        // (0x2000…/0x0000…) are D1-domain TCM and *not* reachable
+        // by DMA1.
         defmt::assert!(
-            a2 >= 0x2400_0000,
+            a >= 0x2400_0000,
             "DShot buffer in DTCM/ITCM — DMA1 can't reach it"
         );
         defmt::info!("DShot bit-cell ticks: t0h={=u32} t1h={=u32}", self.t0h, self.t1h);
@@ -208,8 +261,15 @@ impl<'d> DshotQuad<'d> {
             w.set_pupdr(5, pac::gpio::vals::Pupdr::PULL_UP);
         });
 
-        // 2. Change TIM3 ARR to sample at 1.8 MHz (133 ticks at 240 MHz)
-        pac::TIM3.arr().modify(|w| w.set_arr(133 - 1));
+        // 2. Change TIM3 ARR to sample at ~1.44 MHz (167 ticks at 240 MHz).
+        // Rationale: uf-dshot's `OversamplingConfig::default()` expects
+        // 3 samples per response bit. DShot600 bidir telemetry uses a
+        // bit cell of (5/4) × 1.667 µs = 2.083 µs, so the matching
+        // sample period is 2.083 / 3 ≈ 0.694 µs, i.e. ARR = 166.
+        // Previously we sampled at 1.8 MHz (~3.76 samples/bit) which
+        // is workable for the `tuned` decoder once it's adapted but
+        // can mis-tune on the very first frame after boot.
+        pac::TIM3.arr().modify(|w| w.set_arr(167 - 1));
 
         // 3. Start Rx DMA reading GPIOB_IDR
         let rx_req = <DMA1_CH6 as UpDma<TIM3>>::request(&self.dma_tim3_rx);
@@ -227,19 +287,17 @@ impl<'d> DshotQuad<'d> {
         }
         pac::TIM3.dier().modify(|w| w.set_ude(false));
 
-        // 4. Restore pins and Timer for next cycle
+        // 4. Restore pins and Timer for next cycle.
+        // ARR back to 400 ticks (1.667 µs cell @ 240 MHz / 600 kHz).
+        // PUPDR stays PULL_UP — with open-drain alternate-function
+        // output the HIGH idle is provided by the pull-up, so we keep
+        // it engaged across both INPUT and ALTERNATE modes.
         pac::TIM3.arr().modify(|w| w.set_arr(399)); // 400 - 1
         pac::GPIOB.moder().modify(|w| {
             w.set_moder(0, pac::gpio::vals::Moder::ALTERNATE);
             w.set_moder(1, pac::gpio::vals::Moder::ALTERNATE);
             w.set_moder(4, pac::gpio::vals::Moder::ALTERNATE);
             w.set_moder(5, pac::gpio::vals::Moder::ALTERNATE);
-        });
-        pac::GPIOB.pupdr().modify(|w| {
-            w.set_pupdr(0, pac::gpio::vals::Pupdr::FLOATING);
-            w.set_pupdr(1, pac::gpio::vals::Pupdr::FLOATING);
-            w.set_pupdr(4, pac::gpio::vals::Pupdr::FLOATING);
-            w.set_pupdr(5, pac::gpio::vals::Pupdr::FLOATING);
         });
 
         // 5. Decode Telemetry
