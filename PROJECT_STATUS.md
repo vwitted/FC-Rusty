@@ -51,10 +51,20 @@ material hardware or design change lands (see `CLAUDE.md`).
 
 (The specifics here are largely validated on older hardware, but the overall functionality has now been implemented and enhanced for the STM32H743).
 
-- **Attitude**: MPU6000 and ICM-42688P dual IMUs read at 8 kHz via SPI. MEKF fusing accel (100 Hz update)
-  and gyro (8 kHz predict). Gyro bias bounded to 0.3–0.5 dps; innovation
-  gate rejects ~0% at rest and ~25% under aggressive motion. Sensor
-  frames mapped to NED. **Yaw is observable**: LIS2MDL magnetometer
+- **Attitude**: MPU6000 and ICM-42688P dual IMUs read at 8 kHz via SPI,
+  averaged in body-frame NED for √2 noise reduction, then passed
+  through a software 2nd-order Butterworth LPF chain (150 Hz gyro,
+  25 Hz accel; module `imu_filter.rs`) before being signalled to the
+  MEKF. On-chip filters are left at their wide defaults: the MPU6000's
+  DLPF can't be enabled without losing the 8 kHz ODR, and applying it
+  only to the ICM leaves the averaged signal with mismatched bands —
+  one software LPF stage after averaging gives both sensors identical
+  treatment at 8 kHz full rate. The 25 Hz accel cutoff is also our
+  anti-alias filter for the 100 Hz MEKF gravity-update decimation
+  (~ −12 dB at the 50 Hz Nyquist edge). MEKF fusing accel (100 Hz
+  update) and gyro (8 kHz predict). Gyro bias bounded to 0.3–0.5 dps;
+  innovation gate rejects ~0% at rest and ~25% under aggressive
+  motion. Sensor frames mapped to NED. **Yaw is observable**: LIS2MDL magnetometer
   on I2C1 (shared with SPL06) at 100 Hz feeds `AttitudeMekf::update_mag`
   with a 3-vector body-frame measurement model and innovation gate.
   Reference field is auto-seeded from the first reading after the
@@ -286,6 +296,7 @@ All host-tested (`cargo test --lib --no-default-features --target x86_64-unknown
 | Arming FSM       | `control/arming.rs`      | Pre-arm (thr/lvl/imu/rc/altitude_ref), soft baro-or-GPS gate, failsafe-on-RC-loss (never disarms; control loop chooses descent), IMU-loss-only auto-disarm |
 | PosKF            | `estimation.rs`          | 6-state linear KF; GPS position + GPS velocity + baro + IMU predict; stability-windowed home latch |
 | MEKF             | `attitude_mekf.rs`       | Quaternion MEKF with gyro-bias state, 8 kHz predict, 100 Hz accel + 100 Hz mag updates |
+| IMU LPF          | `imu_filter.rs`          | 2nd-order Butterworth biquad bank applied to fused dual-IMU stream; 150 Hz gyro / 25 Hz accel default |
 | CRSF parser      | `drivers/crsf.rs`        | Byte streaming, 11-bit unpack, link stats, CRC8              |
 | NMEA parser      | `drivers/nmea.rs`        | GGA/RMC/GSA/VTG, 3D fix detection, checksum                  |
 | UBX parser       | `drivers/ubx.rs`         | u-blox binary protocol — written, not yet active             |
