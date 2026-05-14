@@ -1045,10 +1045,11 @@ async fn pos_kf_task() {
     );
 
     // Baro state. `p_ref_pa` is latched on the Disarmed→Armed event
-    // (see ARM_LATCH below); `baro_calibrated` gates fusion. Until
-    // arm, baro samples are stored but not fused.
+    // (see ARM_LATCH below); `baro_p_ref_latched` then gates fusion.
+    // Until arm, baro samples are stored on `last_baro_pressure` /
+    // `last_baro_t` but not fused into the KF.
     let mut p_ref_pa: f32 = 0.0;
-    let mut baro_calibrated = false;
+    let mut baro_p_ref_latched = false;
     let mut last_baro_pressure: Option<f32> = None;
 
     // Home-origin latch state. Stored as f64 for lat/lon to preserve
@@ -1059,7 +1060,13 @@ async fn pos_kf_task() {
     let mut home_latched = false;
 
     let mut last_imu: Option<ImuData> = None;
-    let mut last_baro_t = Instant::now();
+    // `None` until the first baro sample arrives. The arming gate
+    // (`baro_ready`) and the readiness flag (`altitude_ready`) both
+    // derive freshness from this — initialising to `Instant::now()`
+    // would mean "fresh" at task spawn before any sample existed,
+    // a startup race that could let the arm FSM clear baro-only
+    // arming with the baro completely absent.
+    let mut last_baro_t: Option<Instant> = None;
     let mut baro_updates_sec: u32 = 0;
     // Three GPS counters so the 1 Hz log distinguishes "signal events
     // received" (driven by the gps_task's UART wake rate) from "actual
@@ -1253,15 +1260,24 @@ async fn pos_kf_task() {
         }
 
         // ---- Baro update (sensor-driven; None on non-25-Hz ticks) ----
-        // Pressure is stored on every sample so ARM_LATCH can latch
-        // p_ref against the most recent reading. Fusion is gated on
-        // `baro_calibrated`, which flips true at arm.
+        // Pressure + freshness timestamp are stored on **every** sample
+        // independent of arming/fusion state. Fusion (`kf.update_baro`)
+        // is still gated on `baro_p_ref_latched`, which flips true at
+        // ARM_LATCH.
+        //
+        // Decoupling the timestamp from fusion fixes the baro-only
+        // arming deadlock: the arm FSM's `baro_ready` gate keys off
+        // `baro_age_ms` (published from `last_baro_t`); pre-fix, that
+        // timestamp only advanced once we were fusing, which only
+        // happened after arm, which required the gate to clear. With
+        // the timestamp running on every sample, `baro_ready` clears
+        // as soon as the baro task is alive.
         if let Some(baro) = BARO_DATA.try_take() {
             last_baro_pressure = Some(baro.pressure_pa);
-            if baro_calibrated {
+            last_baro_t = Some(Instant::now());
+            if baro_p_ref_latched {
                 let alt_up = baro::pressure_to_altitude_m(baro.pressure_pa, p_ref_pa);
                 kf.update_baro(alt_up);
-                last_baro_t = Instant::now();
                 baro_updates_sec = baro_updates_sec.wrapping_add(1);
             }
         }
@@ -1275,7 +1291,7 @@ async fn pos_kf_task() {
         if ARM_LATCH.try_take().is_some() {
             if let Some(p) = last_baro_pressure {
                 p_ref_pa = p;
-                baro_calibrated = true;
+                baro_p_ref_latched = true;
                 kf.x[2] = 0.0; // pz
                 kf.x[5] = 0.0; // vz
                 defmt::info!("PosKF arm latch: p_ref={=f32}Pa, KF z/vz zeroed", p_ref_pa);
@@ -1287,12 +1303,22 @@ async fn pos_kf_task() {
         }
 
         // ---- Readiness ----
-        // Altitude is meaningful if either sensor is anchored: baro post-
-        // arm latch, or GPS once home is set. The two flags are exposed
-        // separately so altitude-only modes (alt-hold) can engage on
-        // baro alone while position-modes (pos-hold, RTH, rescue) stay
-        // gated on `home_latched`.
-        let altitude_ready = baro_calibrated || home_latched;
+        // Altitude is meaningful if either sensor is currently anchored:
+        // recent baro samples (whether or not we're fusing them yet) or
+        // a latched GPS home. **Not** keyed on `baro_p_ref_latched`,
+        // which is a one-shot "have we processed ARM_LATCH" flag — that
+        // would (a) misreport stale-true if the baro died mid-flight
+        // (the flag never clears once set), and (b) miss the pre-arm
+        // window where baro is alive but we haven't armed yet.
+        //
+        // Freshness threshold: 1 s. The baro task signals at 125 Hz,
+        // so a 1-s gap means at least ~125 missed samples — well past
+        // the in-task recovery streak (~0.4 s) so we're not flapping
+        // during normal bus-stuck recoveries.
+        let baro_fresh = last_baro_t
+            .map(|t| t.elapsed() < Duration::from_secs(1))
+            .unwrap_or(false);
+        let altitude_ready = baro_fresh || home_latched;
 
         // ---- Publish estimate ----
         let s = kf.state();
@@ -1302,7 +1328,11 @@ async fn pos_kf_task() {
             altitude_up: kf.altitude_up(),
             vz_up: kf.vz_up(),
             p_ref_pa,
-            baro_age_ms: last_baro_t.elapsed().as_millis() as u32,
+            // u32::MAX before the first baro sample — distinguishes
+            // "never seen" from "stale by N ms" downstream.
+            baro_age_ms: last_baro_t
+                .map(|t| t.elapsed().as_millis() as u32)
+                .unwrap_or(u32::MAX),
             altitude_ready,
             home_latched,
         };
@@ -1315,12 +1345,13 @@ async fn pos_kf_task() {
                 .unwrap_or((0, 99.99, 0));
             if altitude_ready {
                 defmt::info!(
-                    "PosKF: alt={=f32}m vz={=f32}m/s | N={=f32}m E={=f32}m | baro={} home={} | {} baro/s | gps {}sig {}pos {}vel /s",
+                    "PosKF: alt={=f32}m vz={=f32}m/s | N={=f32}m E={=f32}m | baro_fresh={} p_ref_latched={} home={} | {} baro/s | gps {}sig {}pos {}vel /s",
                     est.altitude_up,
                     est.vz_up,
                     est.position_ned[0],
                     est.position_ned[1],
-                    baro_calibrated,
+                    baro_fresh,
+                    baro_p_ref_latched,
                     home_latched,
                     baro_updates_sec,
                     gps_signals_sec,

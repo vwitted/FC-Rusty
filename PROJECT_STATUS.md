@@ -110,9 +110,16 @@ material hardware or design change lands (see `CLAUDE.md`).
     pressure` and zero the KF's vertical state, so altitude reads
     ~0 at arm. From arm forward baro fuses every sample at σ_baro =
     0.3 m, which dominates GPS altitude over the short term.
-  - **Readiness flags**: `altitude_ready` (= `baro_calibrated ||
-    home_latched`, gates AltHold and PosHold) and `home_latched`
-    (gates GpsRescue / GpsHome / RTH).
+  - **Readiness flags**: `altitude_ready` (= `baro_fresh ||
+    home_latched`, where `baro_fresh = last_baro_t.elapsed() < 1 s`;
+    gates AltHold and PosHold) and `home_latched` (gates GpsRescue /
+    GpsHome / RTH). Tied to actual sample freshness rather than the
+    one-shot `baro_p_ref_latched` flag — that flag now means "have
+    we processed ARM_LATCH" and only gates baro fusion, nothing
+    user-facing. Without this split, the readiness flag (a) couldn't
+    clear pre-arm even when baro was alive, deadlocking the arm
+    gate, and (b) couldn't fall back to false if the baro died
+    mid-flight.
   - Outdoor verification 2026-04-20 (under the prior GPS-anchored
     design): clean ready transition, baro 26 reads/s with 0 errors,
     post-home-latch IMU-only drift (~1500 m) corrected in one GPS
