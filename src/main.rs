@@ -459,6 +459,16 @@ async fn main(spawner: Spawner) {
 
     // DShot ESC outputs (all 4 channels on TIM3)
     // M1=PB0(CH3), M2=PB1(CH4), M3=PB5(CH2), M4=PB4(CH1).
+    //
+    // Bench-bisect knobs: edit and reflash to try different ESC
+    // protocol/mode combinations. Some BLHeli_S firmware only accepts
+    // DShot300, and bidir support depends on whether the ESC's own
+    // configurator has it enabled — so the four corners (300/600 ×
+    // bidir on/off) are worth a try if motors stay silent at the
+    // default.
+    const DSHOT_SPEED: DshotSpeed = DshotSpeed::Dshot600;
+    const DSHOT_BIDIR: bool = true;
+
     let dshot = DshotQuad::new(
         p.TIM3,
         p.PB0,
@@ -467,11 +477,12 @@ async fn main(spawner: Spawner) {
         p.PB4,
         p.DMA1_CH7, // TIM3_UP (Tx)
         p.DMA1_CH6, // TIM3_UP (Rx)
-        DshotSpeed::Dshot600,
+        DSHOT_SPEED,
+        DSHOT_BIDIR,
     );
 
     dshot.log_config();
-    defmt::info!("DShot (TIM2+TIM3+TIM4, DShot600) initialised");
+    defmt::info!("DShot initialised on TIM3 (4 channels, eRPM gated on bidir)");
 
     // ---- Run the 50 Hz outer loop as a spawned task ----
     spawner.spawn(navigation_task()).unwrap();

@@ -70,12 +70,25 @@ pub struct DshotQuad<'d> {
 
     t1h: u32,
     t0h: u32,
+    /// TIM3 ARR for TX (one bit-cell at the configured speed). Cached
+    /// so the RX path can restore it after the inverted-direction
+    /// sample-rate change.
+    tx_arr: u32,
+    /// TIM3 ARR for RX. Picked so the bidir telemetry response
+    /// (5/4 × TX bit period) is sampled at ≈3 samples per bit, which
+    /// is what `uf_dshot::OversamplingConfig::default()` expects.
+    rx_arr: u32,
+    /// Bidir mode toggle: enables CCER polarity inversion, open-drain
+    /// + pull-up idle, and the RX phase. With `bidir = false` the
+    /// driver emits standard DShot (HIGH-pulse, idle LOW, push-pull)
+    /// and the RX phase is a no-op.
+    bidir: bool,
 
     buf_tim3: &'static mut [u32; TIM3_BUF_LEN],
     rx_buffer: &'static mut [u16; 256],
     dma_tim3_rx: Peri<'d, DMA1_CH6>,
-    
-    // Decoders for telemetry
+
+    // Decoders for telemetry (unused when bidir == false).
     decoders: [uf_dshot::BidirDecoder; 4],
 
     frame_count: u32,
@@ -91,6 +104,7 @@ impl<'d> DshotQuad<'d> {
         dma_tim3_up: Peri<'d, DMA1_CH7>,
         dma_tim3_rx: Peri<'d, DMA1_CH6>,
         speed: DshotSpeed,
+        bidir: bool,
     ) -> Self {
         const TIMER_CLOCK_HZ: u32 = 240_000_000;
         let bitrate = speed.timing_hints().nominal_bitrate_hz;
@@ -99,16 +113,29 @@ impl<'d> DshotQuad<'d> {
         let t0h = period * 3 / 8;
         let freq = Hertz(bitrate);
 
+        // Cached ARR values. The bidir telemetry response uses a bit
+        // period 5/4× longer than the TX bit period (so it's *slower*,
+        // not faster). `OversamplingConfig::default()` wants 3 samples
+        // per response bit, so sample period in timer ticks
+        // = period_TX × 5/4 / 3 = period_TX × 5/12. ARR = ticks − 1.
+        let tx_arr = period - 1;
+        let rx_arr = (period * 5 / 12).saturating_sub(1);
+
         // ---- TIM3: CH3 (PB0), CH4 (PB1), CH2 (PB5), CH1 (PB4) ----
-        // Open-drain so the line can be pulled LOW by either side
-        // without contention; pull-up takes the idle HIGH. See header
-        // comment for the full rationale.
+        // Output type depends on mode:
+        //   - Bidir: open-drain + pull-up. The ESC also drives the
+        //     line during its telemetry response phase; OD avoids
+        //     push-pull contention if our cleanup races the response.
+        //   - Standard: push-pull. We own the wire end-to-end, and a
+        //     push-pull HIGH is crisper for the ESC's RC-time-constant
+        //     detection on the rising edge of each bit cell.
+        let pin_otype = if bidir { OutputType::OpenDrain } else { OutputType::PushPull };
         let mut tim3_pwm = SimplePwm::new(
             tim3,
-            Some(PwmPin::new(pb4, OutputType::OpenDrain)), // CH1 → M4
-            Some(PwmPin::new(pb5, OutputType::OpenDrain)), // CH2 → M3
-            Some(PwmPin::new(pb0, OutputType::OpenDrain)), // CH3 → M1
-            Some(PwmPin::new(pb1, OutputType::OpenDrain)), // CH4 → M2
+            Some(PwmPin::new(pb4, pin_otype)), // CH1 → M4
+            Some(PwmPin::new(pb5, pin_otype)), // CH2 → M3
+            Some(PwmPin::new(pb0, pin_otype)), // CH3 → M1
+            Some(PwmPin::new(pb1, pin_otype)), // CH4 → M2
             freq,
             CountingMode::EdgeAlignedUp,
         );
@@ -118,26 +145,29 @@ impl<'d> DshotQuad<'d> {
             c.enable();
         }
 
-        // Invert each channel's polarity for bidir DShot. With CCxP=1
-        // and PWM Mode 1: the timer drives LOW while counter < CCR,
-        // and "drives" HIGH (open-drain → high-Z → pull-up) otherwise.
-        // CCR = t1h gives a 75 % LOW pulse ("1"), CCR = t0h gives a
-        // 37.5 % LOW pulse ("0"), CCR = 0 leaves the line at idle.
-        pac::TIM3.ccer().modify(|w| {
-            w.set_ccp(0, true); // CH1
-            w.set_ccp(1, true); // CH2
-            w.set_ccp(2, true); // CH3
-            w.set_ccp(3, true); // CH4
-        });
-
-        // Internal pull-up on all four pins so the open-drain HIGH
-        // state is robust independent of any ESC-side pull-up.
-        pac::GPIOB.pupdr().modify(|w| {
-            w.set_pupdr(0, pac::gpio::vals::Pupdr::PULL_UP);
-            w.set_pupdr(1, pac::gpio::vals::Pupdr::PULL_UP);
-            w.set_pupdr(4, pac::gpio::vals::Pupdr::PULL_UP);
-            w.set_pupdr(5, pac::gpio::vals::Pupdr::PULL_UP);
-        });
+        // Bidir-only: invert CCER polarity and engage pull-up.
+        // With CCxP=1 and PWM Mode 1 the timer drives LOW while
+        // counter < CCR and goes high-Z otherwise; the pull-up takes
+        // the line back HIGH. CCR = t1h → 75 % LOW pulse ("1"),
+        // CCR = t0h → 37.5 % LOW pulse ("0"), CCR = 0 → idle HIGH.
+        //
+        // Standard DShot keeps CCxP=0 (default after SimplePwm::new)
+        // so the push-pull timer drives HIGH while counter < CCR and
+        // LOW otherwise — exactly the conventional bit shape.
+        if bidir {
+            pac::TIM3.ccer().modify(|w| {
+                w.set_ccp(0, true); // CH1
+                w.set_ccp(1, true); // CH2
+                w.set_ccp(2, true); // CH3
+                w.set_ccp(3, true); // CH4
+            });
+            pac::GPIOB.pupdr().modify(|w| {
+                w.set_pupdr(0, pac::gpio::vals::Pupdr::PULL_UP);
+                w.set_pupdr(1, pac::gpio::vals::Pupdr::PULL_UP);
+                w.set_pupdr(4, pac::gpio::vals::Pupdr::PULL_UP);
+                w.set_pupdr(5, pac::gpio::vals::Pupdr::PULL_UP);
+            });
+        }
 
         // DShot DMA buffer — placed in SRAM1
         let buf_tim3: &'static mut [u32; TIM3_BUF_LEN] =
@@ -146,12 +176,25 @@ impl<'d> DshotQuad<'d> {
         let rx_buffer: &'static mut [u16; 256] =
             unsafe { &mut *(RX_BUFFER_ADDR as *mut [u16; 256]) };
 
+        defmt::info!(
+            "DShot init: speed={=?} bidir={=bool} tx_arr={=u32} rx_arr={=u32} t0h={=u32} t1h={=u32}",
+            speed,
+            bidir,
+            tx_arr,
+            rx_arr,
+            t0h,
+            t1h,
+        );
+
         Self {
             tim3: tim3_pwm,
             dma_tim3_up,
             dma_tim3_rx,
             t1h,
             t0h,
+            tx_arr,
+            rx_arr,
+            bidir,
             buf_tim3,
             rx_buffer,
             decoders: [
@@ -242,12 +285,33 @@ impl<'d> DshotQuad<'d> {
             .await;
         }
         pac::TIM3.dier().modify(|w| w.set_ude(false)); // Disable Update DMA
-        
-        // Wait for the trailing low bits to finish outputting (8 bits * 1.66us = 13.3us)
-        embassy_time::Timer::after_micros(15).await;
 
-        // ---- Rx Phase ----
-        // 1. Reconfigure pins to Input PullUp
+        // Wait for the trailing zero cells to finish (8 cells at the
+        // current TX bit period). At DShot600 that's ~13 µs; at
+        // DShot300 ~27 µs; at DShot150 ~53 µs. Pad by 2 µs and scale.
+        let trailing_us: u32 = ((self.tx_arr + 1) * 8) / 240 + 2;
+        embassy_time::Timer::after_micros(trailing_us as u64).await;
+
+        if !self.bidir {
+            // Standard DShot: no telemetry. Skip the entire RX phase
+            // and return a placeholder per channel so the caller's
+            // tally still updates (NoEdge == "we never saw an edge"
+            // is the cleanest match — semantically there was no
+            // response to start with).
+            self.frame_count = self.frame_count.wrapping_add(1);
+            if self.frame_count.is_multiple_of(800) {
+                self.log_runtime_state();
+            }
+            return [
+                Err(uf_dshot::TelemetryError::NoEdge),
+                Err(uf_dshot::TelemetryError::NoEdge),
+                Err(uf_dshot::TelemetryError::NoEdge),
+                Err(uf_dshot::TelemetryError::NoEdge),
+            ];
+        }
+
+        // ---- Rx Phase (bidir only) ----
+        // 1. Reconfigure pins to Input PullUp.
         pac::GPIOB.moder().modify(|w| {
             w.set_moder(0, pac::gpio::vals::Moder::INPUT);
             w.set_moder(1, pac::gpio::vals::Moder::INPUT);
@@ -261,20 +325,18 @@ impl<'d> DshotQuad<'d> {
             w.set_pupdr(5, pac::gpio::vals::Pupdr::PULL_UP);
         });
 
-        // 2. Change TIM3 ARR to sample at ~1.44 MHz (167 ticks at 240 MHz).
-        // Rationale: uf-dshot's `OversamplingConfig::default()` expects
-        // 3 samples per response bit. DShot600 bidir telemetry uses a
-        // bit cell of (5/4) × 1.667 µs = 2.083 µs, so the matching
-        // sample period is 2.083 / 3 ≈ 0.694 µs, i.e. ARR = 166.
-        // Previously we sampled at 1.8 MHz (~3.76 samples/bit) which
-        // is workable for the `tuned` decoder once it's adapted but
-        // can mis-tune on the very first frame after boot.
-        pac::TIM3.arr().modify(|w| w.set_arr(167 - 1));
+        // 2. Switch TIM3 ARR to the cached RX sample rate.
+        // `OversamplingConfig::default()` expects 3 samples per
+        // response bit. The bidir response bit cell is 5/4 × the TX
+        // bit period, so the matching sample period = period × 4/15;
+        // `rx_arr` is that minus one. Cached at construction so this
+        // tracks whatever DShot speed was selected.
+        pac::TIM3.arr().modify(|w| w.set_arr(self.rx_arr as u16));
 
-        // 3. Start Rx DMA reading GPIOB_IDR
+        // 3. Start Rx DMA reading GPIOB_IDR.
         let rx_req = <DMA1_CH6 as UpDma<TIM3>>::request(&self.dma_tim3_rx);
         pac::TIM3.dier().modify(|w| w.set_ude(true));
-        
+
         unsafe {
             use embassy_stm32::dma::{Transfer, TransferOptions};
             Transfer::new_read(
@@ -287,12 +349,10 @@ impl<'d> DshotQuad<'d> {
         }
         pac::TIM3.dier().modify(|w| w.set_ude(false));
 
-        // 4. Restore pins and Timer for next cycle.
-        // ARR back to 400 ticks (1.667 µs cell @ 240 MHz / 600 kHz).
+        // 4. Restore pins and timer for the next cycle.
         // PUPDR stays PULL_UP — with open-drain alternate-function
-        // output the HIGH idle is provided by the pull-up, so we keep
-        // it engaged across both INPUT and ALTERNATE modes.
-        pac::TIM3.arr().modify(|w| w.set_arr(399)); // 400 - 1
+        // output the HIGH idle is provided by the pull-up.
+        pac::TIM3.arr().modify(|w| w.set_arr(self.tx_arr as u16));
         pac::GPIOB.moder().modify(|w| {
             w.set_moder(0, pac::gpio::vals::Moder::ALTERNATE);
             w.set_moder(1, pac::gpio::vals::Moder::ALTERNATE);
@@ -300,7 +360,7 @@ impl<'d> DshotQuad<'d> {
             w.set_moder(5, pac::gpio::vals::Moder::ALTERNATE);
         });
 
-        // 5. Decode Telemetry
+        // 5. Decode telemetry.
         // M1=CH3(PB0), M2=CH4(PB1), M3=CH2(PB5), M4=CH1(PB4)
         let frame1 = self.decoders[0].decode_frame_tuned_port_samples_u16(self.rx_buffer, 1 << 0);
         let frame2 = self.decoders[1].decode_frame_tuned_port_samples_u16(self.rx_buffer, 1 << 1);
