@@ -77,26 +77,23 @@ material hardware or design change lands (see `CLAUDE.md`).
   at 100 Hz predict. Baro and GPS fuse as independent measurement
   paths — pilot decides what to fly with via the soft arm gate
   (`baro_ready || gps_home_latched`).
-  - **GPS position**: home latches on the **centroid of a stable
-    window** of quality-gated fixes. Quality gate is `FIX3D &&
-    sats ≥ 7 && HDOP < 2.0` (tightened from the Alpha-era 5 / 3.5 to
-    match the post-Alpha target). On top of that, a two-stage
-    stability test prevents anchoring the home origin against early
-    acquisition wander:
-    - *Fast path* — ≥ 30 s of samples with spread ≤ 10 m → latch.
-      Handles the "receiver already locked at power-on" case so
-      we don't pay 60 s for a clean fix.
-    - *Slow path* — ≥ 60 s of samples with spread ≤ 100 m → latch.
-      Wandering acquisitions fail the fast test but eventually pass
-      this one once the wander rolls out of the sliding window.
-    Home is latched at the centroid of the stable window, not the
-    latest sample. Once latched the stability gate is no longer
-    consulted — every quality-passing GGA fuses. Subsequent good
-    fixes fuse as local NED. σ_gps_h = 2 m, σ_gps_v = 5 m.
-    Per-sentence signal storms are deduped at the consumer
-    (`pos_kf_task`) so the same GGA isn't fused 3–5× per cycle
-    (which over-shrinks P_pp and dominates the filter with stale
-    noise). Diagnostic now reports `Nsig / Npos / Nvel` per second.
+  - **GPS position**: HDOP-only home latch (2026-05-15). Per-fix
+    quality gate is `FIX3D && sats >= 4 && hdop < 2.5`. Home latches
+    against the third consecutive lat/lon-fresh fix passing the gate
+    — `STREAK_TO_LATCH = 3` guards against single-fix cold-start
+    glitches without paying a fixed time window. The pre-2026-05-15
+    two-stage spatial-stability buffer (30 s fast / 60 s slow at sats
+    ≥ 7) was removed: the previous receiver never produced enough
+    sats to clear it (pre-arm log on 2026-05-14 ran for 1 h with home
+    never latching), and "stability of N samples" is the wrong
+    primitive — HDOP per-fix is the actual per-measurement
+    uncertainty and the KF's R-matrix already weights by it. Each
+    fuse uses `update_gps_scaled` with σ_h / σ_v scaled by the
+    fix's HDOP (clamped to [1.0, 2.5]) so noisier fixes contribute
+    proportionally less. Home is *provisional* pre-arm and re-anchors
+    on ARM to whatever fix is current. Per-sentence signal storms
+    are deduped at the consumer so the same GGA isn't fused 3–5×.
+    Diagnostic reports `Nsig / Npos / Nvel` per second.
   - **GPS velocity** (NMEA RMC ground speed × course) fuses
     independently of home latching at σ = 0.3 m/s, via the new
     `PosKf::update_gps_velocity(vn, ve)` method. This caps DR
@@ -105,21 +102,25 @@ material hardware or design change lands (see `CLAUDE.md`).
     diverging immediately. Below 0.3 m/s ground speed the path
     fuses (0, 0) since RMC course is undefined at low speeds —
     actively damps drift while stationary.
-  - **Baro** is *not* fused before arm. On the Disarmed→Armed event
-    the `ARM_LATCH` signal makes pos_kf_task latch `p_ref = current
-    pressure` and zero the KF's vertical state, so altitude reads
-    ~0 at arm. From arm forward baro fuses every sample at σ_baro =
-    0.3 m, which dominates GPS altitude over the short term.
+  - **Baro** fuses continuously from the first sample (2026-05-15).
+    First sample seeds a *provisional* `p_ref_pa`; from there every
+    sample fuses via `update_baro` at σ_baro = 0.3 m. On the
+    Disarmed→Armed event the `ARM_LATCH` signal re-anchors `p_ref`
+    to the current pressure, re-anchors home to the current GPS fix
+    (if healthy), and zeroes the full 6-state KF so altitude and NED
+    both read ~0 at arm. The pre-2026-05-15 design only fused baro
+    post-arm; pre-arm the KF ran pure IMU prediction and altitude
+    drifted unbounded (~900 km in the same 1 h log that exposed the
+    home-latch bug).
   - **Readiness flags**: `altitude_ready` (= `baro_fresh ||
     home_latched`, where `baro_fresh = last_baro_t.elapsed() < 1 s`;
     gates AltHold and PosHold) and `home_latched` (gates GpsRescue /
     GpsHome / RTH). Tied to actual sample freshness rather than the
-    one-shot `baro_p_ref_latched` flag — that flag now means "have
-    we processed ARM_LATCH" and only gates baro fusion, nothing
-    user-facing. Without this split, the readiness flag (a) couldn't
-    clear pre-arm even when baro was alive, deadlocking the arm
-    gate, and (b) couldn't fall back to false if the baro died
-    mid-flight.
+    one-shot `p_ref_at_arm` flag — that flag now means only "have we
+    processed ARM_LATCH" and does *not* gate fusion. Without this
+    split, the readiness flag (a) couldn't clear pre-arm even when
+    baro was alive, deadlocking the arm gate, and (b) couldn't fall
+    back to false if the baro died mid-flight.
   - Outdoor verification 2026-04-20 (under the prior GPS-anchored
     design): clean ready transition, baro 26 reads/s with 0 errors,
     post-home-latch IMU-only drift (~1500 m) corrected in one GPS
@@ -173,12 +174,17 @@ material hardware or design change lands (see `CLAUDE.md`).
 
 ### post-Alpha tweaks
 
-- [x] GPS thresholds tightened to 7 sats / HDOP < 2.0. Implemented
-  2026-05-14 together with a two-stage stability-windowed home latch
-  (30 s/10 m fast path, 60 s/100 m slow path, anchored at the
-  centroid) and consumer-side dedupe so per-sentence NMEA signal
-  storms can't re-fuse the same GGA into the KF. See "What's
-  Verified → GPS position" for the full design.
+- [x] GPS home latch + pre-arm fusion overhaul (2026-05-15). The
+  2026-05-14 two-stage stability buffer was removed: a 1 h pre-arm
+  log showed the receiver never produced enough sats (peak 6) to
+  clear the sats ≥ 7 gate, and the buffer's FIFO ageing meant even
+  on a perfect receiver the 30 s spread test couldn't fire. Replaced
+  with an HDOP-only gate (`sats >= 4 && hdop < 2.5`, 3-consecutive
+  streak to latch), per-fix HDOP-scaled `update_gps_scaled`,
+  always-fusing baro with a provisional `p_ref_pa` seeded from the
+  first sample, and an arm-time frame re-origin that zeroes the
+  KF state and re-anchors both p_ref and home. See "What's Verified
+  → GPS position / Baro" for the full design.
 - [x] Re-enable arming on baro only, but if GPS fix is available set home co-ords. Implemented 2026-05-08: arming gate is now soft (`baro_ready || gps_home_latched`); baro p_ref latches on the Disarmed→Armed transition via `ARM_LATCH` signal; `PosEstimate` exposes split `altitude_ready` / `home_latched` flags. `arming::ArmingStateMachine.require_gps` renamed to `require_altitude_ref`.
 - [x] Assign CRSF channels for user-initiated GPS Rescue, pos-hold and alt-hold functionality. (Implemented: CH5 for mode, CH6 for RTH trigger)
 - [ ] ESC Bidirectional Dshot functionality
@@ -301,7 +307,7 @@ All host-tested (`cargo test --lib --no-default-features --target x86_64-unknown
 | Position PD      | `control/position.rs`    | Horizontal hold, world→body rotation, tilt-limited — **written, not yet wired** |
 | Quad-X mixer     | `control/mixer.rs`       | Airmode + no-airmode paths, phantom-thrust prevention         |
 | Arming FSM       | `control/arming.rs`      | Pre-arm (thr/lvl/imu/rc/altitude_ref), soft baro-or-GPS gate, failsafe-on-RC-loss (never disarms; control loop chooses descent), IMU-loss-only auto-disarm |
-| PosKF            | `estimation.rs`          | 6-state linear KF; GPS position + GPS velocity + baro + IMU predict; stability-windowed home latch |
+| PosKF            | `estimation.rs`          | 6-state linear KF; GPS position (HDOP-scaled R) + GPS velocity + baro (pre-arm provisional p_ref) + IMU predict; arm re-origins frame |
 | MEKF             | `attitude_mekf.rs`       | Quaternion MEKF with gyro-bias state, 8 kHz predict, 100 Hz accel + 100 Hz mag updates |
 | IMU LPF          | `imu_filter.rs`          | 2nd-order Butterworth biquad bank applied to fused dual-IMU stream; 150 Hz gyro / 25 Hz accel default |
 | CRSF parser      | `drivers/crsf.rs`        | Byte streaming, 11-bit unpack, link stats, CRC8              |

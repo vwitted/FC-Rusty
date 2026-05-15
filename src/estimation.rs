@@ -174,10 +174,24 @@ impl PosKf {
         self.symmetrise();
     }
 
-    /// GPS position measurement update.
-    ///
-    /// `z_gps_ned` is the noisy [px, py, pz] fix in the NED world frame.
+    /// GPS position measurement update using the σ baked into the
+    /// filter at construction time.
     pub fn update_gps(&mut self, z_gps_ned: [f32; 3]) {
+        self.update_gps_scaled(z_gps_ned, self.sigma_gps_h, self.sigma_gps_v);
+    }
+
+    /// GPS position measurement update with per-call σ override.
+    ///
+    /// Lets callers scale the R-matrix per fix — typically by HDOP, so
+    /// a hdop=1.0 fix weighs in fully while a hdop=2.5 fix is treated
+    /// as proportionally noisier. The state-machine sigma fields stay
+    /// untouched.
+    pub fn update_gps_scaled(
+        &mut self,
+        z_gps_ned: [f32; 3],
+        sigma_h: f32,
+        sigma_v: f32,
+    ) {
         // H = [ I₃ | 0₃ ]  so H·x picks off [px, py, pz].
         let z = Vector3::from_column_slice(&z_gps_ned);
         let y = z - Vector3::new(self.x[0], self.x[1], self.x[2]);
@@ -185,9 +199,9 @@ impl PosKf {
         // S = H·P·H^T + R = Ppp + R
         let ppp = self.p_cov.fixed_view::<3, 3>(0, 0).into_owned();
         let mut s = ppp;
-        s[(0, 0)] += self.sigma_gps_h * self.sigma_gps_h;
-        s[(1, 1)] += self.sigma_gps_h * self.sigma_gps_h;
-        s[(2, 2)] += self.sigma_gps_v * self.sigma_gps_v;
+        s[(0, 0)] += sigma_h * sigma_h;
+        s[(1, 1)] += sigma_h * sigma_h;
+        s[(2, 2)] += sigma_v * sigma_v;
 
         let s_inv = match s.try_inverse() {
             Some(m) => m,
@@ -353,264 +367,6 @@ pub fn geodetic_to_local_ned(
     let down = -(alt_msl - alt_ref_msl);
 
     [north, east, down]
-}
-
-// ---- GPS home-latch stability check ----
-//
-// Early NMEA fixes drift for tens of seconds even after the receiver
-// reports sats >= 7 and HDOP < 2.0 — modules will frame-narrow as more
-// satellites lock, and the reported position can wander by tens of
-// metres in the process. Latching home against an early fix anchors
-// every subsequent `geodetic_to_local_ned` against a wrong reference,
-// and the PosKF then tracks GPS *deltas* correctly but reads as
-// "wildly wrong" in absolute terms.
-//
-// The stability buffer holds the last `CAP` quality-gated samples (the
-// caller is responsible for only pushing fixes that already passed
-// sats / HDOP gates). Two-stage latch criterion:
-//
-//   - **Fast path**: at least `FAST_MIN_AGE_S` seconds and `FAST_MIN_N`
-//     samples span the buffer, and every sample is within
-//     `FAST_RADIUS_M` of the centroid. Catches the "already locked at
-//     power-on" case so we don't pay 60 s for a clean receiver.
-//   - **Slow path**: at least `SLOW_MIN_AGE_S` seconds and `SLOW_MIN_N`
-//     samples, every sample within `SLOW_RADIUS_M` of the centroid.
-//     Wandering acquisitions fail the fast test but eventually pass
-//     this one once the wander rolls out of the sliding window.
-//
-// The centroid is returned alongside so the caller can latch home at
-// the mean of the stable samples rather than the noisier latest one.
-
-/// Single quality-gated GPS fix awaiting home-latch consideration.
-#[derive(Clone, Copy, Debug)]
-pub struct StabilitySample {
-    pub lat_deg: f64,
-    pub lon_deg: f64,
-    pub alt_msl_m: f32,
-    /// Monotonic timestamp in milliseconds. Caller chooses the epoch;
-    /// only differences matter.
-    pub t_ms: u64,
-}
-
-/// Tuning for the two-stage latch.
-#[derive(Clone, Copy, Debug)]
-pub struct StabilityConfig {
-    pub fast_min_age_s: u32,
-    pub fast_min_samples: usize,
-    pub fast_radius_m: f32,
-    pub slow_min_age_s: u32,
-    pub slow_min_samples: usize,
-    pub slow_radius_m: f32,
-    /// Samples older than this are evicted from the buffer.
-    pub window_s: u32,
-}
-
-impl Default for StabilityConfig {
-    fn default() -> Self {
-        Self {
-            fast_min_age_s: 30,
-            fast_min_samples: 15,
-            fast_radius_m: 10.0,
-            slow_min_age_s: 60,
-            slow_min_samples: 30,
-            slow_radius_m: 100.0,
-            window_s: 60,
-        }
-    }
-}
-
-/// Centroid + decision returned by [`evaluate_stability`].
-#[derive(Clone, Copy, Debug)]
-pub struct StabilityDecision {
-    pub latch: bool,
-    /// Centroid of the buffer (only meaningful when `latch` is true).
-    pub lat_deg: f64,
-    pub lon_deg: f64,
-    pub alt_msl_m: f32,
-    /// Max distance from the centroid across all samples, metres.
-    /// Useful for diagnostics regardless of `latch`.
-    pub spread_m: f32,
-    /// Time span of the buffer (oldest to newest), seconds.
-    pub age_s: f32,
-    pub samples: usize,
-}
-
-/// Capacity of the home-latch stability buffer. 64 entries × 1 Hz NMEA
-/// covers a 60 s window with headroom; pushes past `CAP` are no-ops
-/// (drop the new sample) — by design, the slow path is at-most-60-s,
-/// so we'd be discarding samples we don't need.
-pub const STABILITY_CAP: usize = 64;
-
-/// Fixed-capacity FIFO of quality-gated GPS samples.
-///
-/// Insertion-ordered; `push` evicts the oldest entry when full, and
-/// `trim_older_than` evicts entries by age. Designed for `no_std` use
-/// with no allocator dependency.
-pub struct StabilityBuffer {
-    samples: [StabilitySample; STABILITY_CAP],
-    head: usize,
-    len: usize,
-}
-
-impl StabilityBuffer {
-    pub const fn new() -> Self {
-        Self {
-            samples: [StabilitySample {
-                lat_deg: 0.0,
-                lon_deg: 0.0,
-                alt_msl_m: 0.0,
-                t_ms: 0,
-            }; STABILITY_CAP],
-            head: 0,
-            len: 0,
-        }
-    }
-
-    #[allow(dead_code)] // public API; used by host tests, kept for callers.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    #[allow(dead_code)]
-    pub fn clear(&mut self) {
-        self.head = 0;
-        self.len = 0;
-    }
-
-    fn idx(&self, i: usize) -> usize {
-        (self.head + i) % STABILITY_CAP
-    }
-
-    /// Append a sample. When the buffer is full this evicts the oldest
-    /// entry — fine because the slow-path window caps out at 60 s and
-    /// the buffer is sized to hold that at 1 Hz with headroom.
-    pub fn push(&mut self, s: StabilitySample) {
-        if self.len < STABILITY_CAP {
-            let pos = (self.head + self.len) % STABILITY_CAP;
-            self.samples[pos] = s;
-            self.len += 1;
-        } else {
-            // Buffer full: overwrite the oldest slot and advance head.
-            self.samples[self.head] = s;
-            self.head = (self.head + 1) % STABILITY_CAP;
-        }
-    }
-
-    /// Drop entries whose timestamp is older than `now_ms - max_age_ms`.
-    pub fn trim_older_than(&mut self, now_ms: u64, max_age_ms: u64) {
-        let cutoff = now_ms.saturating_sub(max_age_ms);
-        while self.len > 0 {
-            let oldest = self.samples[self.head];
-            if oldest.t_ms < cutoff {
-                self.head = (self.head + 1) % STABILITY_CAP;
-                self.len -= 1;
-            } else {
-                break;
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn oldest(&self) -> Option<StabilitySample> {
-        if self.len == 0 { None } else { Some(self.samples[self.head]) }
-    }
-
-    #[allow(dead_code)]
-    pub fn newest(&self) -> Option<StabilitySample> {
-        if self.len == 0 {
-            None
-        } else {
-            let pos = (self.head + self.len - 1) % STABILITY_CAP;
-            Some(self.samples[pos])
-        }
-    }
-}
-
-/// Evaluate the home-latch criterion. Returns the decision plus the
-/// centroid (only meaningful when `latch == true`) and diagnostic
-/// `spread_m` / `age_s` / `samples`.
-///
-/// The centroid is a flat-mean of lat/lon/alt; for the small angular
-/// extents we care about (≤ 100 m radius at any plausible latitude)
-/// the difference between a flat mean and a spherical centroid is well
-/// below GPS noise.
-pub fn evaluate_stability(
-    buf: &StabilityBuffer,
-    cfg: &StabilityConfig,
-    now_ms: u64,
-) -> StabilityDecision {
-    let n = buf.len;
-    if n == 0 {
-        return StabilityDecision {
-            latch: false,
-            lat_deg: 0.0,
-            lon_deg: 0.0,
-            alt_msl_m: 0.0,
-            spread_m: 0.0,
-            age_s: 0.0,
-            samples: 0,
-        };
-    }
-
-    // Centroid (flat mean).
-    let mut sum_lat: f64 = 0.0;
-    let mut sum_lon: f64 = 0.0;
-    let mut sum_alt: f64 = 0.0;
-    for i in 0..n {
-        let s = buf.samples[buf.idx(i)];
-        sum_lat += s.lat_deg;
-        sum_lon += s.lon_deg;
-        sum_alt += s.alt_msl_m as f64;
-    }
-    let mean_lat = sum_lat / n as f64;
-    let mean_lon = sum_lon / n as f64;
-    let mean_alt = (sum_alt / n as f64) as f32;
-
-    // Max horizontal distance from the centroid, metres.
-    const R_EARTH: f64 = 6_378_137.0;
-    const DEG2RAD: f64 = core::f64::consts::PI / 180.0;
-    let cos_lat = libm::cos(mean_lat * DEG2RAD);
-    let mut max_d2_m: f64 = 0.0;
-    for i in 0..n {
-        let s = buf.samples[buf.idx(i)];
-        let dn = (s.lat_deg - mean_lat) * DEG2RAD * R_EARTH;
-        let de = (s.lon_deg - mean_lon) * DEG2RAD * R_EARTH * cos_lat;
-        let d2 = dn * dn + de * de;
-        if d2 > max_d2_m {
-            max_d2_m = d2;
-        }
-    }
-    let spread_m = libm::sqrtf(max_d2_m as f32);
-
-    // Buffer span (newest − oldest).
-    let oldest_t = buf.samples[buf.idx(0)].t_ms;
-    // `now_ms` rather than newest sample so a stream that's gone quiet
-    // doesn't keep "ageing" toward latch on stale data.
-    let age_ms = now_ms.saturating_sub(oldest_t);
-    let age_s = (age_ms as f64 / 1000.0) as f32;
-
-    // Two-stage check (fast first, then slow as a fallback).
-    let fast_ok = age_s >= cfg.fast_min_age_s as f32
-        && n >= cfg.fast_min_samples
-        && spread_m <= cfg.fast_radius_m;
-    let slow_ok = age_s >= cfg.slow_min_age_s as f32
-        && n >= cfg.slow_min_samples
-        && spread_m <= cfg.slow_radius_m;
-
-    StabilityDecision {
-        latch: fast_ok || slow_ok,
-        lat_deg: mean_lat,
-        lon_deg: mean_lon,
-        alt_msl_m: mean_alt,
-        spread_m,
-        age_s,
-        samples: n,
-    }
 }
 
 #[cfg(test)]
@@ -781,136 +537,52 @@ mod tests {
         }
     }
 
-    // ---- Home-latch stability tests ----
-
-    fn s_at(lat: f64, lon: f64, t_ms: u64) -> StabilitySample {
-        StabilitySample {
-            lat_deg: lat,
-            lon_deg: lon,
-            alt_msl_m: 50.0,
-            t_ms,
-        }
-    }
-
-    /// Convert a metres offset to a (small) lat/lon delta near the
-    /// reference. Useful for building scenarios in physical units.
-    fn offset_m(lat_ref: f64, dn_m: f32, de_m: f32) -> (f64, f64) {
-        const R_EARTH: f64 = 6_378_137.0;
-        const DEG2RAD: f64 = core::f64::consts::PI / 180.0;
-        let dlat = (dn_m as f64) / R_EARTH / DEG2RAD;
-        let dlon =
-            (de_m as f64) / R_EARTH / DEG2RAD / libm::cos(lat_ref * DEG2RAD);
-        (lat_ref + dlat, dlon)
-    }
-
+    /// Passing the filter's own sigmas to `update_gps_scaled` should
+    /// produce an identical post-fuse state to `update_gps`.
     #[test]
-    fn stability_fast_path_latches_on_already_locked_module() {
-        // Receiver already locked at boot: 1 Hz samples for 30 s, all
-        // within 5 m of truth → fast-path fires at ~30 s.
-        let mut buf = StabilityBuffer::new();
-        let cfg = StabilityConfig::default();
-        let truth_lat = 51.5;
-        let mut latched_at: Option<u64> = None;
+    fn update_gps_scaled_matches_update_gps_at_default_sigmas() {
+        let init = [1.0, -0.5, -2.0];
+        let measurement = [3.0, 1.0, -5.0];
 
-        for sec in 0..40 {
-            // Tiny ±3 m oscillation, well inside fast-path radius (10 m).
-            let dn = if sec % 2 == 0 { 3.0 } else { -3.0 };
-            let de = if sec % 3 == 0 { 2.0 } else { -2.0 };
-            let (lat, lon_off) = offset_m(truth_lat, dn, de);
-            buf.push(s_at(lat, lon_off, sec * 1000));
-            buf.trim_older_than(sec * 1000, (cfg.window_s as u64) * 1000);
-            let d = evaluate_stability(&buf, &cfg, sec * 1000);
-            if d.latch && latched_at.is_none() {
-                latched_at = Some(sec);
-                // Centroid should be very close to truth (within 1 m).
-                let (_, dlon) = offset_m(truth_lat, 0.0, 0.0);
-                assert!((d.lat_deg - truth_lat).abs() < 1e-5,
-                        "lat centroid drifted: {} vs {}", d.lat_deg, truth_lat);
-                assert!((d.lon_deg - dlon).abs() < 1e-5,
-                        "lon centroid drifted");
+        let mut kf_a = PosKf::new_at(init, 0.5, 2.0, 5.0, 0.3);
+        let mut kf_b = PosKf::new_at(init, 0.5, 2.0, 5.0, 0.3);
+
+        kf_a.update_gps(measurement);
+        kf_b.update_gps_scaled(measurement, 2.0, 5.0);
+
+        for i in 0..KF_NX {
+            assert!(
+                (kf_a.x[i] - kf_b.x[i]).abs() < 1e-6,
+                "state[{i}] diverged: {} vs {}", kf_a.x[i], kf_b.x[i],
+            );
+            for j in 0..KF_NX {
+                assert!(
+                    (kf_a.p_cov[(i, j)] - kf_b.p_cov[(i, j)]).abs() < 1e-6,
+                    "P[{i},{j}] diverged",
+                );
             }
         }
-        let t = latched_at.expect("fast-path should have latched");
-        assert!(t <= 31, "fast-path latched too late: {} s", t);
     }
 
+    /// A noisier (larger-sigma) fix should pull the state less than a
+    /// tighter one given the same measurement and starting condition.
     #[test]
-    fn stability_slow_path_latches_after_wander_subsides() {
-        // First 20 s of wander (radius ~150 m), then settles inside
-        // 50 m for the next 60 s. Fast-path never fires; slow-path
-        // latches once the wander rolls out of the 60 s window.
-        let mut buf = StabilityBuffer::new();
-        let cfg = StabilityConfig::default();
-        let truth_lat = 40.0;
-        let mut latched_at: Option<u64> = None;
+    fn update_gps_scaled_high_sigma_pulls_less() {
+        let init = [0.0, 0.0, 0.0];
+        let measurement = [10.0, 0.0, 0.0];
 
-        for sec in 0..120 {
-            let (dn, de) = if sec < 20 {
-                // Big initial wander
-                let phase = (sec as f32) * 0.7;
-                (150.0 * libm::cosf(phase), 150.0 * libm::sinf(phase))
-            } else {
-                // Settled within 50 m centred on truth
-                let phase = (sec as f32) * 0.3;
-                (20.0 * libm::cosf(phase), 20.0 * libm::sinf(phase))
-            };
-            let (lat, lon_off) = offset_m(truth_lat, dn, de);
-            buf.push(s_at(lat, lon_off, sec * 1000));
-            buf.trim_older_than(sec * 1000, (cfg.window_s as u64) * 1000);
-            let d = evaluate_stability(&buf, &cfg, sec * 1000);
-            if d.latch && latched_at.is_none() {
-                latched_at = Some(sec);
-            }
-        }
-        let t = latched_at.expect("slow-path should have latched");
-        // Slow-path needs 60 s of post-wander samples; wander ended at
-        // 20 s, so earliest plausible latch is ~80 s. Be generous.
-        assert!(t >= 75 && t <= 95, "slow-path latched at unexpected time: {} s", t);
-    }
+        let mut kf_tight = PosKf::new_at(init, 0.5, 2.0, 5.0, 0.3);
+        let mut kf_loose = PosKf::new_at(init, 0.5, 2.0, 5.0, 0.3);
 
-    #[test]
-    fn stability_never_latches_under_continuous_wander() {
-        // Persistent ±150 m noise — should never latch.
-        let mut buf = StabilityBuffer::new();
-        let cfg = StabilityConfig::default();
-        let truth_lat = -33.0;
+        kf_tight.update_gps_scaled(measurement, 2.0, 5.0);
+        kf_loose.update_gps_scaled(measurement, 20.0, 50.0);
 
-        for sec in 0..180 {
-            let phase = (sec as f32) * 0.9;
-            let dn = 150.0 * libm::cosf(phase);
-            let de = 150.0 * libm::sinf(phase);
-            let (lat, lon_off) = offset_m(truth_lat, dn, de);
-            buf.push(s_at(lat, lon_off, sec * 1000));
-            buf.trim_older_than(sec * 1000, (cfg.window_s as u64) * 1000);
-            let d = evaluate_stability(&buf, &cfg, sec * 1000);
-            assert!(!d.latch, "unexpectedly latched under wander at {} s", sec);
-        }
-    }
-
-    #[test]
-    fn stability_buffer_trim_drops_old_entries() {
-        let mut buf = StabilityBuffer::new();
-        for sec in 0..10 {
-            buf.push(s_at(51.5, -0.1, sec * 1000));
-        }
-        assert_eq!(buf.len(), 10);
-        // Drop everything older than 5 s relative to t=9 s.
-        buf.trim_older_than(9_000, 5_000);
-        // Keeps entries with t_ms >= 4_000 → seconds 4..=9 → 6 entries.
-        assert_eq!(buf.len(), 6);
-        assert_eq!(buf.oldest().unwrap().t_ms, 4_000);
-        assert_eq!(buf.newest().unwrap().t_ms, 9_000);
-    }
-
-    #[test]
-    fn stability_buffer_eviction_on_overflow() {
-        let mut buf = StabilityBuffer::new();
-        for i in 0..(STABILITY_CAP + 5) {
-            buf.push(s_at(0.0, 0.0, i as u64));
-        }
-        assert_eq!(buf.len(), STABILITY_CAP);
-        // Oldest should now be t_ms = 5 (the first 5 were evicted).
-        assert_eq!(buf.oldest().unwrap().t_ms, 5);
-        assert_eq!(buf.newest().unwrap().t_ms, (STABILITY_CAP + 4) as u64);
+        // Both should move toward the measurement, but the loose one
+        // less so. Compare absolute deltas from the starting position.
+        assert!(
+            kf_tight.x[0] > kf_loose.x[0],
+            "tight {} should exceed loose {}", kf_tight.x[0], kf_loose.x[0],
+        );
+        assert!(kf_loose.x[0] >= 0.0 && kf_loose.x[0] < kf_tight.x[0]);
     }
 }
