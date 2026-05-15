@@ -174,10 +174,24 @@ impl PosKf {
         self.symmetrise();
     }
 
-    /// GPS position measurement update.
-    ///
-    /// `z_gps_ned` is the noisy [px, py, pz] fix in the NED world frame.
+    /// GPS position measurement update using the σ baked into the
+    /// filter at construction time.
     pub fn update_gps(&mut self, z_gps_ned: [f32; 3]) {
+        self.update_gps_scaled(z_gps_ned, self.sigma_gps_h, self.sigma_gps_v);
+    }
+
+    /// GPS position measurement update with per-call σ override.
+    ///
+    /// Lets callers scale the R-matrix per fix — typically by HDOP, so
+    /// a hdop=1.0 fix weighs in fully while a hdop=2.5 fix is treated
+    /// as proportionally noisier. The state-machine sigma fields stay
+    /// untouched.
+    pub fn update_gps_scaled(
+        &mut self,
+        z_gps_ned: [f32; 3],
+        sigma_h: f32,
+        sigma_v: f32,
+    ) {
         // H = [ I₃ | 0₃ ]  so H·x picks off [px, py, pz].
         let z = Vector3::from_column_slice(&z_gps_ned);
         let y = z - Vector3::new(self.x[0], self.x[1], self.x[2]);
@@ -185,9 +199,9 @@ impl PosKf {
         // S = H·P·H^T + R = Ppp + R
         let ppp = self.p_cov.fixed_view::<3, 3>(0, 0).into_owned();
         let mut s = ppp;
-        s[(0, 0)] += self.sigma_gps_h * self.sigma_gps_h;
-        s[(1, 1)] += self.sigma_gps_h * self.sigma_gps_h;
-        s[(2, 2)] += self.sigma_gps_v * self.sigma_gps_v;
+        s[(0, 0)] += sigma_h * sigma_h;
+        s[(1, 1)] += sigma_h * sigma_h;
+        s[(2, 2)] += sigma_v * sigma_v;
 
         let s_inv = match s.try_inverse() {
             Some(m) => m,
@@ -521,5 +535,54 @@ mod tests {
                 assert!(kf.p_cov[(d, d)] >= -1e-6, "P[{d},{d}]={}", kf.p_cov[(d, d)]);
             }
         }
+    }
+
+    /// Passing the filter's own sigmas to `update_gps_scaled` should
+    /// produce an identical post-fuse state to `update_gps`.
+    #[test]
+    fn update_gps_scaled_matches_update_gps_at_default_sigmas() {
+        let init = [1.0, -0.5, -2.0];
+        let measurement = [3.0, 1.0, -5.0];
+
+        let mut kf_a = PosKf::new_at(init, 0.5, 2.0, 5.0, 0.3);
+        let mut kf_b = PosKf::new_at(init, 0.5, 2.0, 5.0, 0.3);
+
+        kf_a.update_gps(measurement);
+        kf_b.update_gps_scaled(measurement, 2.0, 5.0);
+
+        for i in 0..KF_NX {
+            assert!(
+                (kf_a.x[i] - kf_b.x[i]).abs() < 1e-6,
+                "state[{i}] diverged: {} vs {}", kf_a.x[i], kf_b.x[i],
+            );
+            for j in 0..KF_NX {
+                assert!(
+                    (kf_a.p_cov[(i, j)] - kf_b.p_cov[(i, j)]).abs() < 1e-6,
+                    "P[{i},{j}] diverged",
+                );
+            }
+        }
+    }
+
+    /// A noisier (larger-sigma) fix should pull the state less than a
+    /// tighter one given the same measurement and starting condition.
+    #[test]
+    fn update_gps_scaled_high_sigma_pulls_less() {
+        let init = [0.0, 0.0, 0.0];
+        let measurement = [10.0, 0.0, 0.0];
+
+        let mut kf_tight = PosKf::new_at(init, 0.5, 2.0, 5.0, 0.3);
+        let mut kf_loose = PosKf::new_at(init, 0.5, 2.0, 5.0, 0.3);
+
+        kf_tight.update_gps_scaled(measurement, 2.0, 5.0);
+        kf_loose.update_gps_scaled(measurement, 20.0, 50.0);
+
+        // Both should move toward the measurement, but the loose one
+        // less so. Compare absolute deltas from the starting position.
+        assert!(
+            kf_tight.x[0] > kf_loose.x[0],
+            "tight {} should exceed loose {}", kf_tight.x[0], kf_loose.x[0],
+        );
+        assert!(kf_loose.x[0] >= 0.0 && kf_loose.x[0] < kf_tight.x[0]);
     }
 }

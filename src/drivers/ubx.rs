@@ -423,9 +423,11 @@ pub const FACTORY_BAUD: u32 = 9600;
 ///   baud but streaming NMEA (factory default on most u-blox units).
 /// - `Silent`: no recognisable GPS bytes within the window (wrong
 ///   baud or module silent / misrouted).
+#[cfg(feature = "firmware")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ProbeResult { Ubx, NmeaOrSync, Silent }
 
+#[cfg(feature = "firmware")]
 async fn probe_for_data(
     rx: &mut embassy_stm32::usart::UartRx<'_, embassy_stm32::mode::Async>,
 ) -> ProbeResult {
@@ -474,6 +476,7 @@ async fn probe_for_data(
 ///   cold boots reliably — configuring every boot is cheaper than
 ///   debugging "why is it 9600 again after unplugging".
 /// - If no data at either baud: logs a warning and returns 0.
+#[cfg(feature = "firmware")]
 pub async fn configure(
     tx: &mut embassy_stm32::usart::UartTx<'static, embassy_stm32::mode::Async>,
     rx: &mut embassy_stm32::usart::UartRx<'static, embassy_stm32::mode::Async>,
@@ -552,6 +555,7 @@ pub async fn configure(
 }
 
 /// Enable UBX NAV-PVT (0x01 0x07) at 1 Hz on the current UART.
+#[cfg(feature = "firmware")]
 async fn enable_nav_pvt(
     tx: &mut embassy_stm32::usart::UartTx<'static, embassy_stm32::mode::Async>,
 ) {
