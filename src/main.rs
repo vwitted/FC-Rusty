@@ -50,9 +50,9 @@ mod drivers {
     pub mod dshot_diag;
     pub mod dshot_hw;
     pub mod icm42688;
-    pub mod mpu6000;
     pub mod ism6hg256x;
     pub mod lis2mdl;
+    pub mod mpu6000;
     pub mod nmea;
     pub mod ubx;
     pub mod wt901b;
@@ -72,7 +72,6 @@ mod logger;
 mod rc_task;
 
 use attitude_mekf::{AttitudeMekf, G_MPS2, MekfParams};
-use imu_filter::{ImuFilter, ImuFilterParams};
 use control::altitude::{AltitudeController, AltitudeGains};
 use control::arming::{ArmState, ArmingStateMachine};
 use control::mixer::{ControlDemand, QUAD_X};
@@ -81,16 +80,15 @@ use control::pid::{PidGains, PidLimits, RatePidController};
 use control::position::{PositionController, PositionGains};
 use drivers::baro::{self, BaroSample};
 use drivers::crsf::RcChannels;
-use drivers::lis2mdl::{Lis2mdl, MagSample, Orientation as MagOrientation};
 use drivers::dshot_hw::DshotQuad;
-use uf_dshot::{Command, DshotSpeed, DshotTx, EncodedFrame};
 use drivers::icm42688::{Orientation, RawImu};
+use drivers::lis2mdl::{Lis2mdl, MagSample, Orientation as MagOrientation};
 use drivers::mpu6000::Mpu6000;
 use drivers::nmea::{FixMode, GpsData, NmeaParser};
-use drivers::wt901b::{
-    ImuData, UPDATED_ACCEL, UPDATED_ANGLE, UPDATED_GYRO, UPDATED_QUAT,
-};
-use estimation::{geodetic_to_local_ned, PosKf};
+use drivers::wt901b::{ImuData, UPDATED_ACCEL, UPDATED_ANGLE, UPDATED_GYRO, UPDATED_QUAT};
+use estimation::{PosKf, geodetic_to_local_ned};
+use imu_filter::{ImuFilter, ImuFilterParams};
+use uf_dshot::{Command, DshotSpeed, DshotTx, EncodedFrame};
 
 // ---- Flight modes ----
 
@@ -187,7 +185,6 @@ pub struct OuterLoopCommand {
 }
 
 static OUTER_CMD: Watch<CriticalSectionRawMutex, OuterLoopCommand, 2> = Watch::new();
-
 
 /// Counters for the ICM monitor task. Live regardless of whether the
 /// read task is making progress, so a silent INT pin still shows up
@@ -289,8 +286,6 @@ static POS_ESTIMATE: Signal<CriticalSectionRawMutex, PosEstimate> = Signal::new(
 /// any GPS-home anchoring is preserved.
 static ARM_LATCH: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
-
-
 // RC signals are defined in rc_task.rs:
 // rc_task::RC_CHANNELS, rc_task::RC_LINK, rc_task::RC_LAST_SEEN
 
@@ -307,8 +302,8 @@ async fn main(spawner: Spawner) {
     //   APB1 = 120 MHz (prescaler 2), APB1 timers = 240 MHz
     //   APB2 = 120 MHz (prescaler 2), APB2 timers = 240 MHz
     use embassy_stm32::rcc::{
-        AHBPrescaler, APBPrescaler, Hse, HseMode, Pll, PllMul, PllDiv, PllPreDiv,
-        PllSource, Sysclk, VoltageScale,
+        AHBPrescaler, APBPrescaler, Hse, HseMode, Pll, PllDiv, PllMul, PllPreDiv, PllSource,
+        Sysclk, VoltageScale,
     };
     let mut config = embassy_stm32::Config::default();
     config.rcc.hse = Some(Hse {
@@ -340,6 +335,7 @@ async fn main(spawner: Spawner) {
     // Bring up USART3 TX (PB10) for defmt output before anything else
     // so the first defmt::info! below actually lands on the wire.
     // USART3 maps to the internal Bluetooth serial port on the Taker H743.
+    embassy_time::Timer::after(Duration::from_secs(5)).await;
     logger::init_usart3();
 
     // ---- Status LED Heartbeat ----
@@ -365,8 +361,6 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(rc_task::run(rc_uart)).unwrap();
     defmt::info!("RC task spawned");
-
-
 
     // ---- Dual IMUs (timer-polled 8 kHz reads) ----
     // IMU1 (MPU6000) on SPI1: SCK=PA5, MISO=PA6, MOSI=PA7, CS=PA4 (ROTATION_YAW_90)
@@ -467,8 +461,7 @@ async fn main(spawner: Spawner) {
     // bidir on/off) are worth a try if motors stay silent at the
     // default.
     const DSHOT_SPEED: DshotSpeed = DshotSpeed::Dshot600;
-    const DSHOT_BIDIR: bool = true;
-
+    const DSHOT_BIDIR: bool = false;
     let dshot = DshotQuad::new(
         p.TIM3,
         p.PB0,
@@ -685,9 +678,7 @@ async fn dual_imu_read_task(
 // reads only IMU1.
 
 #[embassy_executor::task]
-async fn single_imu_read_task(
-    mut imu: Mpu6000<'static>,
-) {
+async fn single_imu_read_task(mut imu: Mpu6000<'static>) {
     use core::sync::atomic::Ordering;
     defmt::info!("Single IMU read task started (8 kHz ticker, IMU2 unavailable)");
 
@@ -745,8 +736,11 @@ async fn icm_monitor_task() {
                 libm::fabsf(d.a1[1] - d.a2[1]),
                 libm::fabsf(d.a1[2] - d.a2[2]),
             ];
-            let max_da = if da[0] > da[1] { if da[0] > da[2] { da[0] } else { da[2] } }
-                         else { if da[1] > da[2] { da[1] } else { da[2] } };
+            let max_da = if da[0] > da[1] {
+                if da[0] > da[2] { da[0] } else { da[2] }
+            } else {
+                if da[1] > da[2] { da[1] } else { da[2] }
+            };
 
             // Max absolute gyro disagreement across axes (dps)
             let dg = [
@@ -754,26 +748,42 @@ async fn icm_monitor_task() {
                 libm::fabsf(d.g1[1] - d.g2[1]),
                 libm::fabsf(d.g1[2] - d.g2[2]),
             ];
-            let max_dg = if dg[0] > dg[1] { if dg[0] > dg[2] { dg[0] } else { dg[2] } }
-                         else { if dg[1] > dg[2] { dg[1] } else { dg[2] } };
+            let max_dg = if dg[0] > dg[1] {
+                if dg[0] > dg[2] { dg[0] } else { dg[2] }
+            } else {
+                if dg[1] > dg[2] { dg[1] } else { dg[2] }
+            };
 
             defmt::info!(
                 "IMU1 accel=[{=f32},{=f32},{=f32}]g  gyro=[{=f32},{=f32},{=f32}]dps  t={=f32}C",
-                d.a1[0], d.a1[1], d.a1[2],
-                d.g1[0], d.g1[1], d.g1[2],
+                d.a1[0],
+                d.a1[1],
+                d.a1[2],
+                d.g1[0],
+                d.g1[1],
+                d.g1[2],
                 d.t1,
             );
             defmt::info!(
                 "IMU2 accel=[{=f32},{=f32},{=f32}]g  gyro=[{=f32},{=f32},{=f32}]dps  t={=f32}C",
-                d.a2[0], d.a2[1], d.a2[2],
-                d.g2[0], d.g2[1], d.g2[2],
+                d.a2[0],
+                d.a2[1],
+                d.a2[2],
+                d.g2[0],
+                d.g2[1],
+                d.g2[2],
                 d.t2,
             );
             defmt::info!(
                 "FUSED accel=[{=f32},{=f32},{=f32}]g  gyro=[{=f32},{=f32},{=f32}]dps  |da|max={=f32}g |dg|max={=f32}dps",
-                d.a_fused[0], d.a_fused[1], d.a_fused[2],
-                d.g_fused[0], d.g_fused[1], d.g_fused[2],
-                max_da, max_dg,
+                d.a_fused[0],
+                d.a_fused[1],
+                d.a_fused[2],
+                d.g_fused[0],
+                d.g_fused[1],
+                d.g_fused[2],
+                max_da,
+                max_dg,
             );
         }
     }
@@ -844,8 +854,12 @@ async fn mekf_task() {
         gyro_sum[2] / (calib_samples as f32),
     ];
     mekf.set_bias(bias_calib);
-    defmt::info!("MEKF gyro calibration complete: bias=[{=f32},{=f32},{=f32}] dps",
-        bias_calib[0] * RAD2DEG, bias_calib[1] * RAD2DEG, bias_calib[2] * RAD2DEG);
+    defmt::info!(
+        "MEKF gyro calibration complete: bias=[{=f32},{=f32},{=f32}] dps",
+        bias_calib[0] * RAD2DEG,
+        bias_calib[1] * RAD2DEG,
+        bias_calib[2] * RAD2DEG
+    );
 
     let mut last_predict = Instant::now();
     let mut sample_count: u32 = 0;
@@ -899,8 +913,10 @@ async fn mekf_task() {
                 if mekf.initialize_mag_from_first(ut) {
                     defmt::info!(
                         "MEKF mag reference seeded: ut=[{=f32},{=f32},{=f32}] |M|={=f32}uT",
-                        ut[0], ut[1], ut[2],
-                        libm::sqrtf(ut[0]*ut[0] + ut[1]*ut[1] + ut[2]*ut[2]),
+                        ut[0],
+                        ut[1],
+                        ut[2],
+                        libm::sqrtf(ut[0] * ut[0] + ut[1] * ut[1] + ut[2] * ut[2]),
                     );
                 }
             } else if mekf.update_mag(ut) {
@@ -1166,8 +1182,7 @@ async fn pos_kf_task() {
                 && gps.hdop > 0.0
                 && gps.hdop < HDOP_THRESH;
 
-            let pos_fresh =
-                gps.latitude != last_fused_lat || gps.longitude != last_fused_lon;
+            let pos_fresh = gps.latitude != last_fused_lat || gps.longitude != last_fused_lon;
 
             if good_fix && pos_fresh {
                 good_fix_streak = good_fix_streak.saturating_add(1);
@@ -1239,8 +1254,8 @@ async fn pos_kf_task() {
             // ~0.3 m/s the receiver's course report is noise — clamp
             // to (0, 0), which still actively damps drift while
             // stationary but only once per fresh sample.
-            let vel_fresh = gps.ground_speed_ms != last_fused_speed
-                || gps.course_deg != last_fused_course;
+            let vel_fresh =
+                gps.ground_speed_ms != last_fused_speed || gps.course_deg != last_fused_course;
             if vel_fresh && gps.fix_mode != FixMode::NoFix && gps.satellites >= 3 {
                 let (vn, ve) = if gps.ground_speed_ms < 0.3 {
                     (0.0, 0.0)
@@ -1270,10 +1285,7 @@ async fn pos_kf_task() {
             if p_ref_provisional {
                 p_ref_pa = baro.pressure_pa;
                 p_ref_provisional = false;
-                defmt::info!(
-                    "PosKF provisional p_ref set: {=f32}Pa",
-                    p_ref_pa,
-                );
+                defmt::info!("PosKF provisional p_ref set: {=f32}Pa", p_ref_pa,);
             }
             let alt_up = baro::pressure_to_altitude_m(baro.pressure_pa, p_ref_pa);
             kf.update_baro(alt_up);
@@ -1292,14 +1304,9 @@ async fn pos_kf_task() {
                 p_ref_pa = p;
                 p_ref_provisional = false;
                 p_ref_at_arm = true;
-                defmt::info!(
-                    "PosKF arm: p_ref re-anchored to {=f32}Pa",
-                    p_ref_pa,
-                );
+                defmt::info!("PosKF arm: p_ref re-anchored to {=f32}Pa", p_ref_pa,);
             } else {
-                defmt::warn!(
-                    "PosKF arm: no baro sample — p_ref stays at boot default",
-                );
+                defmt::warn!("PosKF arm: no baro sample — p_ref stays at boot default",);
             }
             // Re-anchor home to current GPS fix if it's healthy. If GPS
             // isn't usable we leave home where it was (either pre-arm
@@ -1539,7 +1546,7 @@ async fn baro_task(
         };
 
         let addr = match chip {
-            BaroChip::Spl06  { addr } => addr,
+            BaroChip::Spl06 { addr } => addr,
             BaroChip::Dps310 { addr } => addr, // fallback; not on this board
             BaroChip::Bmp280 { addr: _ } => {
                 defmt::warn!("BMP280 detected but driver not yet implemented");
@@ -1654,7 +1661,9 @@ async fn baro_task(
                     (0, None) => {
                         defmt::info!(
                             "Baro 0 reads/s, {} errs — bus stuck (no sample yet); mag {}/s, {} errs",
-                            errs, mag_reads, mag_errs,
+                            errs,
+                            mag_reads,
+                            mag_errs,
                         );
                     }
                     _ => {
@@ -1697,8 +1706,6 @@ async fn baro_task(
     }
 }
 
-
-
 // ---- Control Loop ----
 // The heart of the flight controller. Reads sensor data and
 // RC input, computes control outputs, and drives the motors.
@@ -1738,8 +1745,6 @@ async fn navigation_task() {
     // ---- Position hold / GPS rescue (50 Hz) ----
     let mut pos_ctrl = PositionController::new(PositionGains::default());
 
-
-
     // ---- Sensor state ----
     let mut last_rc = RcChannels {
         channels: [992; 16],
@@ -1754,7 +1759,7 @@ async fn navigation_task() {
     // ---- Flight mode state ----
     let mut flight_mode = FlightMode::Acro;
     let mut prev_mode = FlightMode::Acro;
-    let mut alt_target: f32 = 0.0;      // metres, positive-up
+    let mut alt_target: f32 = 0.0; // metres, positive-up
     let mut pos_target: [f32; 2] = [0.0, 0.0]; // [north, east] metres
     let mut rescue_loiter_start: Option<Instant> = None;
     let mut rescue_landing = false;
@@ -1845,9 +1850,13 @@ async fn navigation_task() {
             // which modes will engage.
             let alt_ready = last_pos_est.map(|e| e.altitude_ready).unwrap_or(false);
             match (alt_ready, gps_home_latched) {
-                (true, true)  => {} // full lock — quiet
-                (true, false) => defmt::info!("ARMED with baro only — alt-hold OK, no position modes"),
-                (false, true) => defmt::warn!("ARMED with GPS only — position modes OK; alt source is GPS"),
+                (true, true) => {} // full lock — quiet
+                (true, false) => {
+                    defmt::info!("ARMED with baro only — alt-hold OK, no position modes")
+                }
+                (false, true) => {
+                    defmt::warn!("ARMED with GPS only — position modes OK; alt source is GPS")
+                }
                 (false, false) => defmt::warn!(
                     "ARMED with no altitude reference — manual throttle, no alt-hold or position modes"
                 ),
@@ -1886,8 +1895,6 @@ async fn navigation_task() {
                 last_rc.channels[5],
             );
         }
-
-
 
         // ---- 3. Flight mode selection ----
         // `altitude_ready` (baro OR GPS) gates altitude-aware modes;
@@ -2090,7 +2097,10 @@ async fn navigation_task() {
                         yaw_rate_dps = 0.0;
                         desired_yaw_rad = 0.0;
                         if let Some(est) = last_pos_est.filter(|e| e.home_latched) {
-                            let dist_home = libm::sqrtf(est.position_ned[0] * est.position_ned[0] + est.position_ned[1] * est.position_ned[1]);
+                            let dist_home = libm::sqrtf(
+                                est.position_ned[0] * est.position_ned[0]
+                                    + est.position_ned[1] * est.position_ned[1],
+                            );
 
                             // Auto-land sequence
                             if rescue_landing {
@@ -2328,7 +2338,8 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
 
             let motor_outputs = QUAD_X.apply(&control_demand);
 
-            let mut frames: [EncodedFrame; 4] = [DshotTx::bidirectional().command(Command::MotorStop); 4];
+            let mut frames: [EncodedFrame; 4] =
+                [DshotTx::bidirectional().command(Command::MotorStop); 4];
             for i in 0..4 {
                 let v = motor_outputs.motors[i];
                 if v <= 0.0 {
@@ -2338,7 +2349,7 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
                     frames[i] = DshotTx::bidirectional().throttle_clamped(throttle);
                 }
             }
-            
+
             let telemetry = dshot.send_throttles_and_receive(frames).await;
 
             // Log eRPM telemetry at ~10 Hz (every 800th 8 kHz tick).
@@ -2348,16 +2359,17 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
             static LOG_COUNTER: AtomicU32 = AtomicU32::new(0);
             let n = LOG_COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
             if n.is_multiple_of(800) {
-                let get_erpm = |res: &Result<uf_dshot::TelemetryFrame, uf_dshot::TelemetryError>| -> u32 {
-                    if let Ok(uf_dshot::TelemetryFrame::Erpm(r)) = res {
-                        // pole_pairs=1 returns eRPM (electrical revs/min).
-                        // For mechanical RPM, divide by the motor's pole
-                        // pair count (typically 7 for 12N14P stators).
-                        r.mechanical_rpm(1)
-                    } else {
-                        0
-                    }
-                };
+                let get_erpm =
+                    |res: &Result<uf_dshot::TelemetryFrame, uf_dshot::TelemetryError>| -> u32 {
+                        if let Ok(uf_dshot::TelemetryFrame::Erpm(r)) = res {
+                            // pole_pairs=1 returns eRPM (electrical revs/min).
+                            // For mechanical RPM, divide by the motor's pole
+                            // pair count (typically 7 for 12N14P stators).
+                            r.mechanical_rpm(1)
+                        } else {
+                            0
+                        }
+                    };
 
                 let e1 = get_erpm(&telemetry[0]);
                 let e2 = get_erpm(&telemetry[1]);
@@ -2367,7 +2379,8 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
             }
         } else {
             rate_pid.reset();
-            let frames: [EncodedFrame; 4] = [DshotTx::bidirectional().command(Command::MotorStop); 4];
+            let frames: [EncodedFrame; 4] =
+                [DshotTx::bidirectional().command(Command::MotorStop); 4];
             let _ = dshot.send_throttles_and_receive(frames).await;
         }
     }

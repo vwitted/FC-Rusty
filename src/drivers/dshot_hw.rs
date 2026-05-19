@@ -15,31 +15,40 @@
 // ---- Bidirectional DShot wiring conventions ----
 //
 // Bidir DShot inverts the on-wire signal vs standard DShot:
-//   - Line idles HIGH between frames (pull-up + open-drain).
+//   - Line idles HIGH between frames.
 //   - A "1" data bit is a long-LOW pulse (75 % of the cell).
 //   - A "0" data bit is a short-LOW pulse (37.5 % of the cell).
 //   - After the 16-bit frame the ESC waits ~30 µs then drives the
 //     same wire LOW to transmit a 21-bit GCR-encoded response.
 //
-// Two consequences for this driver:
-//   1. **Pins are open-drain with a pull-up.** Push-pull on the FC
-//      side would short its PMOS through the ESC's NMOS during the
-//      TX→RX handoff if the ESC starts responding earlier than the
-//      reconfiguration completes. Same hazard pattern as the I²C
-//      bus-recovery push-pull issue (see CLAUDE.md).
+// Driver consequences:
+//   1. **TX phase uses push-pull, not open-drain.** An earlier
+//      version used OD + external pull-up. On this board the line
+//      capacitance + pull-up RC is ~1 µs, so between consecutive
+//      "0" bit-pulses the line only recovered to ~3.2 V before the
+//      next pulse pulled it back down — a sawtooth that the ESC
+//      could not decode (scope, 2026-05-17). Push-pull drives both
+//      edges crisply at the GPIO's 3.3 V rail and removes the RC
+//      ceiling. The trade-off — driving 3.3 V into a line the ESC
+//      pulls up to 5 V — is benign in practice: the PMOS easily
+//      wins against the ESC's 4.7–20 kΩ pull-up so the pin settles
+//      at ~3.3 V (well below VDD+0.3 V, so the body diode never
+//      conducts), and every Betaflight H7 BB-DShot setup runs this
+//      way. TX→RX hand-off contention with the ESC is avoided by
+//      switching the pins to INPUT-with-pull-up *before* the ESC
+//      response window opens (the 8 trailing-zero cells give >13 µs
+//      of headroom on top of the ESC's ~30 µs response delay).
 //   2. **TIM_CCER.CCxP is set to 1 (active-low) for all four
 //      channels.** PWM Mode 1 keeps "OC active" while counter < CCR
-//      and "OC inactive" otherwise; inverting the polarity means
-//      "active" = LOW and "inactive" = HIGH. With open-drain that
-//      becomes: CCR ticks of driven-LOW, then pull-up-HIGH for the
-//      remainder. Setting CCR = t1h (75 % of period) produces the
-//      bidir "1" pulse; CCR = 0 in the trailing slots leaves the
-//      line at idle-HIGH.
+//      and "OC inactive" otherwise; inverting the polarity flips
+//      that to "active" = LOW and "inactive" = HIGH. CCR = t1h
+//      (75 % of period) gives the bidir "1" LOW pulse; CCR = 0 in
+//      the trailing cells holds the line driven-HIGH.
 //
 // Timer clock: APB1 timers on this board run at 240 MHz.
 
 use embassy_stm32::Peri;
-use embassy_stm32::gpio::OutputType;
+use embassy_stm32::gpio::{OutputType, Pull, Speed};
 use embassy_stm32::pac;
 use embassy_stm32::peripherals::{
     DMA1_CH6, DMA1_CH7, PB0, PB1, PB5, PB4, TIM3,
@@ -47,7 +56,7 @@ use embassy_stm32::peripherals::{
 use embassy_stm32::time::Hertz;
 use embassy_stm32::timer::Channel;
 use embassy_stm32::timer::low_level::CountingMode;
-use embassy_stm32::timer::simple_pwm::{PwmPin, SimplePwm};
+use embassy_stm32::timer::simple_pwm::{PwmPin, PwmPinConfig, SimplePwm};
 use embassy_stm32::timer::UpDma;
 
 use uf_dshot::{DshotSpeed, EncodedFrame};
@@ -92,6 +101,11 @@ pub struct DshotQuad<'d> {
     decoders: [uf_dshot::BidirDecoder; 4],
 
     frame_count: u32,
+    /// Per-channel tally of telemetry decode outcomes, reset every
+    /// time `log_telemetry_histogram` fires. Indices:
+    /// 0 = Ok, 1 = NoEdge, 2 = InvalidGcrSymbol, 3 = InvalidCrc,
+    /// 4 = FrameTooShort|InvalidFrame, 5 = other.
+    telem_tally: [[u16; 6]; 4],
 }
 
 impl<'d> DshotQuad<'d> {
@@ -122,20 +136,32 @@ impl<'d> DshotQuad<'d> {
         let rx_arr = (period * 5 / 12).saturating_sub(1);
 
         // ---- TIM3: CH3 (PB0), CH4 (PB1), CH2 (PB5), CH1 (PB4) ----
-        // Output type depends on mode:
-        //   - Bidir: open-drain + pull-up. The ESC also drives the
-        //     line during its telemetry response phase; OD avoids
-        //     push-pull contention if our cleanup races the response.
-        //   - Standard: push-pull. We own the wire end-to-end, and a
-        //     push-pull HIGH is crisper for the ESC's RC-time-constant
-        //     detection on the rising edge of each bit cell.
-        let pin_otype = if bidir { OutputType::OpenDrain } else { OutputType::PushPull };
+        // Output type: push-pull regardless of bidir mode (see the
+        // module header for the bidir-OD sawtooth analysis). The
+        // bidir RX phase switches the pins to INPUT for the response
+        // window, so the PP→input handoff replaces the OD trick.
+        //
+        // Pull-up is engaged for bidir mode: when we re-configure the
+        // pin as INPUT before RX, this internal pull-up keeps the
+        // line biased HIGH until the ESC starts driving the response.
+        //
+        // GPIO speed: `Speed::Medium` (≈25–50 MHz slew on H7), NOT
+        // `Speed::VeryHigh`. Embassy's `PwmPin::new()` defaults to
+        // VeryHigh, which on H743 motor pins produces ringy edges
+        // and the documented Betaflight H7 signal-integrity bug.
+        // Medium is plenty for a 600 kHz bit rate (~1.6 µs cell).
+        let pin_pull = if bidir { Pull::Up } else { Pull::None };
+        let pin_cfg = PwmPinConfig {
+            output_type: OutputType::PushPull,
+            speed: Speed::Medium,
+            pull: pin_pull,
+        };
         let mut tim3_pwm = SimplePwm::new(
             tim3,
-            Some(PwmPin::new(pb4, pin_otype)), // CH1 → M4
-            Some(PwmPin::new(pb5, pin_otype)), // CH2 → M3
-            Some(PwmPin::new(pb0, pin_otype)), // CH3 → M1
-            Some(PwmPin::new(pb1, pin_otype)), // CH4 → M2
+            Some(PwmPin::new_with_config(pb4, pin_cfg)), // CH1 → M4
+            Some(PwmPin::new_with_config(pb5, pin_cfg)), // CH2 → M3
+            Some(PwmPin::new_with_config(pb0, pin_cfg)), // CH3 → M1
+            Some(PwmPin::new_with_config(pb1, pin_cfg)), // CH4 → M2
             freq,
             CountingMode::EdgeAlignedUp,
         );
@@ -161,12 +187,7 @@ impl<'d> DshotQuad<'d> {
                 w.set_ccp(2, true); // CH3
                 w.set_ccp(3, true); // CH4
             });
-            pac::GPIOB.pupdr().modify(|w| {
-                w.set_pupdr(0, pac::gpio::vals::Pupdr::PULL_UP);
-                w.set_pupdr(1, pac::gpio::vals::Pupdr::PULL_UP);
-                w.set_pupdr(4, pac::gpio::vals::Pupdr::PULL_UP);
-                w.set_pupdr(5, pac::gpio::vals::Pupdr::PULL_UP);
-            });
+            // PUPDR pull-up is set via `PwmPinConfig.pull` above.
         }
 
         // DShot DMA buffer — placed in SRAM1
@@ -204,7 +225,31 @@ impl<'d> DshotQuad<'d> {
                 uf_dshot::BidirDecoder::new(uf_dshot::OversamplingConfig::default()),
             ],
             frame_count: 0,
+            telem_tally: [[0u16; 6]; 4],
         }
+    }
+
+    fn tally_telemetry(&mut self, ch: usize, result: &Result<uf_dshot::TelemetryFrame, uf_dshot::TelemetryError>) {
+        let bucket = match result {
+            Ok(_) => 0,
+            Err(uf_dshot::TelemetryError::NoEdge) => 1,
+            Err(uf_dshot::TelemetryError::InvalidGcrSymbol) => 2,
+            Err(uf_dshot::TelemetryError::InvalidCrc { .. }) => 3,
+            Err(uf_dshot::TelemetryError::FrameTooShort)
+            | Err(uf_dshot::TelemetryError::InvalidFrame) => 4,
+            Err(_) => 5,
+        };
+        self.telem_tally[ch][bucket] = self.telem_tally[ch][bucket].saturating_add(1);
+    }
+
+    fn log_telemetry_histogram(&mut self) {
+        for (i, t) in self.telem_tally.iter().enumerate() {
+            defmt::info!(
+                "DShot RX M{}: ok={=u16} no_edge={=u16} gcr_err={=u16} crc_err={=u16} short={=u16} other={=u16}",
+                (i + 1) as u8, t[0], t[1], t[2], t[3], t[4], t[5],
+            );
+        }
+        self.telem_tally = [[0u16; 6]; 4];
     }
 
     pub fn log_config(&self) {
@@ -223,7 +268,32 @@ impl<'d> DshotQuad<'d> {
         dshot_diag::log_timpre();
         dshot_diag::log_gpio_pins();
         dshot_diag::log_timer_running();
-        dshot_diag::log_tim2_config();
+        dshot_diag::log_tim3_config();
+    }
+
+    /// Print the first 16 data cells of the DMA buffer, decoded as
+    /// "Z" (CCR == t0h, a zero bit) / "O" (CCR == t1h, a one bit) /
+    /// "?" (anything else), one column per motor. Lets us verify that
+    /// the bit pattern the buffer holds matches the encoded frame.
+    pub fn log_buffer_preview(&self) {
+        let decode = |v: u32| -> &'static str {
+            if v == 0 { "_" }
+            else if v == self.t0h { "Z" }
+            else if v == self.t1h { "O" }
+            else { "?" }
+        };
+        for step in 0..STEPS_PER_FRAME {
+            let c1 = self.buf_tim3[step * 4];
+            let c2 = self.buf_tim3[step * 4 + 1];
+            let c3 = self.buf_tim3[step * 4 + 2];
+            let c4 = self.buf_tim3[step * 4 + 3];
+            defmt::info!(
+                "buf[{=usize:02}]: CH1=M4:{=str} CH2=M3:{=str} CH3=M1:{=str} CH4=M2:{=str}  raw=({=u32},{=u32},{=u32},{=u32})",
+                step,
+                decode(c1), decode(c2), decode(c3), decode(c4),
+                c1, c2, c3, c4,
+            );
+        }
     }
 
     pub fn log_runtime_state(&self) {
@@ -235,6 +305,7 @@ impl<'d> DshotQuad<'d> {
             pac::TIM3.ccr(2).read().ccr() as u32,
             pac::TIM3.ccr(3).read().ccr() as u32,
         );
+        self.log_buffer_preview();
     }
 
     pub async fn send_throttles_and_receive(&mut self, frames: [EncodedFrame; 4]) -> [Result<uf_dshot::TelemetryFrame, uf_dshot::TelemetryError>; 4] {
@@ -367,10 +438,16 @@ impl<'d> DshotQuad<'d> {
         let frame3 = self.decoders[2].decode_frame_tuned_port_samples_u16(self.rx_buffer, 1 << 5);
         let frame4 = self.decoders[3].decode_frame_tuned_port_samples_u16(self.rx_buffer, 1 << 4);
 
+        self.tally_telemetry(0, &frame1);
+        self.tally_telemetry(1, &frame2);
+        self.tally_telemetry(2, &frame3);
+        self.tally_telemetry(3, &frame4);
+
         self.frame_count = self.frame_count.wrapping_add(1);
 
         if self.frame_count.is_multiple_of(800) {
             self.log_runtime_state();
+            self.log_telemetry_histogram();
         }
 
         [frame1, frame2, frame3, frame4]

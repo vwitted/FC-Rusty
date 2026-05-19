@@ -44,7 +44,19 @@
       "Bash(timeout 30 curl *)",
       "Bash(timeout 20 curl -sL 'https://api.github.com/repos/jettify/uf-dshot/contents/' -H 'User-Agent: claude-research')",
       "Bash(python3 -c 'import sys,json; [print\\(f\"{f[\\\\\"type\\\\\"]:6} {f[\\\\\"name\\\\\"]}\"\\) for f in json.load\\(sys.stdin\\)]')",
-      "Bash(xargs -I{} grep -n \"fn set_cc[ap1234]\\\\|fn set_ccp\\\\b\\\\|fn ccp\\\\b\" {})"
+      "Bash(xargs -I{} grep -n \"fn set_cc[ap1234]\\\\|fn set_ccp\\\\b\\\\|fn ccp\\\\b\" {})",
+      "Bash(grep -nA 15 \"struct PosEstimate\" src/main.rs)",
+      "Bash(sed -i '372,629d' src/estimation.rs)",
+      "Bash(sed -n '368,378p' src/estimation.rs)",
+      "Bash(sed -n '672,675p' src/estimation.rs)",
+      "Bash(grep -n \"^}$\" src/estimation.rs)",
+      "Bash(sed -n '535,540p' src/estimation.rs)",
+      "Bash(sed -n '668,672p' src/estimation.rs)",
+      "Bash(sed -i '539,671d' src/estimation.rs)",
+      "Bash(sed -n '535,545p' src/estimation.rs)",
+      "Bash(git stash *)",
+      "Bash(sed -n '425,435p' src/drivers/ubx.rs)",
+      "Bash(sed -n '565,575p' src/drivers/ubx.rs)"
     ]
   }
 }

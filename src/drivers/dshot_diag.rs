@@ -37,42 +37,53 @@ pub fn log_timpre() {
     }
 }
 
-/// Dump GPIO MODER/OSPEEDR/AFR for the four DShot pins. If any pin
-/// isn't in AF mode at the right AF number with VeryHigh slew, the
-/// signal at the pad won't match what the timer is generating.
+/// Dump full per-pin state for the four DShot motor pins on this
+/// board (TIM3 CH1..4 → PB4/PB5/PB0/PB1). Reports MODER, OTYPER,
+/// OSPEEDR, PUPDR, and AFR so we can verify the pad matches what
+/// the embassy `PwmPin` config asked for. With the push-pull TX
+/// fix in place, the expected steady-state is:
+///   MODER=2 (AF), OTYPER=0 (push-pull), OSPEEDR=1 (Medium),
+///   PUPDR=1 (PullUp, bidir mode), AF=2 (TIM3_CH1..4).
 pub fn log_gpio_pins() {
-    let a = pac::GPIOA;
     let b = pac::GPIOB;
-    let a_moder = a.moder().read().0;
-    let a_ospd  = a.ospeedr().read().0;
-    let a_afrh  = a.afr(1).read().0;
     let b_moder = b.moder().read().0;
+    let b_otype = b.otyper().read().0;
     let b_ospd  = b.ospeedr().read().0;
+    let b_pupd  = b.pupdr().read().0;
     let b_afrl  = b.afr(0).read().0;
 
-    // (pin, name, expected_af, raw moder, raw ospd, raw afr nibble)
-    let pa15_mode = (a_moder >> 30) & 0b11;
-    let pa15_ospd = (a_ospd  >> 30) & 0b11;
-    let pa15_af   = (a_afrh  >> 28) & 0xF;     // PA15 in AFRH bits 28..=31
-    let pb3_mode  = (b_moder >> 6)  & 0b11;
-    let pb3_ospd  = (b_ospd  >> 6)  & 0b11;
-    let pb3_af    = (b_afrl  >> 12) & 0xF;
-    let pb4_mode  = (b_moder >> 8)  & 0b11;
-    let pb4_ospd  = (b_ospd  >> 8)  & 0b11;
-    let pb4_af    = (b_afrl  >> 16) & 0xF;
-    let pb6_mode  = (b_moder >> 12) & 0b11;
-    let pb6_ospd  = (b_ospd  >> 12) & 0b11;
-    let pb6_af    = (b_afrl  >> 24) & 0xF;
+    // Per-pin field extraction. MODER/OSPEEDR/PUPDR are 2 bits/pin,
+    // OTYPER is 1 bit/pin, AFR is 4 bits/pin (first 8 pins in AFRL).
+    let pin_state = |p: u32| -> (u32, u32, u32, u32, u32) {
+        let mode = (b_moder >> (p * 2)) & 0b11;
+        let otype = (b_otype >> p) & 0b1;
+        let ospd  = (b_ospd  >> (p * 2)) & 0b11;
+        let pupd  = (b_pupd  >> (p * 2)) & 0b11;
+        let af    = (b_afrl  >> (p * 4)) & 0xF;
+        (mode, otype, ospd, pupd, af)
+    };
 
-    // Expected: MODER=2 (AF), OSPEEDR=3 (VeryHigh), AF: PA15=1 PB3=1 PB4=2 PB6=2
-    defmt::info!("GPIO PA15 (M1/TIM2_CH1): MODER={=u32} OSPEEDR={=u32} AF={=u32} (want 2/3/1)",
-                  pa15_mode, pa15_ospd, pa15_af);
-    defmt::info!("GPIO PB3  (M2/TIM2_CH2): MODER={=u32} OSPEEDR={=u32} AF={=u32} (want 2/3/1)",
-                  pb3_mode, pb3_ospd, pb3_af);
-    defmt::info!("GPIO PB4  (M3/TIM3_CH1): MODER={=u32} OSPEEDR={=u32} AF={=u32} (want 2/3/2)",
-                  pb4_mode, pb4_ospd, pb4_af);
-    defmt::info!("GPIO PB6  (M4/TIM4_CH1): MODER={=u32} OSPEEDR={=u32} AF={=u32} (want 2/3/2)",
-                  pb6_mode, pb6_ospd, pb6_af);
+    let (m0, t0, s0, u0, a0) = pin_state(0);  // PB0 → CH3 → M1
+    let (m1, t1, s1, u1, a1) = pin_state(1);  // PB1 → CH4 → M2
+    let (m4, t4, s4, u4, a4) = pin_state(4);  // PB4 → CH1 → M4
+    let (m5, t5, s5, u5, a5) = pin_state(5);  // PB5 → CH2 → M3
+
+    defmt::info!(
+        "GPIO PB0 (M1/CH3): MODER={=u32} OTYPER={=u32} OSPEEDR={=u32} PUPDR={=u32} AF={=u32} (want 2/0/1/1/2)",
+        m0, t0, s0, u0, a0
+    );
+    defmt::info!(
+        "GPIO PB1 (M2/CH4): MODER={=u32} OTYPER={=u32} OSPEEDR={=u32} PUPDR={=u32} AF={=u32} (want 2/0/1/1/2)",
+        m1, t1, s1, u1, a1
+    );
+    defmt::info!(
+        "GPIO PB4 (M4/CH1): MODER={=u32} OTYPER={=u32} OSPEEDR={=u32} PUPDR={=u32} AF={=u32} (want 2/0/1/1/2)",
+        m4, t4, s4, u4, a4
+    );
+    defmt::info!(
+        "GPIO PB5 (M3/CH2): MODER={=u32} OTYPER={=u32} OSPEEDR={=u32} PUPDR={=u32} AF={=u32} (want 2/0/1/1/2)",
+        m5, t5, s5, u5, a5
+    );
 }
 
 /// Read each timer's CNT three times in a row. If CNT is changing,
@@ -122,18 +133,29 @@ pub fn log_tim2_config() {
 }
 
 /// Dump TIM3 (16-bit) PWM+DMA configuration registers.
+///
+/// CCMR1 covers CH1/CH2; CCMR2 covers CH3/CH4 — we drive all four,
+/// so both matter. Per-channel OCxM (PWM mode 1 = 0b110) and OCxPE
+/// (preload enable) live inside CCMRx.
 pub fn log_tim3_config() {
     let t = pac::TIM3;
     defmt::info!(
-        "TIM3: PSC={=u16} ARR={=u16} CR1={=u32:08x} DIER={=u32:08x} DCR={=u32:08x} CCMR1={=u32:08x} CCER={=u32:08x} CCR1={=u16}",
+        "TIM3: PSC={=u16} ARR={=u16} CR1={=u32:08x} DIER={=u32:08x} DCR={=u32:08x} CCMR1={=u32:08x} CCMR2={=u32:08x} CCER={=u32:08x}",
         t.psc().read(),
         t.arr().read().arr(),
         t.cr1().read().0,
         t.dier().read().0,
         t.dcr().read().0,
         t.ccmr_output(0).read().0,
+        t.ccmr_output(1).read().0,
         t.ccer().read().0,
+    );
+    defmt::info!(
+        "TIM3 CCR: ch1={=u16} ch2={=u16} ch3={=u16} ch4={=u16}",
         t.ccr(0).read().ccr(),
+        t.ccr(1).read().ccr(),
+        t.ccr(2).read().ccr(),
+        t.ccr(3).read().ccr(),
     );
 }
 
