@@ -22,7 +22,7 @@ material hardware or design change lands (see `CLAUDE.md`).
 | SPI1 + PA4             | ICM-42688P IMU1 (onboard)         | ✅ verified — 8 kHz reads, MEKF fusing         |
 | SPI4 + PB1             | ICM-42688P IMU2 (onboard)         | ✅ verified — 8 kHz reads, averaged with IMU1  |
 | I2C2 (PB10/PB11)       | SPL06 barometer (onboard)         | ✅ proper driver — 128 Hz, correct calibration              |
-| TIM2 (PA0/PA1/PA2/PA3) | DShot600, motors M1–M4            | ✅ verified — all four motors spin on arm      |
+| TIM2 (PA0/PA1/PA2/PA3) | DShot600, motors M1–M4            | ⚠️ BF-style per-channel CC DMA port (bidir-capable); non-bidir motor spin verified pre-port, bidir RX decode unverified on HW |
 | PD10                   | Status LED (active low)           | ✅ heartbeat blink task                        |
 | USB-C                  | DFU flashing                      | ✅ verified — no SWD on this board             |
 | UART4 (PD1/PD0)        | DisplayPort / VTX (T4/R4)         | ⚪ not wired                                   |
@@ -129,10 +129,28 @@ material hardware or design change lands (see `CLAUDE.md`).
 
 ### post-Alpha tweaks
 
+> **Branch note (`dakefpv-h743-post-alpha`, 2026-06-05):** this branch
+> ports the post-Alpha work that was developed on `geprc-taker-h743`
+> back onto the DAKEFPV H743 (the GEPRC TAKER board stopped responding
+> on the bench). Integrated here so far, all building clean with
+> 125/125 host tests: the `RawImu` public-orientation refactor, the
+> 2nd-order Butterworth IMU LPF, LIS2MDL → MEKF yaw fusion, the
+> per-fuse GPS log, the baro-only arming deadlock fix, and the PosKF
+> pre-arm fusion + HDOP-only home latch + arm-reorigin rewrite. Plus
+> the BF-style bidir DShot driver retargeted to TIM2 (see below).
+
 - [ ] GPS thresholds tightened to 7 sats / HDOP < 2.0
 - [x] Re-enable arming on baro only, but if GPS fix is available set home co-ords. Implemented 2026-05-08: arming gate is now soft (`baro_ready || gps_home_latched`); baro p_ref latches on the Disarmed→Armed transition via `ARM_LATCH` signal; `PosEstimate` exposes split `altitude_ready` / `home_latched` flags. `arming::ArmingStateMachine.require_gps` renamed to `require_altitude_ref`.
+- [x] GPS home latch + pre-arm fusion overhaul (ported 2026-06-05, orig. 2026-05-15): HDOP-only per-fix gate (`sats >= 4 && hdop < 2.5`, 3-streak to latch), per-fix HDOP-scaled `update_gps_scaled`, always-fusing baro with a provisional `p_ref` seeded from the first sample, and arm-time frame re-origin that zeroes the KF and re-anchors p_ref + home.
 - [x] Assign CRSF channels for user-initiated GPS Rescue, pos-hold and alt-hold functionality. (Implemented: CH5 for mode, CH6 for RTH trigger)
-- [ ] ESC Bidirectional Dshot functionality
+- [~] **ESC Bidirectional DShot.** Driver implemented: BF-style
+      per-channel CC DMA on TIM2, bidir polarity + input-capture RX +
+      GCR/CRC/eRPM decode (`dshot_hw.rs` + `dshot_frame.rs` +
+      `dshot_telemetry.rs`). Includes the CCR-reset + EGR.UG fix for
+      the residual-capture glitch on the first post-RX TX cell.
+      **Unverified on hardware** — needs a working board to confirm
+      the ESC decodes our frames and that `DShot RX` logs non-zero
+      eRPM. `uf-dshot` dependency fully removed.
 - [ ] revert throttle changes implemented for bench motor testing (posssibly this is done by adding a stick scaling factor in the mixer)
 
 ### Items for Beta build
@@ -256,8 +274,11 @@ All host-tested (`cargo test --lib --no-default-features --target x86_64-unknown
 | WT901B parser    | `drivers/wt901b.rs`      | All packet types; `ImuData` type still used internally        |
 | SPL06 driver     | `drivers/baro.rs`        | 128 Hz / 1× OSR, correct cal from 0x18; DPS310 retained     |
 | ISM6HG256X driver | `drivers/ism6hg256x.rs` | ±16 g / ±4000 dps / 7.68 kHz, SPI; written for Beta breakout, unreferenced |
-| LIS2MDL driver   | `drivers/lis2mdl.rs`     | 3-axis mag, I2C addr 0x1E, 100 Hz HR + LPF + OFF_CANC; written for Beta breakout, unreferenced |
-| DShot driver     | `drivers/dshot_hw.rs`    | TIM2 DMAR burst, DShot600, all 4 channels simultaneously     |
+| LIS2MDL driver   | `drivers/lis2mdl.rs`     | 3-axis mag, I2C addr 0x1E, 100 Hz HR + LPF + OFF_CANC; wired into baro_task + fused in MEKF for yaw |
+| IMU LPF          | `imu_filter.rs`          | 2nd-order Butterworth biquad bank on the fused dual-IMU stream; 150 Hz gyro / 25 Hz accel default |
+| DShot driver     | `drivers/dshot_hw.rs`    | TIM2 per-channel CC DMA (4 streams, CCxDE), DShot600, bidir-capable; line-by-line BF `pwm_output_dshot_hal.c` port |
+| DShot frame      | `drivers/dshot_frame.rs` | 16-bit frame encoder, bidir CRC inversion; MSB-first wire unpack |
+| DShot telemetry  | `drivers/dshot_telemetry.rs` | GCR 5→4 decode + EDT/eRPM payload parse + period→RPM |
 | Physics sim      | `sim/sim.rs`             | 6DOF rigid body, τ=30ms motor lag, NED, ground collision     |
 | Sensor sim       | `sim/sensors.rs`         | GPS (10 Hz + noise), baro (50 Hz + noise/drift), xorshift64  |
 | TinyMPC solver   | `control/tinympc-rs/`    | ADMM, no_std, const-generic dimensions                        |
