@@ -41,38 +41,38 @@ pub fn log_timpre() {
 /// isn't in AF mode at the right AF number with VeryHigh slew, the
 /// signal at the pad won't match what the timer is generating.
 pub fn log_gpio_pins() {
+    // All four DShot motor pins are on GPIOA: PA0..PA3 = TIM2 CH1..CH4
+    // (M1..M4). TIM2 alternate function is AF1 on this part. Pins 0..3
+    // all live in AFRL (afr(0)). MODER/OSPEEDR are 2 bits/pin.
     let a = pac::GPIOA;
-    let b = pac::GPIOB;
-    let a_moder = a.moder().read().0;
-    let a_ospd  = a.ospeedr().read().0;
-    let a_afrh  = a.afr(1).read().0;
-    let b_moder = b.moder().read().0;
-    let b_ospd  = b.ospeedr().read().0;
-    let b_afrl  = b.afr(0).read().0;
+    let moder = a.moder().read().0;
+    let ospd  = a.ospeedr().read().0;
+    let pupd  = a.pupdr().read().0;
+    let afrl  = a.afr(0).read().0;
 
-    // (pin, name, expected_af, raw moder, raw ospd, raw afr nibble)
-    let pa15_mode = (a_moder >> 30) & 0b11;
-    let pa15_ospd = (a_ospd  >> 30) & 0b11;
-    let pa15_af   = (a_afrh  >> 28) & 0xF;     // PA15 in AFRH bits 28..=31
-    let pb3_mode  = (b_moder >> 6)  & 0b11;
-    let pb3_ospd  = (b_ospd  >> 6)  & 0b11;
-    let pb3_af    = (b_afrl  >> 12) & 0xF;
-    let pb4_mode  = (b_moder >> 8)  & 0b11;
-    let pb4_ospd  = (b_ospd  >> 8)  & 0b11;
-    let pb4_af    = (b_afrl  >> 16) & 0xF;
-    let pb6_mode  = (b_moder >> 12) & 0b11;
-    let pb6_ospd  = (b_ospd  >> 12) & 0b11;
-    let pb6_af    = (b_afrl  >> 24) & 0xF;
+    let pin_state = |p: u32| -> (u32, u32, u32, u32) {
+        let mode = (moder >> (p * 2)) & 0b11;
+        let spd  = (ospd  >> (p * 2)) & 0b11;
+        let pu   = (pupd  >> (p * 2)) & 0b11;
+        let af   = (afrl  >> (p * 4)) & 0xF;
+        (mode, spd, pu, af)
+    };
 
-    // Expected: MODER=2 (AF), OSPEEDR=3 (VeryHigh), AF: PA15=1 PB3=1 PB4=2 PB6=2
-    defmt::info!("GPIO PA15 (M1/TIM2_CH1): MODER={=u32} OSPEEDR={=u32} AF={=u32} (want 2/3/1)",
-                  pa15_mode, pa15_ospd, pa15_af);
-    defmt::info!("GPIO PB3  (M2/TIM2_CH2): MODER={=u32} OSPEEDR={=u32} AF={=u32} (want 2/3/1)",
-                  pb3_mode, pb3_ospd, pb3_af);
-    defmt::info!("GPIO PB4  (M3/TIM3_CH1): MODER={=u32} OSPEEDR={=u32} AF={=u32} (want 2/3/2)",
-                  pb4_mode, pb4_ospd, pb4_af);
-    defmt::info!("GPIO PB6  (M4/TIM4_CH1): MODER={=u32} OSPEEDR={=u32} AF={=u32} (want 2/3/2)",
-                  pb6_mode, pb6_ospd, pb6_af);
+    let (m0, s0, u0, a0) = pin_state(0); // PA0 → TIM2_CH1 → M1
+    let (m1, s1, u1, a1) = pin_state(1); // PA1 → TIM2_CH2 → M2
+    let (m2, s2, u2, a2) = pin_state(2); // PA2 → TIM2_CH3 → M3
+    let (m3, s3, u3, a3) = pin_state(3); // PA3 → TIM2_CH4 → M4
+
+    // Expected: MODER=2 (AF), OSPEEDR=1 (Low, matches BF), PUPDR=1
+    // (PullUp for bidir idle-high), AF=1 (TIM2).
+    defmt::info!("GPIO PA0 (M1/TIM2_CH1): MODER={=u32} OSPEEDR={=u32} PUPDR={=u32} AF={=u32} (want 2/1/1/1)",
+                  m0, s0, u0, a0);
+    defmt::info!("GPIO PA1 (M2/TIM2_CH2): MODER={=u32} OSPEEDR={=u32} PUPDR={=u32} AF={=u32} (want 2/1/1/1)",
+                  m1, s1, u1, a1);
+    defmt::info!("GPIO PA2 (M3/TIM2_CH3): MODER={=u32} OSPEEDR={=u32} PUPDR={=u32} AF={=u32} (want 2/1/1/1)",
+                  m2, s2, u2, a2);
+    defmt::info!("GPIO PA3 (M4/TIM2_CH4): MODER={=u32} OSPEEDR={=u32} PUPDR={=u32} AF={=u32} (want 2/1/1/1)",
+                  m3, s3, u3, a3);
 }
 
 /// Read each timer's CNT three times in a row. If CNT is changing,

@@ -85,8 +85,8 @@ use control::position::{PositionController, PositionGains};
 use drivers::baro::{self, BaroSample};
 use drivers::crsf::RcChannels;
 use drivers::lis2mdl::{Lis2mdl, MagSample, Orientation as MagOrientation};
+use drivers::dshot_frame::{DshotFrame, DshotSpeed};
 use drivers::dshot_hw::DshotQuad;
-use uf_dshot::{Command, DshotSpeed, DshotTx, EncodedFrame};
 use drivers::icm42688::RawImu;
 use drivers::nmea::{FixMode, GpsData, NmeaParser};
 use drivers::wt901b::{
@@ -156,6 +156,13 @@ const FAILSAFE_LAND_DISARM_ALT_M: f32 = 0.3;
 /// regains RC or the battery cuts. Impact-signature-based disarm is
 /// a Beta-target backlog item (see PROJECT_STATUS.md).
 const FAILSAFE_BLIND_THROTTLE_FRAC: f32 = 0.9;
+
+// ---- DShot configuration ----
+/// Set `true` for bidir DShot (line idles HIGH, telemetry-request bit
+/// set, inverted CRC, and an input-capture RX phase after each frame).
+/// Must match the ESC's EEPROM config from BLHeli/BlueJay/AM32. When
+/// false the driver runs the plain non-bidir TX-only path.
+const DSHOT_BIDIR: bool = true;
 
 // ---- Interrupt bindings ----
 
@@ -464,20 +471,31 @@ async fn main(spawner: Spawner) {
     spawner.spawn(gps_task(gps_rx)).unwrap();
     defmt::info!("GPS task spawned (NMEA at 9600)");
 
-    // DShot ESC outputs (all 4 channels on TIM2)
-    // M1=PA0, M2=PA1, M3=PA2, M4=PA3.
+    // DShot ESC outputs (all 4 channels on TIM2).
+    //   TIM2 CH1 → PA0 → M1 (DMA1_CH2)
+    //   TIM2 CH2 → PA1 → M2 (DMA1_CH3)
+    //   TIM2 CH3 → PA2 → M3 (DMA1_CH4)
+    //   TIM2 CH4 → PA3 → M4 (DMA1_CH7)
+    // Per-channel CC DMA (BF-style port), four DMA1 streams.
     let dshot = DshotQuad::new(
         p.TIM2,
-        p.PA0,
-        p.PA1,
-        p.PA2,
-        p.PA3,
-        p.DMA1_CH7, // TIM2_UP
+        p.PA0,      // CH1 → M1
+        p.PA1,      // CH2 → M2
+        p.PA2,      // CH3 → M3
+        p.PA3,      // CH4 → M4
+        p.DMA1_CH2, // TIM2_CH1 → M1
+        p.DMA1_CH3, // TIM2_CH2 → M2
+        p.DMA1_CH4, // TIM2_CH3 → M3
+        p.DMA1_CH7, // TIM2_CH4 → M4
         DshotSpeed::Dshot600,
+        DSHOT_BIDIR,
     );
 
     dshot.log_config();
-    defmt::info!("DShot (TIM2+TIM3+TIM4, DShot600) initialised");
+    defmt::info!(
+        "DShot initialised on TIM2 (4 per-channel CC DMA streams, bidir={=bool})",
+        DSHOT_BIDIR
+    );
 
     // ---- Run the 50 Hz outer loop as a spawned task ----
     spawner.spawn(navigation_task()).unwrap();
@@ -2296,21 +2314,33 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
 
             let motor_outputs = QUAD_X.apply(&control_demand);
 
-            let mut frames: [EncodedFrame; 4] = [DshotTx::standard().command(Command::MotorStop); 4];
-            for i in 0..4 {
-                let v = motor_outputs.motors[i];
-                if v <= 0.0 {
-                    frames[i] = DshotTx::standard().command(Command::MotorStop);
-                } else {
-                    let throttle = (v * 1999.0) as u16;
-                    frames[i] = DshotTx::standard().throttle_clamped(throttle);
-                }
+            // `from_normalised` emits MotorStop for v ≤ 0; otherwise a
+            // throttle frame. Bidir flag controls telem-bit + CRC.
+            let frames: [DshotFrame; 4] = core::array::from_fn(|i| {
+                DshotFrame::from_normalised(motor_outputs.motors[i], DSHOT_BIDIR)
+            });
+
+            let telemetry = dshot.send_throttles_and_receive(frames).await;
+
+            // Telemetry log at ~10 Hz (every 800 frames at 8 kHz). Each
+            // per-motor result is Erpm{period_us} / NoEdge / InvalidGcr
+            // / InvalidCrc — the key signal that bidir RX is decoding.
+            use core::sync::atomic::{AtomicU32, Ordering};
+            static TELEM_LOG_N: AtomicU32 = AtomicU32::new(0);
+            let n = TELEM_LOG_N.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+            if DSHOT_BIDIR && n.is_multiple_of(800) {
+                defmt::info!(
+                    "DShot RX: M1={=?} M2={=?} M3={=?} M4={=?}",
+                    telemetry[0],
+                    telemetry[1],
+                    telemetry[2],
+                    telemetry[3],
+                );
             }
-            dshot.send(frames).await;
         } else {
             rate_pid.reset();
-            let frames: [EncodedFrame; 4] = [DshotTx::standard().command(Command::MotorStop); 4];
-            dshot.send(frames).await;
+            let frames: [DshotFrame; 4] = [DshotFrame::motor_stop(DSHOT_BIDIR); 4];
+            let _ = dshot.send_throttles_and_receive(frames).await;
         }
     }
 }
