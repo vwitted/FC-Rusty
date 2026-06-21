@@ -10,6 +10,13 @@
 // so the test harness and panic handler are available on host.
 #![cfg_attr(not(test), no_std)]
 
+// Bench motor-test mode. The firmware `run()` lives in the binary's module
+// tree (it needs the embassy DShot driver); here we expose only the pure
+// config layer for host tests. `main.rs` declares the module under the
+// `motor-test` feature for the firmware build.
+#[cfg(test)]
+pub mod motor_test;
+
 pub mod control {
     pub mod altitude;
     pub mod arm_origin;

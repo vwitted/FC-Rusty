@@ -55,6 +55,11 @@ firmware = [
     "dep:static_cell",
 ]
 
+# Bench motor-test firmware (see docs/superpowers/specs/2026-06-21-dshot-motor-test-design.md).
+# Adds to the default set, so `cargo build --release --features motor-test`
+# keeps `firmware` on. No extra deps of its own.
+motor-test = []
+
 # ---- Always-available dependencies ----
 # These compile for both embedded (no_std) and host (std) targets.
 
