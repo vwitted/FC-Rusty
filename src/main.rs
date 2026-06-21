@@ -33,6 +33,10 @@
 
 #![no_std]
 #![no_main]
+// Under `motor-test` the entire flight stack is cfg'd out (the flight `main`
+// is gated off), so its tasks, helpers, and imports are intentionally unused.
+// Silence that noise for the bench build only; the flight build is unaffected.
+#![cfg_attr(feature = "motor-test", allow(unused))]
 
 use embassy_executor::Spawner;
 use embassy_stm32::time::Hertz;
@@ -74,6 +78,9 @@ mod estimation;
 mod imu_filter;
 mod logger;
 mod rc_task;
+
+#[cfg(feature = "motor-test")]
+mod motor_test;
 
 use attitude_mekf::{AttitudeMekf, G_MPS2, MekfParams};
 use imu_filter::{ImuFilter, ImuFilterParams};
@@ -313,16 +320,12 @@ static ARM_LATCH: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 // ---- Main entry point ----
 
-#[embassy_executor::main]
-async fn main(spawner: Spawner) {
-    // ---- Clock configuration ----
-    // STM32H743 with 8 MHz HSE crystal on the DAKEFPVH743.
-    //   HSE 8 MHz → PLL_M=1 → 8 MHz → PLL_N=120 → VCO 960 MHz
-    //   PLL_P=2 → SYSCLK 480 MHz  (H743 max)
-    //   PLL_Q=20 → USB 48 MHz     (960/20 = 48, exact)
-    //   AHB  = 240 MHz (prescaler 2)
-    //   APB1 = 120 MHz (prescaler 2), APB1 timers = 240 MHz
-    //   APB2 = 120 MHz (prescaler 2), APB2 timers = 240 MHz
+/// STM32H743 clock tree for the DAKEFPV (8 MHz HSE → 480 MHz SYSCLK).
+/// Shared by the flight and motor-test entry points so the clock config
+/// can never drift between them.
+fn board_config() -> embassy_stm32::Config {
+    //   HSE 8 MHz → PLL_N=120 → VCO 960 MHz; PLL_P=2 → 480 MHz SYSCLK;
+    //   PLL_Q=20 → 48 MHz USB. AHB 240 MHz; APB* 120 MHz (timers 240 MHz).
     use embassy_stm32::rcc::{
         AHBPrescaler, APBPrescaler, Hse, HseMode, Pll, PllMul, PllDiv, PllPreDiv,
         PllSource, Sysclk, VoltageScale,
@@ -334,21 +337,42 @@ async fn main(spawner: Spawner) {
     });
     config.rcc.pll1 = Some(Pll {
         source: PllSource::HSE,
-        prediv: PllPreDiv::DIV1,   // 8 MHz / 1 = 8 MHz VCO input
-        mul: PllMul::MUL120,       // 8 MHz × 120 = 960 MHz VCO
-        divp: Some(PllDiv::DIV2),  // 960 / 2 = 480 MHz SYSCLK
-        divq: Some(PllDiv::DIV20), // 960 / 20 = 48 MHz USB
+        prediv: PllPreDiv::DIV1,
+        mul: PllMul::MUL120,
+        divp: Some(PllDiv::DIV2),
+        divq: Some(PllDiv::DIV20),
         divr: None,
     });
     config.rcc.sys = Sysclk::PLL1_P;
-    config.rcc.ahb_pre = AHBPrescaler::DIV2; // 240 MHz
-    config.rcc.apb1_pre = APBPrescaler::DIV2; // 120 MHz (timers 240 MHz)
-    config.rcc.apb2_pre = APBPrescaler::DIV2; // 120 MHz (timers 240 MHz)
-    config.rcc.apb3_pre = APBPrescaler::DIV2; // 120 MHz
-    config.rcc.apb4_pre = APBPrescaler::DIV2; // 120 MHz
+    config.rcc.ahb_pre = AHBPrescaler::DIV2;
+    config.rcc.apb1_pre = APBPrescaler::DIV2;
+    config.rcc.apb2_pre = APBPrescaler::DIV2;
+    config.rcc.apb3_pre = APBPrescaler::DIV2;
+    config.rcc.apb4_pre = APBPrescaler::DIV2;
     config.rcc.voltage_scale = VoltageScale::Scale0;
+    config
+}
 
-    let p = embassy_stm32::init(config);
+/// Bench motor-test entry point — drives DShot directly, no flight stack.
+#[cfg(feature = "motor-test")]
+#[embassy_executor::main]
+async fn main(_spawner: Spawner) {
+    let p = embassy_stm32::init(board_config());
+
+    // D-cache off for DMA coherency (DShot is DMA-driven).
+    let mut core = cortex_m::Peripherals::take().unwrap();
+    core.SCB.disable_dcache(&mut core.CPUID);
+
+    // defmt over USART6 (PC6), same as the flight path.
+    logger::init_usart6();
+
+    motor_test::run(p).await;
+}
+
+#[cfg(not(feature = "motor-test"))]
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    let p = embassy_stm32::init(board_config());
 
     // Disable D-cache as early as possible
     let mut core = cortex_m::Peripherals::take().unwrap();
