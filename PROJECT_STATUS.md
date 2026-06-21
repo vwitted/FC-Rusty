@@ -151,6 +151,17 @@ material hardware or design change lands (see `CLAUDE.md`).
       **Unverified on hardware** — needs a working board to confirm
       the ESC decodes our frames and that `DShot RX` logs non-zero
       eRPM. `uf-dshot` dependency fully removed.
+- [x] **Motor-test bench firmware** (`--features motor-test`, 2026-06-21):
+      a fully decoupled DShot bench driver for verifying the bidir work
+      above — no arming, RC, PID, or flight stack, just the DShot driver.
+      Per-motor throttle, bidir, and loop-freq are set at build time
+      (`M1_PCT`..`M4_PCT`, `BIDIR`, `LOOP_KHZ` 2–8 kHz), clamped to 25%,
+      with a 5 s props-off countdown. e.g.
+      `M1_PCT=6 cargo build --release --features motor-test`. Config parse
+      is host-tested; the run loop is bench-verified. Spec + plan in
+      `docs/superpowers/{specs,plans}/2026-06-21-dshot-motor-test*`. This is
+      the clean path to test motor spin-up, superseding the throttle hacks
+      noted below.
 - [ ] revert throttle changes implemented for bench motor testing (posssibly this is done by adding a stick scaling factor in the mixer)
 
 ### Items for Beta build
