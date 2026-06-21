@@ -70,6 +70,77 @@ pub fn resolve_config() -> MotorTestConfig {
     )
 }
 
+/// Bench motor-test entry point. Never returns. Drives the DShot driver
+/// directly from the build-time config; no arming, RC, PID, or mixer.
+#[cfg(feature = "firmware")]
+pub async fn run(p: embassy_stm32::Peripherals) -> ! {
+    use crate::drivers::dshot_frame::{DshotFrame, DshotSpeed};
+    use crate::drivers::dshot_hw::DshotQuad;
+    use embassy_stm32::gpio::{Level, Output, Speed};
+    use embassy_time::{Duration, Ticker, Timer};
+
+    let cfg = resolve_config();
+
+    defmt::warn!(
+        "MOTOR TEST — REMOVE PROPS. Spinning in 5s: M1={}% M2={}% M3={}% M4={}% bidir={} loop={}kHz",
+        cfg.motor_pct[0],
+        cfg.motor_pct[1],
+        cfg.motor_pct[2],
+        cfg.motor_pct[3],
+        cfg.bidir,
+        cfg.loop_khz,
+    );
+
+    // Countdown with LED blink (PD10, active-low on the DAKEFPV) as an
+    // "alive" indicator before any frame is sent.
+    let mut led = Output::new(p.PD10, Level::High, Speed::Low);
+    for s in (1..=5).rev() {
+        defmt::info!("motor-test: spinning in {}s", s);
+        for _ in 0..5 {
+            led.toggle();
+            Timer::after(Duration::from_millis(100)).await;
+        }
+    }
+
+    let mut dshot = DshotQuad::new(
+        p.TIM2,
+        p.PA0,
+        p.PA1,
+        p.PA2,
+        p.PA3,
+        p.DMA1_CH2,
+        p.DMA1_CH3,
+        p.DMA1_CH4,
+        p.DMA1_CH7,
+        DshotSpeed::Dshot600,
+        cfg.bidir,
+    );
+
+    // Per-motor frames are constant for the run; 0% maps to MotorStop.
+    let frames: [DshotFrame; 4] =
+        core::array::from_fn(|i| DshotFrame::from_normalised(cfg.motor_pct[i] as f32 / 100.0, cfg.bidir));
+
+    let mut ticker = Ticker::every(Duration::from_micros(1000 / cfg.loop_khz as u64));
+    let log_every: u32 = cfg.loop_khz as u32 * 100; // ~10 Hz
+    let mut n: u32 = 0;
+
+    defmt::info!("motor-test: driving motors");
+    loop {
+        let telem = dshot.send_throttles_and_receive(frames).await;
+        n = n.wrapping_add(1);
+        if cfg.bidir && n % log_every == 0 {
+            defmt::info!(
+                "motor-test RX: M1={=?} M2={=?} M3={=?} M4={=?}",
+                telem[0],
+                telem[1],
+                telem[2],
+                telem[3],
+            );
+        }
+        ticker.next().await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
