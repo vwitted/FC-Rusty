@@ -12,6 +12,7 @@
 
 pub mod control {
     pub mod altitude;
+    pub mod arm_origin;
     pub mod arming;
     pub mod mixer;
     pub mod pid;

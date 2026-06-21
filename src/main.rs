@@ -62,6 +62,7 @@ mod drivers {
 }
 mod control {
     pub mod altitude;
+    pub mod arm_origin;
     pub mod arming;
     pub mod mixer;
     pub mod mpc;
@@ -78,8 +79,9 @@ use attitude_mekf::{AttitudeMekf, G_MPS2, MekfParams};
 use imu_filter::{ImuFilter, ImuFilterParams};
 use control::altitude::{AltitudeController, AltitudeGains};
 use control::arming::{ArmState, ArmingStateMachine};
-use control::mixer::{ControlDemand, QUAD_X};
-use control::mpc::AttitudeMpc;
+use control::arm_origin::ArmOriginSync;
+use control::mixer::{AirmodeGate, ControlDemand, QUAD_X};
+use control::mpc::{AttitudeMpc, MPC_DT, MPC_PERIOD_US};
 use control::pid::{PidGains, PidLimits, RatePidController};
 use control::position::{PositionController, PositionGains};
 use drivers::baro::{self, BaroSample};
@@ -287,6 +289,12 @@ struct PosEstimate {
     /// this is true; any GPS-rescue or position-hold behaviour must
     /// gate on it.
     home_latched: bool,
+    /// Monotonic counter incremented each time the PosKF consumes the arm
+    /// latch (re-anchors origins + zeros state). The navigation task uses
+    /// it (via `ArmOriginSync`) to withhold target capture until the
+    /// arm-time re-origin has actually landed — otherwise it would capture
+    /// stale pre-zero targets and lurch on arm.
+    arm_origin_seq: u32,
 }
 
 static POS_ESTIMATE: Signal<CriticalSectionRawMutex, PosEstimate> = Signal::new();
@@ -1063,6 +1071,11 @@ async fn pos_kf_task() {
     let mut p_ref_at_arm = false;
     let mut last_baro_pressure: Option<f32> = None;
 
+    // Bumped each time the arm latch is consumed (re-origin done). Published
+    // in the estimate so the navigation task knows the post-arm zero has
+    // landed before it captures altitude/position targets.
+    let mut arm_origin_seq: u32 = 0;
+
     // Home-origin latch state. Stored as f64 for lat/lon to preserve
     // sub-metre resolution; the geodetic helper handles the cast.
     // `home_latched` retains its prior semantics for downstream
@@ -1321,6 +1334,10 @@ async fn pos_kf_task() {
             for i in 0..6 {
                 kf.x[i] = 0.0;
             }
+
+            // Signal to the navigation task that the re-origin for this arm
+            // has landed (the published estimate now reflects the zero).
+            arm_origin_seq = arm_origin_seq.wrapping_add(1);
         }
 
         // ---- Readiness ----
@@ -1355,6 +1372,7 @@ async fn pos_kf_task() {
                 .unwrap_or(u32::MAX),
             altitude_ready,
             home_latched,
+            arm_origin_seq,
         };
         POS_ESTIMATE.signal(est);
 
@@ -1707,11 +1725,10 @@ async fn navigation_task() {
     // only needs `require_altitude_ref = false` if neither baro nor
     // GPS hardware is present.
 
-    // ---- MPC attitude outer loop (50 Hz) ----
+    // ---- MPC attitude outer loop (100 Hz) ----
     let mut mpc = AttitudeMpc::new();
-    let mut rate_sp_degs = [0.0f32; 3]; // persisted between MPC solves
 
-    // ---- Altitude hold (50 Hz) ----
+    // ---- Altitude hold (100 Hz) ----
     let hover_throttle: f32 = 0.294; // tune per aircraft: mass*g / max_thrust
     let alt_gains = AltitudeGains {
         kp: 0.15,
@@ -1745,6 +1762,13 @@ async fn navigation_task() {
     let mut rescue_loiter_start: Option<Instant> = None;
     let mut rescue_landing = false;
 
+    // Arm-time re-origin gate + "have the current mode's targets been
+    // captured yet" flag. Together they withhold altitude/position target
+    // capture until the PosKF has zeroed for this arm, then capture exactly
+    // once — even if the mode was entered during the arm/re-origin window.
+    let mut arm_origin_sync = ArmOriginSync::new();
+    let mut targets_captured = false;
+
     // ---- Loop timing instrumentation ----
     // Tracks how long each control loop iteration takes.
     // If loop_time exceeds 5ms (200 Hz budget), we're overrunning.
@@ -1757,10 +1781,12 @@ async fn navigation_task() {
     let mut overrun_count: u32 = 0;
     let mut timing_sample_count: u32 = 0;
 
-    // ---- Main loop: 200 Hz ----
-    let mut ticker = Ticker::every(Duration::from_millis(10));
+    // ---- Main loop: 100 Hz ----
+    // Period and dt come from the MPC module so the outer control loop and
+    // the MPC's discretised model can never run at different rates.
+    let mut ticker = Ticker::every(Duration::from_micros(MPC_PERIOD_US));
     let mut cycle_count: u32 = 0;
-    let dt: f32 = 0.01; // 100 Hz
+    let dt: f32 = MPC_DT; // 100 Hz (== mpc::MPC_PERIOD_US)
 
     // ---- MPC warm-up ----
     // Run one throwaway solve so the first in-flight solve (on arm)
@@ -1907,8 +1933,22 @@ async fn navigation_task() {
         }
 
         // ---- Mode entry: capture targets on transition ----
+        // Log the change and reset the capture flag here; the actual target
+        // capture below is gated separately on the PosKF re-origin, so a
+        // mode entered during the arm/re-origin window still captures once
+        // the zero lands rather than being missed.
         if flight_mode != prev_mode {
             defmt::info!("Flight mode: {} -> {}", prev_mode, flight_mode);
+            prev_mode = flight_mode;
+            targets_captured = false;
+        }
+
+        // True once the PosKF has zeroed for the current arm. Must be called
+        // every tick so the arm-edge tracking stays correct.
+        let reoriginated = arm_origin_sync
+            .reoriginated(armed, last_pos_est.map(|e| e.arm_origin_seq).unwrap_or(0));
+
+        if !targets_captured {
             // AltHold + FailsafeLand need altitude; PosHold + GPS modes
             // need NED. FailsafeBlind needs nothing (open loop).
             let target_gate = match flight_mode {
@@ -1917,7 +1957,11 @@ async fn navigation_task() {
                 FlightMode::GpsRescue | FlightMode::GpsHome => home_latched,
                 FlightMode::Acro | FlightMode::FailsafeBlind => false,
             };
-            if let Some(est) = last_pos_est.filter(|_| target_gate) {
+            // Wait for the arm-time re-origin before sampling the estimate:
+            // otherwise we'd latch a stale pre-zero altitude/position and
+            // lurch the instant the KF zeroes. Mid-flight mode switches see
+            // `reoriginated == true` already, so they capture immediately.
+            if let Some(est) = last_pos_est.filter(|_| target_gate && reoriginated) {
                 match flight_mode {
                     FlightMode::AltHold => {
                         alt_target = est.altitude_up;
@@ -1955,8 +1999,8 @@ async fn navigation_task() {
                     }
                     FlightMode::Acro | FlightMode::FailsafeBlind => {}
                 }
+                targets_captured = true;
             }
-            prev_mode = flight_mode;
         }
 
         // ---- 4. Control computation ----
@@ -1967,9 +2011,13 @@ async fn navigation_task() {
             let yaw_input = RcChannels::to_normalised(last_rc.channels[3]);
             let throttle_raw = RcChannels::to_unit(last_rc.channels[2]);
 
-            // ---- 50 Hz outer loops (every 4th cycle) ----
-            if cycle_count % 4 == 0 {
-                let dt_outer: f32 = dt * 4.0; // 50 Hz
+            // ---- 100 Hz outer loops (every cycle) ----
+            // The MPC and altitude/position controllers run once per
+            // navigation tick. The MPC's A/B model is discretised for
+            // exactly this period (mpc::MPC_DT), so dt_outer == dt. The
+            // block yields the freshly-computed rate setpoints.
+            let rate_sp_degs = {
+                let dt_outer: f32 = dt; // 100 Hz
 
                 // Current IMU state in radians
                 let angles_rad = [
@@ -2175,12 +2223,12 @@ async fn navigation_task() {
                     mpc_iters_max = mpc_iters_last;
                 }
 
-                rate_sp_degs = [
+                [
                     mpc_out.rate_setpoints_rads[0] * RAD2DEG,
                     mpc_out.rate_setpoints_rads[1] * RAD2DEG,
                     mpc_out.rate_setpoints_rads[2] * RAD2DEG,
-                ];
-            }
+                ]
+            };
 
             // ---- Publish to fast inner loop ----
             OUTER_CMD.sender().send(OuterLoopCommand {
@@ -2192,7 +2240,6 @@ async fn navigation_task() {
             // Disarmed — zero everything, reset controllers
             mpc.reset();
             alt_ctrl.reset();
-            rate_sp_degs = [0.0; 3];
             current_thrust = hover_throttle;
             rescue_loiter_start = None;
             rescue_landing = false;
@@ -2290,6 +2337,11 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
     let dt: f32 = 0.000125; // 8 kHz
     let mut receiver = OUTER_CMD.receiver().unwrap();
 
+    // Airmode is withheld until throttle first crosses this floor after
+    // arming, so an armed quad on the ground can't spin up on stick input.
+    const AIRMODE_ACTIVATE_THROTTLE: f32 = 0.05; // 5% collective
+    let mut airmode_gate = AirmodeGate::new();
+
     loop {
         // Wait for the next 8 kHz IMU sample
         let imu = IMU_DATA.wait().await;
@@ -2302,17 +2354,31 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
             armed: false,
         });
 
+        let airmode = airmode_gate.update(cmd.armed, cmd.thrust, AIRMODE_ACTIVATE_THROTTLE);
+
         if cmd.armed {
-            let pid_output = rate_pid.update(cmd.rate_sp_degs, imu.gyro, dt);
-
-            let control_demand = ControlDemand {
-                thrust: cmd.thrust,
-                roll: pid_output[0],
-                pitch: pid_output[1],
-                yaw: pid_output[2],
+            let motor_outputs = if airmode {
+                // Airborne (throttle has crossed the floor this arm): full
+                // airmode keeps roll/pitch/yaw authority at low thrust.
+                let pid_output = rate_pid.update(cmd.rate_sp_degs, imu.gyro, dt);
+                QUAD_X.apply(&ControlDemand {
+                    thrust: cmd.thrust,
+                    roll: pid_output[0],
+                    pitch: pid_output[1],
+                    yaw: pid_output[2],
+                })
+            } else {
+                // Armed but still grounded (pre first throttle-up):
+                // collective thrust only, no torque, and hold the rate PID
+                // in reset so its integrator can't wind up before takeoff.
+                rate_pid.reset();
+                QUAD_X.apply_no_airmode(&ControlDemand {
+                    thrust: cmd.thrust,
+                    roll: 0.0,
+                    pitch: 0.0,
+                    yaw: 0.0,
+                })
             };
-
-            let motor_outputs = QUAD_X.apply(&control_demand);
 
             // `from_normalised` emits MotorStop for v ≤ 0; otherwise a
             // throttle frame. Bidir flag controls telem-bit + CRC.

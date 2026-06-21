@@ -16,25 +16,31 @@ every other decision (estimation, sensors, arming, comms) to the
 stability and authority of the inner loop. See `PROJECT_STATUS.md`
 for the full state snapshot.
 
-Control cascade: Position PD (5 Hz) → Attitude MPC (50 Hz) →
-Rate PID (200 Hz) → DShot. PosKF 6-state (GPS + baro + IMU predict)
+Control cascade: Position PD (5 Hz) → Attitude MPC (100 Hz) →
+Rate PID (8 kHz) → DShot. PosKF 6-state (GPS + baro + IMU predict)
 at 100 Hz; MEKF attitude at 8 kHz.
 
 ---
 
 ## Durable rules
 
-### Keep `PROJECT_STATUS.md` in sync
+### `PROJECT_STATUS.md` / `ARCHITECTURE.md` are a journal, not a spec
 
-**Update `PROJECT_STATUS.md` whenever a material hardware or design
-change lands** — verified peripheral, commit that changes control
-behaviour, killed sensor, new backlog item. If you're writing a
-commit message that would change what "What's Verified" or
-"Code-Done but Unflashed" or "Backlog" should say, update the doc
-in the same commit.
+Keep logging material changes there when they land — verified
+peripheral, commit that changes control behaviour, killed sensor,
+new backlog item. The running record is useful.
 
-A stale status doc is worse than no status doc — do not let it
-drift again.
+But **never infer current behaviour from these docs.** Parts are
+stale, and parts were aspirational or never true (this has already
+misled an outside reviewer into "fixing" bugs that didn't exist).
+Verify behaviour against the code. This file (CLAUDE.md) is the only
+doc kept short, curated, and trustworthy.
+
+**Comments:** keep the *why* — rationale, hazards, conventions,
+current pin/sensor mappings. Delete or fix comments that assert a
+stale *fact* (retired boards like the F407, removed sensors like the
+WT901B, wrong loop rates). Don't blanket-strip comments; the *why*
+is what prevents regressions.
 
 ### Hardware-safety rules (non-negotiable)
 

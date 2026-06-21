@@ -261,7 +261,7 @@ All host-tested (`cargo test --lib --no-default-features --target x86_64-unknown
 | Module           | File                     | Description                                                   |
 |------------------|--------------------------|---------------------------------------------------------------|
 | Rate PID         | `control/pid.rs`         | 3-axis, derivative-on-measurement, D-term LPF, anti-windup   |
-| Attitude MPC     | `control/mpc.rs`         | 6-state roll/pitch/yaw+rates, tinympc ADMM, 50 Hz            |
+| Attitude MPC     | `control/mpc.rs`         | 6-state roll/pitch/yaw+rates, tinympc ADMM, 100 Hz           |
 | Altitude hold    | `control/altitude.rs`    | PID + hover feedforward, anti-windup, gated on PosKF.ready   |
 | Position PD      | `control/position.rs`    | Horizontal hold, world→body rotation, tilt-limited — **written, not yet wired** |
 | Quad-X mixer     | `control/mixer.rs`       | Airmode + no-airmode paths, phantom-thrust prevention         |
@@ -292,10 +292,10 @@ PosKF (100 Hz) ← GPS (1 Hz NMEA) + baro (25 Hz) + IMU predict
 Position PD (5 Hz)  ← [written, not yet wired]
       │
       ▼
-Attitude MPC (50 Hz) → rate setpoints
+Attitude MPC (100 Hz) → rate setpoints
       │
       ▼
-Rate PID (200 Hz) → torque demands → mixer → DShot → motors
+Rate PID (8 kHz) → torque demands → mixer → DShot → motors
 ```
 
 ### Simulation examples
@@ -324,11 +324,16 @@ dual FPU. Ideas ordered by payoff/risk ratio:
 
 1. **MPC hot loop in ITCM.** TinyMPC's ADMM iteration is our tightest
    inner loop; zero-wait ITCM should measurably cut solve time. Low risk.
-2. **MPC rate 50 Hz → 100 Hz → 200 Hz.** Gated on (1). Cuts
-   attitude-tracking lag; at 200 Hz the rate loop gets a fresh setpoint
-   every tick.
-3. **Longer MPC horizon.** More RAM + faster solve = look further ahead;
-   helps on aggressive manoeuvres.
+2. **MPC rate → 200 Hz.** 100 Hz landed 2026-06-21: the outer loop was
+   mislabelled 50 Hz but actually ran at 25 Hz (gated `cycle_count % 4`
+   on a 100 Hz task) while `MPC_DT` assumed 50 Hz — a 2× model/loop
+   mismatch. Now runs every navigation cycle, with `MPC_DT`/`MPC_PERIOD_US`
+   the single source of truth shared by `main.rs` and `mpc.rs`. Next step
+   200 Hz is gated on (1) for solve headroom.
+3. **Longer MPC horizon.** At `MPC_DT = 0.01` the 10-step horizon previews
+   only 0.1 s (halving `MPC_DT` to reach 100 Hz halved the preview from
+   0.2 s). Bumping `HX` restores look-ahead at the cost of RAM + solve
+   time; helps on aggressive manoeuvres.
 4. **True NMPC (12-state, SQP / RTI).** Biggest payoff, biggest work.
    Needs a nonlinear solver (acados-style). Gate on (1)+(2) showing us
    the solve-time budget.

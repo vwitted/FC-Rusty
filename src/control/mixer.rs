@@ -140,6 +140,50 @@ impl<const N: usize> Mixer<N> {
     }
 }
 
+/// Betaflight-style airmode activation latch.
+///
+/// Airmode (see [`Mixer::apply`]) shifts motor outputs up to preserve
+/// roll/pitch/yaw differentials even at zero collective thrust. On the
+/// ground that is dangerous: an armed quad sitting at idle would spin its
+/// motors up the instant a stick is bumped. This gate withholds airmode
+/// until the throttle first crosses an activation floor after arming — at
+/// which point the pilot has committed to taking off — and keeps it on for
+/// the rest of the arm so low-throttle attitude authority is available in
+/// flight. Disarming clears the latch.
+///
+/// While the gate is inactive the caller should suppress the torque mix
+/// entirely (collective thrust only), so grounded stick input cannot drive
+/// any motor.
+pub struct AirmodeGate {
+    active: bool,
+}
+
+impl AirmodeGate {
+    pub const fn new() -> Self {
+        Self { active: false }
+    }
+
+    /// Update the latch and return whether airmode should be applied.
+    ///
+    /// * `armed` — current arm state; `false` resets the latch.
+    /// * `throttle` — current collective throttle command (0.0..1.0).
+    /// * `activate_floor` — throttle at/above which airmode latches on.
+    pub fn update(&mut self, armed: bool, throttle: f32, activate_floor: f32) -> bool {
+        if !armed {
+            self.active = false;
+        } else if throttle >= activate_floor {
+            self.active = true;
+        }
+        self.active
+    }
+}
+
+impl Default for AirmodeGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---- Common frame geometries ----
 
 /// Quad-X, "props-in" (reversed) spin directions, clockwise-from-rear-right numbering:
@@ -310,5 +354,28 @@ mod tests {
             assert!(*m >= 0.0 && *m <= 1.0);
             assert!(m.is_finite());
         }
+    }
+
+    #[test]
+    fn airmode_gate_off_until_first_throttle_up() {
+        let mut g = AirmodeGate::new();
+        // Freshly armed at idle: airmode stays OFF so stick input can't
+        // spin motors on the ground.
+        assert!(!g.update(true, 0.0, 0.05));
+        assert!(!g.update(true, 0.04, 0.05)); // still below the floor
+        // Throttle crosses the floor → airmode latches ON (committed to fly).
+        assert!(g.update(true, 0.06, 0.05));
+        // Stays ON after throttle drops back — now airborne, need authority.
+        assert!(g.update(true, 0.0, 0.05));
+    }
+
+    #[test]
+    fn airmode_gate_resets_on_disarm() {
+        let mut g = AirmodeGate::new();
+        assert!(g.update(true, 0.5, 0.05)); // active in flight
+        assert!(!g.update(false, 0.5, 0.05)); // disarm clears the latch
+        // Re-arm must cross the floor again before airmode re-activates.
+        assert!(!g.update(true, 0.0, 0.05));
+        assert!(g.update(true, 0.10, 0.05));
     }
 }

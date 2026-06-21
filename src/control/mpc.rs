@@ -14,8 +14,9 @@
 // This prevents the MPC from commanding unrealistically aggressive
 // rate changes that the PID can't deliver.
 //
-// MPC runs at 50 Hz. Its output [p_cmd, q_cmd, r_cmd] becomes the
-// rate setpoint for the 200 Hz PID inner loop.
+// MPC runs at 100 Hz (see `MPC_PERIOD_US`). Its output
+// [p_cmd, q_cmd, r_cmd] becomes the rate setpoint for the 8 kHz PID
+// inner loop.
 //
 // Usage:
 //   let mut mpc = AttitudeMpc::new();
@@ -38,18 +39,34 @@ pub const NU: usize = 3;   // [p_cmd, q_cmd, r_cmd]
 pub const HX: usize = 10;  // state prediction horizon
 pub const HU: usize = 9;   // control horizon
 
-/// MPC sample period (seconds). 50 Hz.
-pub const MPC_DT: f32 = 0.02;
+/// Outer control-loop period in microseconds — the single source of
+/// truth for the rate at which the navigation task runs the MPC and the
+/// altitude/position controllers. `main.rs` builds its ticker from this,
+/// and the MPC's A/B model below is discretised for exactly this step, so
+/// the two can never drift apart. 100 Hz = 10_000 µs.
+pub const MPC_PERIOD_US: u64 = 10_000;
+
+/// MPC sample period (seconds) = `MPC_PERIOD_US` · 1e-6. 100 Hz.
+pub const MPC_DT: f32 = 0.01;
 
 // ---- Rate tracking model ----
-// The PID inner loop doesn't track rate commands instantly.
-// We model it as a first-order lag: rate[k+1] = α·rate[k] + (1-α)·u[k]
-// α = exp(-dt_mpc / τ_cl) where τ_cl is the rate-loop closed-loop time
-// constant. Dominant pole is the motor/ESC lag τ_motor ≈ 30 ms, so
-// α ≈ exp(-20/30) ≈ 0.51. Slightly higher (0.55) builds in a bit of
-// margin against model error — the MPC sees a marginally *slower*
-// plant than reality and so commands a little less aggressively.
-const RATE_ALPHA: f32 = 0.55;
+// The PID inner loop doesn't track rate commands instantly. We model it
+// as a first-order lag: rate[k+1] = α·rate[k] + (1-α)·u[k], with
+//   α = exp(-MPC_DT / TAU_MOTOR) + RATE_ALPHA_MARGIN
+// TAU_MOTOR is the dominant rate-loop pole (motor/ESC lag ≈ 30 ms). The
+// margin makes the MPC see a slightly *slower* plant than reality, so it
+// commands a little less aggressively (the 50 Hz model carried the same
+// ~0.035 margin: 0.55 vs an exact 0.51). Deriving α from MPC_DT rather
+// than hand-coding it means the lag model can never silently fall out of
+// sync with the loop rate again.
+const TAU_MOTOR: f32 = 0.030;
+const RATE_ALPHA_MARGIN: f32 = 0.035;
+
+/// First-order rate-lag coefficient α for the current model timestep.
+/// Derived from `MPC_DT` so it tracks any change to the loop rate.
+fn rate_alpha() -> f32 {
+    libm::expf(-MPC_DT / TAU_MOTOR) + RATE_ALPHA_MARGIN
+}
 
 // ---- Constraint bounds ----
 const MAX_ANGLE_RAD: f32 = 45.0 * PI / 180.0;  // ±45°
@@ -103,7 +120,7 @@ impl AttitudeMpc {
         //
         // The first-order lag models the PID's finite bandwidth:
         // rates don't jump instantly to the commanded value.
-        let alpha = RATE_ALPHA;
+        let alpha = rate_alpha();
         let beta = 1.0 - alpha;
 
         let a: SMatrix<f32, NX, NX> = SMatrix::from_row_slice(&[
@@ -164,13 +181,15 @@ impl AttitudeMpc {
             .expect("MPC policy computation failed — check A, B, Q, R");
 
         let mut solver = MpcSolver::new(a, b, policy);
-        // On the STM32F407 (168 MHz, no SIMD, software sqrt), each
-        // ADMM iteration costs ~240us. 50 iters = 12ms, blowing the
-        // 5ms 200Hz budget on cycles where MPC runs. 10 caps solve
-        // time at ~2.5ms, which leaves room for PID + mixer on the
-        // same cycle. Attitude tracking is ~100Hz bandwidth so partial
-        // convergence is fine — the next solve 20ms later continues
-        // from a warm start anyway.
+        // Cap ADMM iterations so the solve fits inside the 10 ms / 100 Hz
+        // navigation budget (the H743's 480 MHz Cortex-M7 with a
+        // double-precision FPU has ample headroom, but bounding the
+        // worst case keeps the outer loop deterministic alongside the
+        // altitude/position controllers). Attitude tracking is well below
+        // the loop bandwidth, so partial convergence is fine — the next
+        // solve 10 ms later continues from a warm start. The navigation
+        // task records `mpc_time_us_max`; check it on hardware if you
+        // change this cap.
         solver.config.max_iter = 10;
         solver.config.do_check = 1;
 
@@ -260,5 +279,47 @@ impl AttitudeMpc {
         self.x_ref = SMatrix::zeros();
         self.x_con.reset();
         self.u_con.reset();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The MPC's A/B model is discretised for exactly the outer-loop
+    // period. If MPC_DT drifts from the rate at which the navigation task
+    // actually calls solve(), the internal model runs at the wrong speed
+    // and the solver over-/under-shoots its rate commands. Lock the model
+    // timestep to the single-source-of-truth period so they can't desync.
+    #[test]
+    fn mpc_dt_matches_outer_loop_period() {
+        let expected = MPC_PERIOD_US as f32 * 1.0e-6;
+        assert!(
+            (MPC_DT - expected).abs() < 1.0e-9,
+            "MPC_DT {} s must equal MPC_PERIOD_US ({} us = {} s)",
+            MPC_DT,
+            MPC_PERIOD_US,
+            expected,
+        );
+    }
+
+    // The first-order rate-lag coefficient is a function of the model
+    // timestep: α = exp(-MPC_DT / TAU_MOTOR). If MPC_DT changes, α must be
+    // retuned or the lag model no longer matches the plant. Allow a small
+    // upward margin (model sees a slightly slower plant) but never let α
+    // fall below the exact figure or drift far above it.
+    #[test]
+    fn rate_alpha_consistent_with_timestep() {
+        let exact = libm::expf(-MPC_DT / TAU_MOTOR);
+        let alpha = rate_alpha();
+        assert!(
+            alpha >= exact - 1.0e-3 && alpha <= exact + 0.06,
+            "rate_alpha() {} inconsistent with exp(-MPC_DT/TAU_MOTOR) = {} \
+             (expected within [{}, {}])",
+            alpha,
+            exact,
+            exact - 1.0e-3,
+            exact + 0.06,
+        );
     }
 }
