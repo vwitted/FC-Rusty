@@ -82,6 +82,11 @@ mod rc_task;
 #[cfg(feature = "motor-test")]
 mod motor_test;
 
+mod persist {
+    pub mod record;
+    pub mod flash;
+}
+
 use attitude_mekf::{AttitudeMekf, G_MPS2, MekfParams};
 use imu_filter::{ImuFilter, ImuFilterParams};
 use control::altitude::{AltitudeController, AltitudeGains};

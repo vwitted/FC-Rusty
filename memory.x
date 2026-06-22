@@ -11,8 +11,13 @@ MEMORY
    *   SRAM3     32 KB @ 0x30040000 (D2 domain)
    *   SRAM4     64 KB @ 0x38000000 (D3 domain)
    */
-  FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 2048K
-  RAM   (rwx): ORIGIN = 0x24000000, LENGTH = 512K
-  DTCM  (rwx): ORIGIN = 0x20000000, LENGTH = 128K
-  ITCM  (rx) : ORIGIN = 0x00000000, LENGTH = 64K
+  /* Last 128 KB sector (bank 2, 0x081E0000) is reserved for the persist
+   * config store; FLASH is shrunk to 1920K so the firmware image can't
+   * overlap it. DFU programming writes only FLASH, so config survives a
+   * reflash. See src/persist/flash.rs (CONFIG_OFFSET). */
+  FLASH  (rx) : ORIGIN = 0x08000000, LENGTH = 1920K
+  CONFIG (r)  : ORIGIN = 0x081E0000, LENGTH = 128K
+  RAM    (rwx): ORIGIN = 0x24000000, LENGTH = 512K
+  DTCM   (rwx): ORIGIN = 0x20000000, LENGTH = 128K
+  ITCM   (rx) : ORIGIN = 0x00000000, LENGTH = 64K
 }
