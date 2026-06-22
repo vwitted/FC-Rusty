@@ -162,6 +162,20 @@ material hardware or design change lands (see `CLAUDE.md`).
       `docs/superpowers/{specs,plans}/2026-06-21-dshot-motor-test*`. This is
       the clean path to test motor spin-up, superseding the throttle hacks
       noted below.
+- [~] **Persist flash config store** (`src/persist/`, 2026-06-22):
+      first non-volatile storage in the repo — a versioned, CRC-checked
+      32-byte record in the last 128 KB flash sector (bank 2, `0x081E0000`,
+      reserved in `memory.x`; `FLASH` shrunk to 1920K). Pure `record`
+      module (host-tested: CRC, encode/decode, version/magic/CRC/blank
+      rejection) + firmware `flash` wrapper (`read`/`write`, disarmed-only,
+      erase-then-write one record). Boot reads it into an uncalibrated
+      default; an uncalibrated board behaves exactly as before. This is
+      **sub-project A** — the foundation for the magnetometer-calibration /
+      yaw fix (sub-project B). Spec + plan in
+      `docs/superpowers/{specs,plans}/2026-06-22-persist-flash-config*`.
+      Code committed; **bench round-trip not yet verified** (a `[~]`, not a
+      `[x]`): build with `--features persist-selftest`, flash, and confirm
+      the marker survives a power cycle on the USART6 console.
 - [ ] revert throttle changes implemented for bench motor testing (posssibly this is done by adding a stick scaling factor in the mixer)
 
 ### Items for Beta build
