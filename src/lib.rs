@@ -17,6 +17,12 @@
 #[cfg(test)]
 pub mod motor_test;
 
+// Versioned flash config store. `record` is pure (host-tested); the
+// firmware flash wrapper lives in main.rs's module tree (needs embassy).
+pub mod persist {
+    pub mod record;
+}
+
 pub mod control {
     pub mod altitude;
     pub mod arm_origin;
