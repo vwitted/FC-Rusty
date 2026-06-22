@@ -387,6 +387,20 @@ async fn main(spawner: Spawner) {
     // so the first defmt::info! below actually lands on the wire.
     logger::init_usart6();
 
+    // Load persisted config (sub-project A). None ⇒ uncalibrated defaults,
+    // identical to prior behaviour. Read once here, before control loops.
+    let mut cfg_flash = persist::flash::driver(p.FLASH);
+    let config = persist::flash::read(&mut cfg_flash).unwrap_or_default();
+    defmt::info!(
+        "persist: mag_calibrated={} decl={=f32}rad hard_iron=[{=f32},{=f32},{=f32}]",
+        config.mag_calibrated,
+        config.declination_rad,
+        config.mag_hard_iron_ut[0],
+        config.mag_hard_iron_ut[1],
+        config.mag_hard_iron_ut[2],
+    );
+    let _ = &config; // consumed by sub-project B; bound now to prove the boot read
+
     // ---- Status LED Heartbeat ----
     // DAKEFPVH743 has LED0 on PD10 (active low). We spawn a quick blink
     // task so we have an immediate visual indicator that the firmware
