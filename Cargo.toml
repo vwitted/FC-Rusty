@@ -60,6 +60,12 @@ firmware = [
 # keeps `firmware` on. No extra deps of its own.
 motor-test = []
 
+# Bench-only self-test for the persist flash store (sub-project A).
+# On boot: logs the pre-write read, then writes a known marker Config.
+# Power-cycle and re-flash-free reboot should then read the marker back,
+# proving persistence. Never enable for a flight build.
+persist-selftest = []
+
 # ---- Always-available dependencies ----
 # These compile for both embedded (no_std) and host (std) targets.
 

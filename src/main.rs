@@ -401,6 +401,29 @@ async fn main(spawner: Spawner) {
     );
     let _ = &config; // consumed by sub-project B; bound now to prove the boot read
 
+    #[cfg(feature = "persist-selftest")]
+    {
+        // Two-boot protocol:
+        //   Boot 1 (blank sector): `config` read above is the default
+        //   (mag_calibrated=false). We then write the marker below.
+        //   Boot 2 (after power-cycle): the read above returns the marker
+        //   (mag_calibrated=true, decl=0.1234), proving persistence.
+        if config.mag_calibrated && (config.declination_rad - 0.1234).abs() < 1e-4 {
+            defmt::info!("persist-selftest: PASS — marker survived reboot");
+        } else {
+            defmt::warn!("persist-selftest: no marker yet — writing it now, power-cycle to verify");
+            let marker = persist::record::Config {
+                mag_hard_iron_ut: [1.0, 2.0, 3.0],
+                declination_rad: 0.1234,
+                mag_calibrated: true,
+            };
+            match persist::flash::write(&mut cfg_flash, &marker) {
+                Ok(()) => defmt::info!("persist-selftest: marker written OK"),
+                Err(e) => defmt::error!("persist-selftest: write failed {:?}", e),
+            }
+        }
+    }
+
     // ---- Status LED Heartbeat ----
     // DAKEFPVH743 has LED0 on PD10 (active low). We spawn a quick blink
     // task so we have an immediate visual indicator that the firmware

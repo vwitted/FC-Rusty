@@ -17,7 +17,7 @@ pub const CONFIG_OFFSET: u32 = 0x1E_0000;
 /// H743 sector size (erase granularity).
 pub const CONFIG_SECTOR_LEN: u32 = 128 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
 pub enum PersistError {
     Erase,
     Write,
