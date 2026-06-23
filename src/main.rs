@@ -982,6 +982,7 @@ async fn mekf_task() {
     let mut cal_active = false;
     let mut anchor_pending = false;
     let mut last_cal_log = Instant::now();
+    let cal_led_tx = CAL_LED.sender();
 
     loop {
         let raw = RAW_IMU.wait().await;
@@ -1003,6 +1004,7 @@ async fn mekf_task() {
                 CalCommand::Start => {
                     calibrator.reset();
                     cal_active = true;
+                    cal_led_tx.send(CalLed::Calibrating(0));
                     defmt::info!("MEKF cal: started — rotate the craft through all axes");
                 }
                 CalCommand::Abort => {
@@ -1010,6 +1012,7 @@ async fn mekf_task() {
                         defmt::info!("MEKF cal: aborted");
                     }
                     cal_active = false;
+                    cal_led_tx.send(CalLed::Idle);
                 }
             }
         }
@@ -1054,6 +1057,7 @@ async fn mekf_task() {
             if cal_active {
                 calibrator.feed(ut);
                 if last_cal_log.elapsed().as_millis() >= 500 {
+                    cal_led_tx.send(CalLed::Calibrating(calibrator.progress()));
                     defmt::info!("MEKF cal: coverage {}%", calibrator.progress());
                     last_cal_log = Instant::now();
                 }
@@ -1063,6 +1067,7 @@ async fn mekf_task() {
                             mekf.set_hard_iron(off);
                             cal_active = false;
                             anchor_pending = true;
+                            cal_led_tx.send(CalLed::AwaitingLevel);
                             let cfg = persist::record::Config {
                                 mag_hard_iron_ut: off,
                                 declination_rad: DECLINATION_DEG.to_radians(),
@@ -1076,6 +1081,7 @@ async fn mekf_task() {
                         }
                         None => {
                             cal_active = false;
+                            cal_led_tx.send(CalLed::Fault);
                             defmt::error!("MEKF cal: degenerate fit — aborted, keeping prior cal");
                         }
                     }
@@ -1088,6 +1094,7 @@ async fn mekf_task() {
                 if anchor_pending && mag_anchor_ready(&raw) {
                     mekf.anchor_heading(ut, DECLINATION_DEG.to_radians());
                     anchor_pending = false;
+                    cal_led_tx.send(CalLed::Saved);
                     defmt::info!(
                         "MEKF anchored to true north: yaw={=f32}deg",
                         mekf.euler()[2] * RAD2DEG,
