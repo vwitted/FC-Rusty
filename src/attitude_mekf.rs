@@ -454,6 +454,61 @@ impl AttitudeMekf {
         true
     }
 
+    /// Scalar yaw measurement update (e.g. GPS course-over-ground used as
+    /// a heading reference). `yaw_meas` and the internal yaw are both
+    /// "angle from north, clockwise positive"; the innovation is wrapped
+    /// to [−π, π]. `sigma_yaw` (rad) should be generous — COG ≈ heading
+    /// only approximately. Returns false if the innovation covariance is
+    /// non-positive.
+    pub fn update_yaw_reference(&mut self, yaw_meas: f32, sigma_yaw: f32) -> bool {
+        use core::f32::consts::PI;
+        let yaw_est = quat_to_euler(&self.q)[2];
+        let mut y = yaw_meas - yaw_est;
+        while y > PI {
+            y -= 2.0 * PI;
+        }
+        while y < -PI {
+            y += 2.0 * PI;
+        }
+
+        // H = [hᵀ | 0], h = body projection of world-down = r_bn_row_z(q).
+        let h = r_bn_row_z(&self.q);
+        let p_tt = self.p.fixed_view::<3, 3>(0, 0).into_owned();
+        let p_tb = self.p.fixed_view::<3, 3>(0, 3).into_owned();
+
+        let s = h.dot(&(p_tt * h)) + sigma_yaw * sigma_yaw;
+        if !(s > 0.0) {
+            return false;
+        }
+        // K = P Hᵀ / s  (6×1): top = P_tt·h, bottom = P_btᵀ·h.
+        let k_top = (p_tt * h) / s;
+        let k_bot = (p_tb.transpose() * h) / s;
+
+        let d_theta = k_top * y;
+        let d_bias = k_bot * y;
+
+        let dq = [1.0, d_theta[0] * 0.5, d_theta[1] * 0.5, d_theta[2] * 0.5];
+        self.q = quat_mul(self.q, dq);
+        quat_normalize(&mut self.q);
+        self.bias += d_bias;
+
+        // P ← (I − K H) P, KH = [[k_top·hᵀ, 0], [k_bot·hᵀ, 0]].
+        let kh_tt = k_top * h.transpose();
+        let kh_bt = k_bot * h.transpose();
+        let mut kh = SMatrix::<f32, 6, 6>::zeros();
+        for i in 0..3 {
+            for j in 0..3 {
+                kh[(i, j)] = kh_tt[(i, j)];
+                kh[(3 + i, j)] = kh_bt[(i, j)];
+            }
+        }
+        let i6 = SMatrix::<f32, 6, 6>::identity();
+        self.p = (i6 - kh) * self.p;
+        let pt = self.p.transpose();
+        self.p = (self.p + pt) * 0.5;
+        true
+    }
+
     /// Euler angles [roll, pitch, yaw] in radians (3-2-1 Tait-Bryan).
     pub fn euler(&self) -> [f32; 3] {
         quat_to_euler(&self.q)
@@ -725,6 +780,39 @@ mod tests {
             let err = (y - psi).sin().abs(); // wrap-safe small-angle check
             assert!(err < 1.0e-2, "heading {} got {} deg", heading_deg, y.to_degrees());
         }
+    }
+
+    #[test]
+    fn yaw_reference_corrects_drift() {
+        let mut m = AttitudeMekf::new(MekfParams::default());
+        m.initialize_from_accel([0.0, 0.0, -1.0]);
+        // Drift +30° yaw the filter doesn't know about.
+        m.q = euler_to_quat(0.0, 0.0, 30.0_f32.to_radians());
+
+        for _ in 0..50 {
+            m.predict([0.0, 0.0, 0.0], 1.0 / 8000.0);
+            m.update_accel([0.0, 0.0, -1.0]);
+            m.update_yaw_reference(0.0, 0.26); // ~15° sigma, measured truth = 0
+        }
+        let [r, p, y] = m.euler();
+        assert!(y.abs() < 10.0_f32.to_radians(), "residual yaw = {} deg", y.to_degrees());
+        // Roll/pitch must not be disturbed by the yaw update.
+        assert!(r.abs() < 2.0_f32.to_radians(), "roll = {} deg", r.to_degrees());
+        assert!(p.abs() < 2.0_f32.to_radians(), "pitch = {} deg", p.to_degrees());
+    }
+
+    #[test]
+    fn yaw_reference_wraps_innovation() {
+        let mut m = AttitudeMekf::new(MekfParams::default());
+        m.initialize_from_accel([0.0, 0.0, -1.0]);
+        m.q = euler_to_quat(0.0, 0.0, 179.0_f32.to_radians());
+        // Measure −179°: true error is +2°, not −358°.
+        for _ in 0..50 {
+            m.predict([0.0, 0.0, 0.0], 1.0 / 8000.0);
+            m.update_yaw_reference((-179.0_f32).to_radians(), 0.26);
+        }
+        let y = m.euler()[2].to_degrees();
+        assert!(y > 178.0 || y < -178.0, "yaw drifted the long way: {}", y);
     }
 
     #[test]
