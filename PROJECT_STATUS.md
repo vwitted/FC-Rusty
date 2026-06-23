@@ -407,4 +407,28 @@ The board has current-sensing hardware; a driver is needed.
 
 - **MSP over USB** — Betaflight configurator compatibility.
 - **MAVLink over UART** — Mission Planner / QGC.
-- **Parameter storage in flash** — persist tuning across reboots.
+- **Parameter storage in flash** — persist tuning across reboots. (A
+  general versioned flash store now exists — `src/persist/`, sub-project A
+  — currently holding only the mag calibration; extend its `Config` for
+  PID/tuning.)
+
+### Pilot telemetry (CRSF FC→TX)
+
+A general channel for surfacing FC state back to the EdgeTX transmitter
+(and its voice callouts) — far more useful than the onboard LED for field
+feedback (cal progress, arming-blocker reasons, battery, GPS, attitude,
+sensor health). Deferred as its own subsystem; notes for when we return:
+
+- We are currently **RX-only** on CRSF (UART5 RX, PB5). CRSF is half-duplex
+  single-wire, so telemetry FC→TX needs the **TX direction on that line**
+  plus a **telemetry-frame scheduler**. That's the bulk of the work.
+- Once present, **native CRSF telemetry frames** are decoded by EdgeTX
+  automatically (battery `0x08`, GPS `0x02`, attitude `0x1E`, **flight-mode
+  text `0x21`**, vario) and can be **voice-announced** via Special
+  Functions — no Lua. The flight-mode text frame is a low-effort way to
+  speak short status strings ("CAL 60", "CAL OK").
+- **MSP-over-CRSF** (`0x7A`/`0x7C`) carries arbitrary data but needs a
+  **Lua script on the TX** (like the Betaflight configurator) — more work
+  both ends.
+- Right-sized for general status/voice; the per-feature LED stays as the
+  no-radio fallback.
