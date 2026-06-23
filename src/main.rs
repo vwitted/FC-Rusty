@@ -93,6 +93,7 @@ use imu_filter::{ImuFilter, ImuFilterParams};
 use control::altitude::{AltitudeController, AltitudeGains};
 use control::arming::{ArmState, ArmingStateMachine};
 use control::arm_origin::ArmOriginSync;
+use control::mag_cal::{CalCommand, MagCalibrator, DECLINATION_DEG};
 use control::mixer::{AirmodeGate, ControlDemand, QUAD_X};
 use control::mpc::{AttitudeMpc, MPC_DT, MPC_PERIOD_US};
 use control::pid::{PidGains, PidLimits, RatePidController};
@@ -319,6 +320,15 @@ static POS_ESTIMATE: Signal<CriticalSectionRawMutex, PosEstimate> = Signal::new(
 /// any GPS-home anchoring is preserved.
 static ARM_LATCH: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
+/// Magnetometer-cal lifecycle: navigation task → mekf task.
+static CAL_CONTROL: Signal<CriticalSectionRawMutex, CalCommand> = Signal::new();
+/// Completed cal to persist (disarmed): mekf task → persist task.
+static CAL_SAVE: Signal<CriticalSectionRawMutex, persist::record::Config> = Signal::new();
+/// Trusted true heading from GPS COG (rad): navigation task → mekf task.
+static YAW_COG: Signal<CriticalSectionRawMutex, f32> = Signal::new();
+/// Boot-loaded calibration: main → mekf task.
+static STORED_CAL: Signal<CriticalSectionRawMutex, persist::record::Config> = Signal::new();
+
 
 
 // RC signals are defined in rc_task.rs:
@@ -400,8 +410,6 @@ async fn main(spawner: Spawner) {
         config.mag_hard_iron_ut[1],
         config.mag_hard_iron_ut[2],
     );
-    let _ = &config; // consumed by sub-project B; bound now to prove the boot read
-
     #[cfg(feature = "persist-selftest")]
     {
         // Two-boot protocol:
@@ -424,6 +432,11 @@ async fn main(spawner: Spawner) {
             }
         }
     }
+
+    // Hand the boot calibration to the MEKF and the flash handle to the
+    // persist task (which writes future cals while disarmed).
+    STORED_CAL.signal(config);
+    spawner.spawn(persist_task(cfg_flash)).unwrap();
 
     // ---- Status LED Heartbeat ----
     // DAKEFPVH743 has LED0 on PD10 (active low). We spawn a quick blink
@@ -591,6 +604,23 @@ async fn blink_task(mut led: embassy_stm32::gpio::Output<'static>) {
         embassy_time::Timer::after(embassy_time::Duration::from_millis(100)).await;
         led.set_high(); // Turn LED OFF
         embassy_time::Timer::after(embassy_time::Duration::from_millis(900)).await;
+    }
+}
+
+// ---- Persist Task ----
+// Owns the flash handle; writes a completed magnetometer calibration to
+// the persist store. Triggered only by cal completion, which is
+// disarmed-only — so the multi-second sector erase happens on the ground.
+#[embassy_executor::task]
+async fn persist_task(
+    mut flash: embassy_stm32::flash::Flash<'static, embassy_stm32::flash::Blocking>,
+) {
+    loop {
+        let cfg = CAL_SAVE.wait().await;
+        match persist::flash::write(&mut flash, &cfg) {
+            Ok(()) => defmt::info!("persist: CAL SAVED to flash"),
+            Err(e) => defmt::error!("persist: cal save failed {:?}", e),
+        }
     }
 }
 
