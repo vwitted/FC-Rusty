@@ -94,6 +94,7 @@ use imu_filter::{ImuFilter, ImuFilterParams};
 use control::altitude::{AltitudeController, AltitudeGains};
 use control::arming::{ArmState, ArmingStateMachine};
 use control::arm_origin::ArmOriginSync;
+use control::cal_led::{led_on, CalLed};
 use control::mag_cal::{CalCommand, MagCalibrator, DECLINATION_DEG};
 use control::mixer::{AirmodeGate, ControlDemand, QUAD_X};
 use control::mpc::{AttitudeMpc, MPC_DT, MPC_PERIOD_US};
@@ -329,6 +330,9 @@ static CAL_SAVE: Signal<CriticalSectionRawMutex, persist::record::Config> = Sign
 static YAW_COG: Signal<CriticalSectionRawMutex, f32> = Signal::new();
 /// Boot-loaded calibration: main → mekf task.
 static STORED_CAL: Signal<CriticalSectionRawMutex, persist::record::Config> = Signal::new();
+/// Cal-feedback LED phase: mekf task → blink task. Watch so the renderer
+/// can poll the current phase every tick without consuming it.
+static CAL_LED: Watch<CriticalSectionRawMutex, CalLed, 2> = Watch::new();
 
 
 
@@ -600,11 +604,26 @@ async fn main(spawner: Spawner) {
 
 #[embassy_executor::task]
 async fn blink_task(mut led: embassy_stm32::gpio::Output<'static>) {
+    let mut rx = CAL_LED.receiver().unwrap();
+    let mut phase = CalLed::Idle;
+    let mut phase_start = Instant::now();
+    let mut ticker = Ticker::every(Duration::from_millis(25));
     loop {
-        led.set_low(); // Turn LED ON
-        embassy_time::Timer::after(embassy_time::Duration::from_millis(100)).await;
-        led.set_high(); // Turn LED OFF
-        embassy_time::Timer::after(embassy_time::Duration::from_millis(900)).await;
+        if let Some(new_phase) = rx.try_get() {
+            // Reset the pattern clock only on a *variant* change, so
+            // Calibrating(p) progress updates don't restart the blink.
+            if core::mem::discriminant(&new_phase) != core::mem::discriminant(&phase) {
+                phase_start = Instant::now();
+            }
+            phase = new_phase;
+        }
+        let elapsed = phase_start.elapsed().as_millis() as u32;
+        if led_on(phase, elapsed) {
+            led.set_low(); // active-low: ON
+        } else {
+            led.set_high(); // OFF
+        }
+        ticker.next().await;
     }
 }
 
