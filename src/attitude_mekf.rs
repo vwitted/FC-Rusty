@@ -343,6 +343,35 @@ impl AttitudeMekf {
         self.mag_ref_set
     }
 
+    /// Anchor yaw to true north from a (raw) mag reading taken while
+    /// level-and-still. Computes the tilt-compensated magnetic heading,
+    /// adds declination, rebuilds the quaternion at that true heading, and
+    /// reseeds `mag_ref` self-consistently with the measured field. The
+    /// hard-iron offset is applied internally. Returns false on a
+    /// zero-magnitude reading.
+    pub fn anchor_heading(&mut self, mag_body: [f32; 3], declination_rad: f32) -> bool {
+        let m = Vector3::new(
+            mag_body[0] - self.hard_iron[0],
+            mag_body[1] - self.hard_iron[1],
+            mag_body[2] - self.hard_iron[2],
+        );
+        if m.norm() < 1e-6 {
+            return false;
+        }
+        let e = quat_to_euler(&self.q);
+        let (roll, pitch) = (e[0], e[1]);
+        // Rotate the corrected body field into a yaw-zeroed nav frame.
+        let q0 = euler_to_quat(roll, pitch, 0.0);
+        let m0 = r_bn_mul(&q0, &m);
+        // Magnetic heading (sign matches NED + quat_to_euler yaw).
+        let psi_mag = -libm::atan2f(m0[1], m0[0]);
+        let psi_true = psi_mag + declination_rad;
+        // Rebuild q at the true heading, reseed the reference.
+        self.q = euler_to_quat(roll, pitch, psi_true);
+        let v_nav = r_bn_mul(&self.q, &m);
+        self.set_mag_reference([v_nav[0], v_nav[1], v_nav[2]])
+    }
+
     /// Magnetometer-reference update. `mag_body` is the raw field in any
     /// consistent unit (µT, mgauss, …) — only the direction is used.
     /// Returns true if the update was applied (innovation gate passed
@@ -676,6 +705,26 @@ mod tests {
         }
         let y = m.euler()[2];
         assert!(y.abs() < 5.0_f32.to_radians(), "residual yaw = {} deg", y.to_degrees());
+    }
+
+    #[test]
+    fn anchor_sets_true_heading() {
+        // Nav field (NED): inclination 60°, declination 0 for the test.
+        let f_nav = Vector3::new(0.5_f32, 0.0, 0.866);
+        for &heading_deg in &[0.0_f32, 45.0, 90.0, 180.0, -120.0] {
+            let psi = heading_deg.to_radians();
+            // Body field a craft at this heading (level) would read.
+            let q_true = euler_to_quat(0.0, 0.0, psi);
+            let body = r_nb_mul(&q_true, &f_nav);
+
+            let mut m = AttitudeMekf::new(MekfParams::default());
+            m.initialize_from_accel([0.0, 0.0, -1.0]); // level, yaw 0
+            assert!(m.anchor_heading([body[0], body[1], body[2]], 0.0));
+
+            let y = m.euler()[2];
+            let err = (y - psi).sin().abs(); // wrap-safe small-angle check
+            assert!(err < 1.0e-2, "heading {} got {} deg", heading_deg, y.to_degrees());
+        }
     }
 
     #[test]
