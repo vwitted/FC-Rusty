@@ -232,8 +232,18 @@ material hardware or design change lands (see `CLAUDE.md`).
     forward flight). Declination is a compile-time `const DECLINATION_DEG`
     (default 0.3°). Soft-iron deliberately out of scope (hard-iron only).
   - Spec + plan in `docs/superpowers/{specs,plans}/2026-06-22-mag-cal-yaw-fix*`.
+  - **LED feedback** (`control/cal_led.rs`, 2026-06-23): the onboard LED
+    (PD10) signals the cal lifecycle for no-laptop field use —
+    accelerating blink (duty → near-solid) while calibrating, **blackout**
+    held at coverage-complete until you hold level, triple-burst on anchor,
+    and a held 5 s/5 s slow-flash on a degenerate fit until you revert
+    AUX4. Pure pattern fn host-tested; `mekf_task` publishes the phase, the
+    reworked `blink_task` renders it. Spec + plan in
+    `docs/superpowers/{specs,plans}/2026-06-23-cal-led-feedback*`. CRSF
+    FC→TX telemetry (the richer status channel) is banked under Post-Alpha
+    Directions.
   - **Not yet bench-verified:** spin-cal coverage/anchor, COG convergence
-    (and the forward-stick sign), uncalibrated regression.
+    (and the forward-stick sign), uncalibrated regression, LED patterns.
 
 - ~~**SPL06 barometer driver.**~~ Done. `drivers/baro.rs` now has a
   proper `Spl06` struct reading calibration from the correct register
