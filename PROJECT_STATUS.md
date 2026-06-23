@@ -216,13 +216,24 @@ material hardware or design change lands (see `CLAUDE.md`).
   USART3 (ESC telemetry pad) is free; needs wiring and a bidirectional
   DShot + telemetry-decode driver.
 
-- **Magnetometer calibration.** The onboard magnetometer is not yet used
-  (zeroed out in `ImuData`). Before it can correct yaw drift, a
-  calibration mode is needed: ~1 minute where the pilot can move the
-  drone through full rotation on all three axes, collecting min/max field
-  readings for sphere-fitting (hard-iron + soft-iron correction). The FC
-  needs to detect when sufficient coverage has been collected and store
-  the result. No implementation exists yet.
+- **Magnetometer calibration + true-north yaw.** (mag was already fused
+  in the MEKF since 2026-05-13; the `ImuData.mag` slot is log-only.)
+  Sub-project B, 2026-06-23, `[~]` bench-pending:
+  - `control/mag_cal.rs` — `MagCalibrator`: online least-squares **sphere
+    fit** for the hard-iron offset + **bin-coverage** completion (24 bins =
+    8 azimuth × 3 elevation, not a fixed timer). Host-tested.
+  - MEKF (`attitude_mekf.rs`): `set_hard_iron` (subtract offset before
+    fusion — the offset was leaking into yaw), `anchor_heading` (tilt-
+    compensated magnetic heading + declination → true-north reference),
+    `update_yaw_reference` (GPS course-over-ground as a scalar yaw update).
+  - Orchestration (`main.rs`): **AUX4** (channel index 7), disarmed-only
+    spin-cal; result persisted via sub-project A; COG fused only when
+    `groundspeed > 2 m/s` AND forward-stick (a quad's COG = heading only in
+    forward flight). Declination is a compile-time `const DECLINATION_DEG`
+    (default 0.3°). Soft-iron deliberately out of scope (hard-iron only).
+  - Spec + plan in `docs/superpowers/{specs,plans}/2026-06-22-mag-cal-yaw-fix*`.
+  - **Not yet bench-verified:** spin-cal coverage/anchor, COG convergence
+    (and the forward-stick sign), uncalibrated regression.
 
 - ~~**SPL06 barometer driver.**~~ Done. `drivers/baro.rs` now has a
   proper `Spl06` struct reading calibration from the correct register
