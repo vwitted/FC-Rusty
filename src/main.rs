@@ -68,6 +68,7 @@ mod control {
     pub mod altitude;
     pub mod arm_origin;
     pub mod arming;
+    pub mod cal_led;
     pub mod mag_cal;
     pub mod mixer;
     pub mod mpc;
