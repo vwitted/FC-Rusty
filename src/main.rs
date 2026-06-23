@@ -1946,6 +1946,12 @@ async fn navigation_task() {
     let mut arm_origin_sync = ArmOriginSync::new();
     let mut targets_captured = false;
 
+    // GPS-COG yaw gating: only trust course when genuinely flying forward.
+    const V_MIN_COG: f32 = 2.0; // m/s
+    const FWD_STICK_MIN: f32 = 0.3; // normalised pitch-forward
+    let mut cal_sw_prev = false;
+    let mut armed_prev_cal = false;
+
     // ---- Loop timing instrumentation ----
     // Tracks how long each control loop iteration takes.
     // If loop_time exceeds 5ms (200 Hz budget), we're overrunning.
@@ -2107,6 +2113,33 @@ async fn navigation_task() {
             flight_mode = FlightMode::AltHold;
         } else {
             flight_mode = FlightMode::Acro;
+        }
+
+        // ---- Magnetometer cal trigger (AUX4 = channel index 7) ----
+        // Disarmed-only. Rising edge starts; falling edge or a fresh arm
+        // aborts. The cal itself runs in the MEKF task.
+        let cal_sw = last_rc.channels[7] > 1500;
+        if cal_sw && !cal_sw_prev && !armed {
+            CAL_CONTROL.signal(CalCommand::Start);
+        } else if (!cal_sw && cal_sw_prev) || (cal_sw && armed && !armed_prev_cal) {
+            CAL_CONTROL.signal(CalCommand::Abort);
+        }
+        cal_sw_prev = cal_sw;
+        armed_prev_cal = armed;
+
+        // ---- GPS-COG yaw reference (gated) ----
+        // COG equals heading only in deliberate forward flight, so require
+        // armed + good 3D fix + above V_MIN + forward pitch stick. The
+        // MEKF fuses it as a generous-sigma scalar yaw update.
+        // NOTE: confirm the forward-stick sign on the bench (channels[1]
+        // forward should be positive here); flip if your TX is reversed.
+        let fwd_stick = RcChannels::to_normalised(last_rc.channels[1]);
+        if armed
+            && last_gps.has_3d_fix()
+            && last_gps.ground_speed_ms > V_MIN_COG
+            && fwd_stick > FWD_STICK_MIN
+        {
+            YAW_COG.signal(last_gps.course_deg.to_radians());
         }
 
         // ---- Mode entry: capture targets on transition ----
