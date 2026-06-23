@@ -116,6 +116,9 @@ pub struct AttitudeMekf {
     /// True once `mag_ref` has been seeded (either by the caller or
     /// auto-seeded from the first reading). `update_mag` requires this.
     mag_ref_set: bool,
+    /// Hard-iron offset subtracted from every raw mag reading (same unit
+    /// as the input, µT). Zero until calibrated.
+    hard_iron: Vector3<f32>,
     params: MekfParams,
 }
 
@@ -132,8 +135,16 @@ impl AttitudeMekf {
             p,
             mag_ref: Vector3::zeros(),
             mag_ref_set: false,
+            hard_iron: Vector3::zeros(),
             params,
         }
+    }
+
+    /// Set the hard-iron offset (sensor native frame, µT). Applied to all
+    /// subsequent mag reads (`update_mag`, `initialize_mag_from_first`,
+    /// `anchor_heading`).
+    pub fn set_hard_iron(&mut self, offset: [f32; 3]) {
+        self.hard_iron = Vector3::new(offset[0], offset[1], offset[2]);
     }
 
     /// Seed the quaternion from a stationary accel reading — level board
@@ -314,7 +325,11 @@ impl AttitudeMekf {
     /// (declination + GPS) and a follow-up `set_mag_reference`.
     pub fn initialize_mag_from_first(&mut self, mag_body: [f32; 3]) -> bool {
         // Rotate body → nav with current q, then unit-normalise.
-        let v_body = Vector3::new(mag_body[0], mag_body[1], mag_body[2]);
+        let v_body = Vector3::new(
+            mag_body[0] - self.hard_iron[0],
+            mag_body[1] - self.hard_iron[1],
+            mag_body[2] - self.hard_iron[2],
+        );
         if v_body.norm() < 1e-6 {
             return false;
         }
@@ -336,7 +351,11 @@ impl AttitudeMekf {
         if !self.mag_ref_set {
             return false;
         }
-        let m = Vector3::new(mag_body[0], mag_body[1], mag_body[2]);
+        let m = Vector3::new(
+            mag_body[0] - self.hard_iron[0],
+            mag_body[1] - self.hard_iron[1],
+            mag_body[2] - self.hard_iron[2],
+        );
         let norm = m.norm();
         if norm < 1e-6 {
             return false;
@@ -626,6 +645,37 @@ mod tests {
         // Filter should have walked yaw back toward 0.
         assert!(y.abs() < 5.0_f32.to_radians(), "residual yaw = {} deg",
                 y.to_degrees());
+    }
+
+    #[test]
+    fn hard_iron_offset_does_not_bias_yaw() {
+        let mut m = AttitudeMekf::new(MekfParams::default());
+        m.initialize_from_accel([0.0, 0.0, -1.0]);
+
+        let offset = [8.0_f32, -4.0, 3.0];
+        m.set_hard_iron(offset);
+
+        // True field at boot heading; raw reading = true + offset.
+        let true_body = [0.5_f32, 0.0, 0.866];
+        let raw = [
+            true_body[0] + offset[0],
+            true_body[1] + offset[1],
+            true_body[2] + offset[2],
+        ];
+        // Seed reference from the raw reading (cal subtracts internally).
+        assert!(m.initialize_mag_from_first(raw));
+
+        // Pretend the filter drifted +30° yaw; feed the same raw reading.
+        let yaw_drift = 30.0_f32.to_radians();
+        m.q = euler_to_quat(0.0, 0.0, yaw_drift);
+
+        for _ in 0..200 {
+            m.predict([0.0, 0.0, 0.0], 1.0 / 8000.0);
+            m.update_accel([0.0, 0.0, -1.0]);
+            m.update_mag(raw);
+        }
+        let y = m.euler()[2];
+        assert!(y.abs() < 5.0_f32.to_radians(), "residual yaw = {} deg", y.to_degrees());
     }
 
     #[test]
