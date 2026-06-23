@@ -913,6 +913,16 @@ async fn icm_monitor_task() {
 //   - ImuData.altitude_cm / pressure / mag are zero — baro will be
 //     fused in a separate task (Phase 4); mag is unused for now.
 
+// True when the board is near-stationary and ~1 g — a safe moment to
+// anchor yaw (attitude/roll/pitch are trustworthy and the field is steady).
+fn mag_anchor_ready(raw: &RawImu) -> bool {
+    let a = raw.accel_g();
+    let amag = libm::sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+    let g = raw.gyro_dps();
+    let gmag = libm::sqrtf(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
+    (amag - 1.0).abs() < 0.1 && gmag < 5.0
+}
+
 #[embassy_executor::task]
 async fn mekf_task() {
     use core::f32::consts::PI;
@@ -947,8 +957,46 @@ async fn mekf_task() {
     let mut mag_rejected: u32 = 0;
     let mut last_mag_ut: [f32; 3] = [0.0; 3];
 
+    const SIGMA_YAW_COG: f32 = 0.26; // ~15°, generous: COG ≈ heading only
+    let mut calibrator = MagCalibrator::new();
+    let mut cal_active = false;
+    let mut anchor_pending = false;
+    let mut last_cal_log = Instant::now();
+
     loop {
         let raw = RAW_IMU.wait().await;
+
+        // Apply a boot-loaded calibration once it arrives.
+        if let Some(cfg) = STORED_CAL.try_take() {
+            if cfg.mag_calibrated {
+                mekf.set_hard_iron(cfg.mag_hard_iron_ut);
+                anchor_pending = true;
+                defmt::info!(
+                    "MEKF loaded stored cal: offset=[{=f32},{=f32},{=f32}]",
+                    cfg.mag_hard_iron_ut[0], cfg.mag_hard_iron_ut[1], cfg.mag_hard_iron_ut[2],
+                );
+            }
+        }
+        // Cal start/abort from the navigation task.
+        if let Some(cmd) = CAL_CONTROL.try_take() {
+            match cmd {
+                CalCommand::Start => {
+                    calibrator.reset();
+                    cal_active = true;
+                    defmt::info!("MEKF cal: started — rotate the craft through all axes");
+                }
+                CalCommand::Abort => {
+                    if cal_active {
+                        defmt::info!("MEKF cal: aborted");
+                    }
+                    cal_active = false;
+                }
+            }
+        }
+        // Fuse a fresh trusted COG heading, if any.
+        if let Some(yaw_cog) = YAW_COG.try_take() {
+            mekf.update_yaw_reference(yaw_cog, SIGMA_YAW_COG);
+        }
 
         let now = Instant::now();
         // Clamp dt to sane bounds — a missed sample stretches dt to
@@ -971,33 +1019,65 @@ async fn mekf_task() {
             }
         }
 
-        // Magnetometer update: try_take is non-blocking and runs on
+        // Magnetometer handling: try_take is non-blocking and runs on
         // whichever IMU sample happens to coincide with a fresh mag
-        // reading. The mag task signals at ~100 Hz; at 8 kHz IMU rate
-        // we hit a fresh sample roughly once every 80 iterations,
-        // matching the accel-update cadence by coincidence rather than
-        // by design — they're independent paths.
-        //
-        // The very first mag sample seeds the reference vector using
-        // the current attitude (already accel-seeded plus calibration),
-        // so subsequent updates measure deviation from boot heading.
-        // Absolute (true-north) heading needs a future declination +
-        // GPS heading injection via `set_mag_reference`.
+        // reading (~100 Hz mag vs 8 kHz IMU). Three modes:
+        //   - cal_active: collect raw samples for the sphere fit; do NOT
+        //     fuse mag (the craft is being rotated through all axes).
+        //   - uninitialised: seed a relative-boot-heading reference (the
+        //     pre-calibration fallback, unchanged from before).
+        //   - normal: anchor to true north once (when level-and-still and
+        //     a cal is pending), then fuse mag updates as usual.
         if let Some(mag) = MAG_DATA.try_take() {
             let ut = mag.ut();
             last_mag_ut = ut;
-            if !mekf.mag_initialized() {
+            if cal_active {
+                calibrator.feed(ut);
+                if last_cal_log.elapsed().as_millis() >= 500 {
+                    defmt::info!("MEKF cal: coverage {}%", calibrator.progress());
+                    last_cal_log = Instant::now();
+                }
+                if calibrator.is_complete() {
+                    match calibrator.result() {
+                        Some(off) => {
+                            mekf.set_hard_iron(off);
+                            cal_active = false;
+                            anchor_pending = true;
+                            let cfg = persist::record::Config {
+                                mag_hard_iron_ut: off,
+                                declination_rad: DECLINATION_DEG.to_radians(),
+                                mag_calibrated: true,
+                            };
+                            CAL_SAVE.signal(cfg);
+                            defmt::info!(
+                                "MEKF cal: COMPLETE offset=[{=f32},{=f32},{=f32}] — hold level to anchor",
+                                off[0], off[1], off[2],
+                            );
+                        }
+                        None => {
+                            cal_active = false;
+                            defmt::error!("MEKF cal: degenerate fit — aborted, keeping prior cal");
+                        }
+                    }
+                }
+            } else if !mekf.mag_initialized() {
                 if mekf.initialize_mag_from_first(ut) {
+                    defmt::info!("MEKF mag reference seeded (relative boot heading)");
+                }
+            } else {
+                if anchor_pending && mag_anchor_ready(&raw) {
+                    mekf.anchor_heading(ut, DECLINATION_DEG.to_radians());
+                    anchor_pending = false;
                     defmt::info!(
-                        "MEKF mag reference seeded: ut=[{=f32},{=f32},{=f32}] |M|={=f32}uT",
-                        ut[0], ut[1], ut[2],
-                        libm::sqrtf(ut[0]*ut[0] + ut[1]*ut[1] + ut[2]*ut[2]),
+                        "MEKF anchored to true north: yaw={=f32}deg",
+                        mekf.euler()[2] * RAD2DEG,
                     );
                 }
-            } else if mekf.update_mag(ut) {
-                mag_applied = mag_applied.wrapping_add(1);
-            } else {
-                mag_rejected = mag_rejected.wrapping_add(1);
+                if mekf.update_mag(ut) {
+                    mag_applied = mag_applied.wrapping_add(1);
+                } else {
+                    mag_rejected = mag_rejected.wrapping_add(1);
+                }
             }
         }
 
