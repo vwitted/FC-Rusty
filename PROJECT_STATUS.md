@@ -162,6 +162,21 @@ material hardware or design change lands (see `CLAUDE.md`).
       `docs/superpowers/{specs,plans}/2026-06-21-dshot-motor-test*`. This is
       the clean path to test motor spin-up, superseding the throttle hacks
       noted below.
+      **Bench session 2026-07-25 — motors spin at commanded throttle.**
+      Three fixes out of that session: (1) `run()` now streams zero-throttle
+      MotorStop frames for 3 s after the countdown so ESCs arm (they lock
+      out on a nonzero first frame — this was why nothing spun); (2) unset
+      `Mx_PCT` now defaults to 5% instead of 0% so a bare motor-test flash
+      actually spins motors (explicit `Mx_PCT=0` still stops; **props-off is
+      now load-bearing on every motor-test flash**); (3) recognised env vars
+      with unparseable values (`BIDIR=false`, `M1_PCT=ten`) are a *compile
+      error* via `const` asserts — unset still defaults, so stray env junk
+      stays harmless. Misspelt var *names* remain undetectable; the startup
+      banner printing the resolved config is the safety net for those.
+      `scripts/flash-motor-test.sh` added (DFU flash of the motor-test
+      build; env vars must be passed to the script since it rebuilds).
+      Open bench observation: rare intermittent single-motor spin while
+      receiving MotorStop — possible signal-integrity/decode issue, parked.
 - [~] **Persist flash config store** (`src/persist/`, 2026-06-22):
       first non-volatile storage in the repo — a versioned, CRC-checked
       32-byte record in the last 128 KB flash sector (bank 2, `0x081E0000`,

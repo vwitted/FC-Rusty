@@ -18,6 +18,7 @@
 - **`src/main.rs`** — extract `board_config()`; `#[cfg(not(feature = "motor-test"))]` on the existing `main`; add a small `#[cfg(feature = "motor-test")]` `main`; declare the module.
 
 Commands used throughout:
+
 - Host tests: `cargo test --lib --no-default-features --target x86_64-unknown-linux-gnu motor_test`
 - Flight firmware (unchanged): `cargo build --release`
 - Motor-test firmware: `cargo build --release --features motor-test` (optionally `M1_PCT=8 LOOP_KHZ=4 BIDIR=1 …`)
@@ -27,6 +28,7 @@ Commands used throughout:
 ### Task 1: Config layer (`parse_config`) — pure, host-tested
 
 **Files:**
+
 - Modify: `Cargo.toml` (`[features]`)
 - Modify: `src/lib.rs` (module declaration)
 - Create: `src/motor_test.rs`
@@ -200,6 +202,7 @@ git commit -m "motor-test: build-time config parser (host-tested)"
 ### Task 2: Firmware run loop
 
 **Files:**
+
 - Modify: `src/motor_test.rs` (append `run()`)
 
 No host test — `run()` drives hardware and is firmware-only. Verification is a successful feature build; behaviour is bench-checked in Task 4.
@@ -286,6 +289,7 @@ git commit -m "motor-test: firmware run loop (countdown + direct DShot drive)"
 ### Task 3: Entry-point wiring
 
 **Files:**
+
 - Modify: `src/main.rs` (extract `board_config`; cfg the existing `main`; add the motor-test `main`; declare the module)
 
 - [ ] **Step 1: Extract the clock config into `board_config()`**
@@ -400,6 +404,7 @@ git commit -m "motor-test: feature-gated entry point (shared board_config)"
 ### Task 4: Bench verification + docs
 
 **Files:**
+
 - Modify: `PROJECT_STATUS.md` (note the new bench tool, per the journal policy)
 
 - [ ] **Step 1: Bench smoke test (props OFF)**
@@ -412,6 +417,7 @@ M1_PCT=6 LOOP_KHZ=8 BIDIR=1 cargo build --release --features motor-test
 ```
 
 Expected on the defmt console (USART6 / PC6):
+
 - The `MOTOR TEST — REMOVE PROPS …` banner with the resolved values.
 - A 5 s countdown (LED blinking).
 - `motor-test: driving motors`, then ~10 Hz `motor-test RX:` lines.
