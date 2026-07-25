@@ -177,6 +177,18 @@ material hardware or design change lands (see `CLAUDE.md`).
       build; env vars must be passed to the script since it rebuilds).
       Open bench observation: rare intermittent single-motor spin while
       receiving MotorStop — possible signal-integrity/decode issue, parked.
+- [x] **SPL06 baro fixed on bench** (2026-07-25): two stacked bugs.
+      (1) The calibration block was read from 0x18 on a wrong "SPL06
+      differs from DPS310" comment; it is 0x10..=0x21, same as DPS310
+      (Betaflight/iNav agree) — wrong registers parsed as coefficients
+      gave P≈647 kPa / T≈-168 °C. Now reads 0x10; bench shows sane cal,
+      P≈99.6 kPa at 1 atm. (2) Debug trap: with `DEFMT_LOG=trace`,
+      embassy's per-byte I2C trace logging inflates the 18-byte cal
+      read past the deliberate 5 ms bus timeout (`BARO_TIMEOUT_MS`) —
+      init fails every attempt at ~3 bytes. Trace-level logging and the
+      baro bus timeout are incompatible; use `info` for baro work.
+      `Spl06Error::I2c` now carries the underlying embassy error kind
+      (Timeout vs Nack) so this is diagnosable from the log next time.
 - [~] **Persist flash config store** (`src/persist/`, 2026-06-22):
       first non-volatile storage in the repo — a versioned, CRC-checked
       32-byte record in the last 128 KB flash sector (bank 2, `0x081E0000`,

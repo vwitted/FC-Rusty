@@ -2,8 +2,8 @@
 //
 // The DAKEFPV H743 has an SPL06 (Goertek) at I2C2.  The DPS310 (Infineon)
 // code is retained as reference — its compensation formula and register
-// map are nearly identical to the SPL06, differing only in the calibration
-// coefficient start address (0x10 vs 0x18).
+// map are nearly identical to the SPL06, including the calibration
+// coefficient block at 0x10..=0x21.
 //
 // This file holds:
 //   - `detect()`:  WHO_AM_I probe at both I2C addresses.
@@ -140,26 +140,32 @@ pub fn pressure_to_altitude_m(p_pa: f32, p_ref_pa: f32) -> f32 {
 
 // ---- SPL06 ----
 //
-// Register map matches the DPS310 almost exactly. The one material
-// difference: calibration coefficients start at 0x18 (vs 0x10 on the
-// DPS310). Compensation formula, OSR/rate encoding, PRS_CFG, TMP_CFG,
-// MEAS_CFG, CFG_REG, RESET, COEF_SRCE registers are all identical.
+// Register map matches the DPS310 almost exactly: calibration
+// coefficients at 0x10..=0x21 (18 bytes, same layout — Betaflight and
+// iNav both read SPL06 cal from 0x10), compensation formula, OSR/rate
+// encoding, PRS_CFG, TMP_CFG, MEAS_CFG, CFG_REG, RESET, COEF_SRCE all
+// identical. (An earlier comment here claimed the SPL06 block started
+// at 0x18 — that was wrong, and reading from 0x18 produced garbage
+// P/T on the bench, 2026-07-25.)
 //
 // Configured at init: 128 Hz pressure, 1× OSR (scale factor 524288).
 // Temperature: 1 Hz, 1× OSR. No P_SHIFT/T_SHIFT needed at 1× OSR.
 
-const SPL06_REG_COEF_START: u8 = 0x18; // 18 bytes: 0x18..=0x29
+const SPL06_REG_COEF_START: u8 = 0x10; // 18 bytes: 0x10..=0x21
 
 #[derive(Debug, defmt::Format)]
 pub enum Spl06Error {
-    I2c,
+    /// Carries the underlying bus error so the log distinguishes a
+    /// Timeout (e.g. transaction budget blown) from a Nack (device
+    /// absent) — these have very different fixes.
+    I2c(I2cError),
     CoefTimeout,
     SensorTimeout,
     WhoAmIMismatch(u8),
 }
 
 impl From<I2cError> for Spl06Error {
-    fn from(_: I2cError) -> Self { Spl06Error::I2c }
+    fn from(e: I2cError) -> Self { Spl06Error::I2c(e) }
 }
 
 pub struct Spl06 {
@@ -209,7 +215,7 @@ impl Spl06 {
         i2c.blocking_write_read(addr, &[DPS310_REG_COEF_SRCE], &mut src)?;
         let tmp_source_bit = src[0] & 0x80;
 
-        // Read 18-byte calibration block from SPL06-specific start address.
+        // Read the 18-byte calibration block (0x10..=0x21, same as DPS310).
         let mut coef = [0u8; 18];
         i2c.blocking_write_read(addr, &[SPL06_REG_COEF_START], &mut coef)?;
         let cal = Dps310Cal::parse(&coef);
