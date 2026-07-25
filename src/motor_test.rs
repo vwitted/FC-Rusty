@@ -21,6 +21,9 @@ pub struct MotorTestConfig {
 /// Hard safety ceiling on any motor's throttle. Raising it requires a
 /// deliberate source edit + reflash — intentional.
 const MAX_PCT: u8 = 25;
+/// Per-motor throttle when the env var is unset: a gentle spin, so a bare
+/// motor-test flash actually tests motors. Explicit `Mx_PCT=0` still stops.
+const DEFAULT_PCT: u8 = 5;
 const DEFAULT_BIDIR: bool = true;
 const DEFAULT_LOOP_KHZ: u8 = 8;
 const MIN_LOOP_KHZ: u8 = 2;
@@ -36,7 +39,7 @@ fn parse_config(
     let motor_pct = core::array::from_fn(|i| {
         motor[i]
             .and_then(|s| s.trim().parse::<u8>().ok())
-            .unwrap_or(0)
+            .unwrap_or(DEFAULT_PCT)
             .min(MAX_PCT)
     });
     let bidir = match bidir.map(|s| s.trim()) {
@@ -54,6 +57,63 @@ fn parse_config(
         loop_khz,
     }
 }
+
+/// Byte range [i, j) of `b` after trimming ASCII whitespace; i == j if blank.
+const fn trimmed(b: &[u8]) -> (usize, usize) {
+    let (mut i, mut j) = (0, b.len());
+    while i < j && (b[i] == b' ' || b[i] == b'\t' || b[i] == b'\n' || b[i] == b'\r') {
+        i += 1;
+    }
+    while j > i && (b[j - 1] == b' ' || b[j - 1] == b'\t' || b[j - 1] == b'\n' || b[j - 1] == b'\r') {
+        j -= 1;
+    }
+    (i, j)
+}
+
+/// Build-time env validation: unset or blank is fine (defaults apply), but a
+/// set value must be a decimal u8. Rejecting garbage at compile time stops a
+/// typo'd value from silently building default-configured firmware.
+const fn env_u8_ok(v: Option<&str>) -> bool {
+    let Some(s) = v else { return true };
+    let b = s.as_bytes();
+    let (mut i, j) = trimmed(b);
+    if i == j {
+        return true; // set-but-empty ≈ unset
+    }
+    let mut val: u32 = 0;
+    while i < j {
+        if b[i] < b'0' || b[i] > b'9' {
+            return false;
+        }
+        val = val * 10 + (b[i] - b'0') as u32;
+        if val > u8::MAX as u32 {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Build-time env validation for BIDIR: unset, blank, "0" or "1" only.
+const fn env_bidir_ok(v: Option<&str>) -> bool {
+    let Some(s) = v else { return true };
+    let b = s.as_bytes();
+    let (i, j) = trimmed(b);
+    i == j || (j - i == 1 && (b[i] == b'0' || b[i] == b'1'))
+}
+
+// Fail the motor-test build outright on unparseable values for the env vars
+// it knows about. Unset vars still default; misspelt *names* remain
+// undetectable — the startup banner logging the resolved config covers those.
+#[cfg(feature = "motor-test")]
+const _: () = {
+    assert!(env_u8_ok(option_env!("M1_PCT")), "M1_PCT must be an integer 0-255");
+    assert!(env_u8_ok(option_env!("M2_PCT")), "M2_PCT must be an integer 0-255");
+    assert!(env_u8_ok(option_env!("M3_PCT")), "M3_PCT must be an integer 0-255");
+    assert!(env_u8_ok(option_env!("M4_PCT")), "M4_PCT must be an integer 0-255");
+    assert!(env_bidir_ok(option_env!("BIDIR")), "BIDIR must be 0 or 1");
+    assert!(env_u8_ok(option_env!("LOOP_KHZ")), "LOOP_KHZ must be an integer (kHz)");
+};
 
 /// Read the build-time env values and resolve them into a clamped config.
 #[allow(dead_code)] // used by the firmware `run()` in the binary build only
@@ -124,6 +184,16 @@ pub async fn run(p: embassy_stm32::Peripherals) -> ! {
     let log_every: u32 = cfg.loop_khz as u32 * 100; // ~10 Hz
     let mut n: u32 = 0;
 
+    // ESCs arm only after a sustained stream of valid zero-throttle frames;
+    // a nonzero first frame locks them out. Stream MotorStop for 3s (expect
+    // the ESC arm beeps during this window) before any real throttle.
+    let stop: [DshotFrame; 4] = [DshotFrame::motor_stop(cfg.bidir); 4];
+    defmt::info!("motor-test: arming ESCs (zero throttle, 3s)");
+    for _ in 0..(cfg.loop_khz as u32 * 3000) {
+        dshot.send_throttles_and_receive(stop).await;
+        ticker.next().await;
+    }
+
     defmt::info!("motor-test: driving motors");
     loop {
         let telem = dshot.send_throttles_and_receive(frames).await;
@@ -148,15 +218,21 @@ mod tests {
     #[test]
     fn defaults_when_all_unset() {
         let c = parse_config([None; 4], None, None);
-        assert_eq!(c.motor_pct, [0, 0, 0, 0]);
+        assert_eq!(c.motor_pct, [5, 5, 5, 5]); // bare motor test spins gently
         assert!(c.bidir);
         assert_eq!(c.loop_khz, 8);
     }
 
     #[test]
+    fn explicit_zero_still_stops_motor() {
+        let c = parse_config([Some("0"), None, None, None], None, None);
+        assert_eq!(c.motor_pct[0], 0);
+    }
+
+    #[test]
     fn parses_each_motor_independently() {
         let c = parse_config([Some("3"), None, Some("7"), None], None, None);
-        assert_eq!(c.motor_pct, [3, 0, 7, 0]);
+        assert_eq!(c.motor_pct, [3, 5, 7, 5]);
     }
 
     #[test]
@@ -170,6 +246,36 @@ mod tests {
         assert!(!parse_config([None; 4], Some("0"), None).bidir);
         assert!(parse_config([None; 4], Some("1"), None).bidir);
         assert!(parse_config([None; 4], Some("yes"), None).bidir); // garbage → default true
+    }
+
+    #[test]
+    fn env_u8_ok_accepts_unset_blank_and_integers() {
+        assert!(env_u8_ok(None));
+        assert!(env_u8_ok(Some(""))); // set-but-empty ≈ unset
+        assert!(env_u8_ok(Some("  ")));
+        assert!(env_u8_ok(Some("0")));
+        assert!(env_u8_ok(Some(" 10 ")));
+        assert!(env_u8_ok(Some("255")));
+    }
+
+    #[test]
+    fn env_u8_ok_rejects_garbage() {
+        assert!(!env_u8_ok(Some("ten")));
+        assert!(!env_u8_ok(Some("10%")));
+        assert!(!env_u8_ok(Some("-1")));
+        assert!(!env_u8_ok(Some("256")));
+        assert!(!env_u8_ok(Some("1.5")));
+    }
+
+    #[test]
+    fn env_bidir_ok_accepts_only_unset_blank_zero_one() {
+        assert!(env_bidir_ok(None));
+        assert!(env_bidir_ok(Some("")));
+        assert!(env_bidir_ok(Some("0")));
+        assert!(env_bidir_ok(Some(" 1 ")));
+        assert!(!env_bidir_ok(Some("false")));
+        assert!(!env_bidir_ok(Some("true")));
+        assert!(!env_bidir_ok(Some("2")));
     }
 
     #[test]
