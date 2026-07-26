@@ -46,7 +46,16 @@ if ! lsusb | grep -q "0483:df11"; then
   exit 1
 fi
 
+STAMP="$(cat target/build-stamp.txt 2>/dev/null || echo unknown)"
+SHA="$(sha256sum "${BIN}" 2>/dev/null | cut -c1-16 || shasum -a 256 "${BIN}" | cut -c1-16)"
+
 echo "==> dfu-util flashing ${BIN} (size: $(stat -c %s "${BIN}" 2>/dev/null || stat -f %z "${BIN}") bytes)"
 dfu-util -a 0 -s 0x08000000:leave -D "${BIN}"
 
 echo "==> flashed; MCU should have rebooted into the new firmware"
+echo
+echo "    build stamp : ${STAMP}"
+echo "    binary sha  : ${SHA}"
+echo
+echo "    The firmware logs 'DShot build: [<stamp>]' at init. If that does not"
+echo "    match the stamp above, the board is running older firmware."
