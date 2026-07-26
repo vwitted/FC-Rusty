@@ -84,7 +84,59 @@ const MOTOR_BIT_1: u32 = 14;
 /// Bidir response window deadtime in microseconds. BF computes this as
 /// `DSHOT_TELEMETRY_DEADTIME_US (=35) + 1e6 * (16*20)/12e6 ≈ 62 µs`
 /// for DShot600 — guard + 16-bit response duration.
-const DEADTIME_US: u64 = 80;
+///
+/// Overridable at build time via `DEADTIME_US=<n>` so the window can be
+/// widened on the bench. Two things depend on it, which makes it a useful
+/// probe: how long we listen for the ESC's reply, and *when* the switch back
+/// to output-compare happens. If a scope artefact moves when this moves, it
+/// belongs to our direction switch; if it stays put, it belongs to the ESC.
+const DEADTIME_US: u64 = parse_deadtime_us();
+
+const DEFAULT_DEADTIME_US: u64 = 80;
+
+/// Parse `DEADTIME_US` at compile time. Unset or blank keeps the default;
+/// anything unparseable fails the build rather than silently reverting (the
+/// same convention `motor_test.rs` uses for its env vars).
+const fn parse_deadtime_us() -> u64 {
+    let Some(s) = option_env!("DEADTIME_US") else {
+        return DEFAULT_DEADTIME_US;
+    };
+    let b = s.as_bytes();
+    let (mut i, j) = {
+        let (mut lo, mut hi) = (0usize, b.len());
+        while lo < hi && (b[lo] == b' ' || b[lo] == b'\t') {
+            lo += 1;
+        }
+        while hi > lo && (b[hi - 1] == b' ' || b[hi - 1] == b'\t') {
+            hi -= 1;
+        }
+        (lo, hi)
+    };
+    if i == j {
+        return DEFAULT_DEADTIME_US;
+    }
+    let mut v: u64 = 0;
+    while i < j {
+        assert!(
+            b[i] >= b'0' && b[i] <= b'9',
+            "DEADTIME_US must be a positive integer (microseconds)"
+        );
+        v = v * 10 + (b[i] - b'0') as u64;
+        i += 1;
+    }
+    assert!(v > 0, "DEADTIME_US must be greater than zero");
+    v
+}
+
+/// Frame number on which the one-shot bidir idle probe runs. Sits inside
+/// motor_test's 3 s MotorStop arming stream (loop_khz × 3000 frames), so the
+/// motors are stopped when it perturbs a frame.
+const PROBE_FRAME: u32 = 100;
+
+/// Frame on which the RX-path self-test drives its own edges on M1. Also
+/// inside the MotorStop arming stream, and far enough from `PROBE_FRAME` that
+/// the two diagnostics can't interact.
+const RX_SELFTEST_FRAME: u32 = 200;
 
 /// BF: in `decodeTelemetryPacket` the per-bit divisor is 16 ticks. At
 /// our 12 MHz cell clock with ARR=0xFFFF_FFFF during RX, 16 ticks =
@@ -141,6 +193,17 @@ pub struct DshotQuad<'d> {
     /// zero cells hold the line high, and each frame is followed by
     /// the input-capture telemetry phase.
     bidir: bool,
+
+    /// True while the four channels are left configured for input capture.
+    ///
+    /// BF switches back to output from `pwmTelemetryDecode`, which runs at the
+    /// start of the next motor update — so the channel stays an input for the
+    /// whole idle gap and the direction switch happens adjacent to the frame.
+    /// This port used to switch back the moment the response window closed,
+    /// leaving ~200 µs of idle driven push-pull and putting the switch's
+    /// disturbance alone in the middle of the gap, where an edge-triggered ESC
+    /// receiver can read it as a frame start.
+    channels_in_input: bool,
 
     frame_count: u32,
 }
@@ -244,6 +307,11 @@ impl<'d> DshotQuad<'d> {
         rx_buf_m4.fill(0);
 
         defmt::info!(
+            "DShot build: [{=str}] deadtime={=u64}us",
+            dshot_diag::BUILD_TAG,
+            DEADTIME_US,
+        );
+        defmt::info!(
             "DShot init (BF-port, TIM2): bidir={=bool} PSC={=u16} ARR={=u32} bit0={=u32} bit1={=u32}",
             bidir,
             pac::TIM2.psc().read(),
@@ -267,6 +335,7 @@ impl<'d> DshotQuad<'d> {
             rx_buf_m3,
             rx_buf_m4,
             bidir,
+            channels_in_input: false,
             frame_count: 0,
         }
     }
@@ -300,6 +369,25 @@ impl<'d> DshotQuad<'d> {
         &mut self,
         frames: [DshotFrame; 4],
     ) -> [TelemetryResult; 4] {
+        // ---- Return the channels to output, immediately before transmitting
+        //      (BF does this from pwmTelemetryDecode at update start, not when
+        //      the response window closes) ----
+        if self.channels_in_input {
+            let probe = self.frame_count == PROBE_FRAME + 1;
+            let idr_during_rx = if probe {
+                dshot_diag::read_pa_low()
+            } else {
+                0
+            };
+
+            switch_channels_to_output_compare();
+            self.channels_in_input = false;
+
+            if probe {
+                dshot_diag::probe_output_idle(idr_during_rx);
+            }
+        }
+
         // ---- TX phase (same as non-bidir, modulo polarity which is
         //                set once at init via CCER.CCxP) ----
         fill_buffer(self.buf_m1, &frames[0]);
@@ -487,6 +575,12 @@ impl<'d> DshotQuad<'d> {
                 w.set_ccde(3, true);
             });
 
+            // RX-path self-test: drive our own edges on M1 so the capture
+            // chain can be validated without the ESC participating.
+            if self.frame_count == RX_SELFTEST_FRAME {
+                dshot_diag::rx_loopback_pulse_pa0();
+            }
+
             // Race the DMA transfers against a deadtime timer. We
             // expect partial fills (BLHeli sends ≤ 22 edges; the rest
             // never arrive), so any-completes-first is the wrong
@@ -525,14 +619,23 @@ impl<'d> DshotQuad<'d> {
         let edges_m3 = (RX_BUF_LEN as u32).saturating_sub(n3);
         let edges_m4 = (RX_BUF_LEN as u32).saturating_sub(n4);
 
+        if self.frame_count == RX_SELFTEST_FRAME {
+            dshot_diag::log_rx_loopback_result(
+                [edges_m1, edges_m2, edges_m3, edges_m4],
+                &self.rx_buf_m1[..],
+            );
+        }
+
         let res_m1 = decode_telemetry(self.rx_buf_m1, edges_m1 as usize);
         let res_m2 = decode_telemetry(self.rx_buf_m2, edges_m2 as usize);
         let res_m3 = decode_telemetry(self.rx_buf_m3, edges_m3 as usize);
         let res_m4 = decode_telemetry(self.rx_buf_m4, edges_m4 as usize);
 
-        // ---- Switch channels back to output-compare for next TX ----
-        switch_channels_to_output_compare();
-        pac::TIM2.arr().write_value(MOTOR_BITLENGTH - 1);
+        // ---- Leave the channels as inputs ----
+        // The switch back to output-compare now happens at the top of the
+        // next send, immediately before transmitting. The line stays
+        // released (input + pull-up) for the whole idle gap, matching BF.
+        self.channels_in_input = true;
 
         self.frame_count = self.frame_count.wrapping_add(1);
         if self.frame_count.is_multiple_of(800) {
@@ -563,19 +666,23 @@ fn fill_buffer(buf: &mut [u32; STEPS_PER_FRAME], frame: &DshotFrame) {
 ///
 /// DAKEFPVH743: all four pins are PA0..PA3, so we touch GPIOA.
 fn gpio_glitch_guard_to_output() {
-    pac::GPIOA.moder().modify(|w| {
-        w.set_moder(0, pac::gpio::vals::Moder::OUTPUT);
-        w.set_moder(1, pac::gpio::vals::Moder::OUTPUT);
-        w.set_moder(2, pac::gpio::vals::Moder::OUTPUT);
-        w.set_moder(3, pac::gpio::vals::Moder::OUTPUT);
-    });
-    // Hold the pins HIGH (idle for bidir) so the line state doesn't
-    // change while CCMR is being rewritten.
+    // ODR first: the pad takes ODR's value the instant MODER says OUTPUT,
+    // so setting the level afterwards means the pad briefly shows whatever
+    // ODR happened to hold. Reset value is 0, i.e. LOW — the opposite of
+    // the bidir idle we are trying to protect.
     pac::GPIOA.bsrr().write(|w| {
         w.set_bs(0, true);
         w.set_bs(1, true);
         w.set_bs(2, true);
         w.set_bs(3, true);
+    });
+    // Now hold the pins HIGH (idle for bidir) so the line state doesn't
+    // change while CCMR is being rewritten.
+    pac::GPIOA.moder().modify(|w| {
+        w.set_moder(0, pac::gpio::vals::Moder::OUTPUT);
+        w.set_moder(1, pac::gpio::vals::Moder::OUTPUT);
+        w.set_moder(2, pac::gpio::vals::Moder::OUTPUT);
+        w.set_moder(3, pac::gpio::vals::Moder::OUTPUT);
     });
 }
 
@@ -594,7 +701,13 @@ fn gpio_glitch_guard_to_af() {
 /// Order matters: disable CCxE → glitch-guard pins to output → rewrite
 /// CCMR → restore AF → re-enable CCxE.
 fn switch_channels_to_input_capture() {
-    // 1. Disable channel enables so CCMR modification is atomic.
+    // 1. Guard FIRST — before any timer register is touched. Disabling CCxE
+    //    while the pad is still on AF exposes the pad to the output stage at
+    //    the exact moment its enable changes, which is the transition the
+    //    guard exists to hide.
+    gpio_glitch_guard_to_output();
+
+    // 2. Disable channel enables so CCMR modification is atomic.
     pac::TIM2.ccer().modify(|w| {
         w.set_cce(0, false);
         w.set_cce(1, false);
@@ -602,23 +715,23 @@ fn switch_channels_to_input_capture() {
         w.set_cce(3, false);
     });
 
-    // 2. H7-specific GPIO glitch guard: hold pins HIGH via direct
-    //    GPIO output while CCMR is being rewritten.
-    gpio_glitch_guard_to_output();
-
-    // 3. CCMR for input capture (CCxS=01 = normal TI mapping, ICxF=2).
-    pac::TIM2.ccmr_input(0).modify(|w| {
-        w.set_ccs(0, pac::timer::vals::CcmrInputCcs::TI4);
-        w.set_icf(0, pac::timer::vals::FilterValue::FCK_INT_N2);
-        w.set_ccs(1, pac::timer::vals::CcmrInputCcs::TI4);
-        w.set_icf(1, pac::timer::vals::FilterValue::FCK_INT_N2);
-    });
-    pac::TIM2.ccmr_input(1).modify(|w| {
-        w.set_ccs(0, pac::timer::vals::CcmrInputCcs::TI4);
-        w.set_icf(0, pac::timer::vals::FilterValue::FCK_INT_N2);
-        w.set_ccs(1, pac::timer::vals::CcmrInputCcs::TI4);
-        w.set_icf(1, pac::timer::vals::FilterValue::FCK_INT_N2);
-    });
+    // 3. CCMR for input capture (CCxS=01 = normal TI mapping, ICxF=2,
+    //    ICxPSC=0 = capture every edge).
+    //
+    //    ICxPSC must be written explicitly. Its bits alias onto OCxPE and
+    //    OCxFE from the output configuration, which are 1 and 0, so a
+    //    read-modify-write that skips them leaves ICxPSC = 0b10 —
+    //    "capture once every 4 events", i.e. three quarters of the ESC's
+    //    edges silently dropped. BF sets LL_TIM_ICPSC_DIV1 here.
+    for reg in [0usize, 1] {
+        pac::TIM2.ccmr_input(reg).modify(|w| {
+            for ch in [0usize, 1] {
+                w.set_ccs(ch, pac::timer::vals::CcmrInputCcs::TI4);
+                w.set_icf(ch, pac::timer::vals::FilterValue::FCK_INT_N2);
+                w.set_icpsc(ch, 0);
+            }
+        });
+    }
 
     // 4. CCER.CCxNP = 1 (with CCxP=1 from bidir TX → both edges).
     pac::TIM2.ccer().modify(|w| {
@@ -628,29 +741,47 @@ fn switch_channels_to_input_capture() {
         w.set_ccnp(3, true);
     });
 
-    // 5. Restore AF on the pins.
-    gpio_glitch_guard_to_af();
-
-    // 6. Re-enable channels (now in input mode).
+    // 5. Re-enable channels (now in input mode) while the pads are still
+    //    held HIGH by the GPIO guard. Enabling capture here is safe: the
+    //    guard is driving a steady level, so there is no edge to capture.
     pac::TIM2.ccer().modify(|w| {
         w.set_cce(0, true);
         w.set_cce(1, true);
         w.set_cce(2, true);
         w.set_cce(3, true);
     });
+
+    // 6. Only now hand the pads back to the AF — the peripheral is fully
+    //    configured, and both the guard level and the released-to-pull-up
+    //    level are HIGH, so the handover produces no edge.
+    gpio_glitch_guard_to_af();
 }
 
 /// Switch all four TIM2 channels back to output-compare PWM Mode 1 with
 /// preload (BF: `pwmDshotSetDirectionOutput`).
 fn switch_channels_to_output_compare() {
+    // NO GPIO glitch guard in this direction — deliberately.
+    //
+    // BF's H7 guard exists only in `pwmDshotSetDirectionInput`, wrapped
+    // around `LL_TIM_IC_Init`; `pwmDshotSetDirectionOutput` touches no GPIO
+    // at all and leaves the pin in ALTERNATE mode throughout. This port
+    // originally applied the guard symmetrically to both directions, and
+    // that extra OUTPUT↔AF handover was measured on hardware 2026-07-26 as
+    // a LOW glitch on the idle line, tracking DEADTIME_US (110 µs after the
+    // frame at 80 µs, 272 µs at 250 µs) — i.e. landing exactly here. Three
+    // attempts to make the handover glitch-free by reordering all failed;
+    // the handover itself is the defect, so it is gone.
+    //
+    // Safe because CCRn is cleared below *before* CCxE is re-enabled, so
+    // the output is never enabled while the compare register still holds an
+    // RX capture value. That is the same ordering LL_TIM_OC_Init gives BF:
+    // clear CC1E, configure CCMR/CCR, then restore CCER last.
     pac::TIM2.ccer().modify(|w| {
         w.set_cce(0, false);
         w.set_cce(1, false);
         w.set_cce(2, false);
         w.set_cce(3, false);
     });
-
-    gpio_glitch_guard_to_output();
 
     pac::TIM2.ccmr_output(0).modify(|w| {
         w.set_ccs(0, pac::timer::vals::CcmrOutputCcs::OUTPUT);
@@ -677,28 +808,57 @@ fn switch_channels_to_output_compare() {
         w.set_ccnp(3, false);
     });
 
-    // Reset CCRn-preload to 0 then force a UEV so CCRn-shadow=0 before
-    // the pin is re-attached to the OC output. Without this, the
-    // residual input-capture timestamp left in CCRn-shadow during the
-    // RX phase makes the FIRST cell of the next TX frame transmit a
-    // glitch: if shadow > ARR, CC-match never fires that cell and the
-    // line stays in the active polarity (LOW in bidir) for a full
-    // ~1.67 µs; if shadow ∈ 0..ARR, the first cell has a mid-cell
-    // edge instead of an encoded bit. Either way the ESC sees a
-    // malformed leading bit and rejects the frame.
+    // Clear the residual input-capture timestamp out of CCRn *before*
+    // the pin is re-attached to the OC output. During the RX phase the
+    // hardware wrote capture values into CCRn; those are 32-bit CNT
+    // snapshots, so typically hundreds-to-thousands of ticks. Left in
+    // place, the OC comparator sees CNT < CCRn and holds the output in
+    // its active state — LOW in bidir — from here until the TX DMA
+    // finally overwrites CCRn a few cells into the next frame. Scoped
+    // on 2026-07-26: ~8 µs (≈5 cells) of solid LOW ahead of every
+    // frame, swallowing the falling edge of bit 0. BLHeli syncs its bit
+    // timing on that edge, which is why bidir never gets a reply while
+    // non-bidir (no RX phase, so CCRn is never polluted) is fine.
     //
-    // OCxPE=1 (set by the CCMR writes above), so writes to CCRn go
-    // to the preload register. EGR.UG triggers an immediate UEV
-    // which transfers preload→shadow for both ARR and CCR; CNT also
-    // resets to 0. CCxE is still 0 at this point, so the output
-    // isn't driving the pin yet — no glitch leaks out.
+    // CCRn is two registers behind one address: with OCxPE=1 a write
+    // lands in the *preload* register and only reaches the *active*
+    // (shadow) one at the next update event. Which of the two the
+    // capture hardware wrote during RX isn't something we can observe
+    // from software — reads return the preload register — so clear
+    // BOTH and leave no path for a stale value to come back:
+    //
+    //   OCxPE=0, CCRn←0   → active register, immediately
+    //   OCxPE=1, CCRn←0   → preload register, so the next UEV (which
+    //                       lands at the start of the next frame)
+    //                       can't shadow junk back in
+    //   EGR.UG            → reset CNT, reload shadows
+    //
+    // BF brackets its `LL_TIM_OC_Init` in `pwmDshotSetDirectionOutput`
+    // with DisablePreload/EnablePreload for the same reason.
+    //
+    // CCxE is still 0 here, so the output isn't driving the pin yet —
+    // no glitch leaks out.
+    for reg in [0usize, 1] {
+        pac::TIM2.ccmr_output(reg).modify(|w| {
+            w.set_ocpe(0, false);
+            w.set_ocpe(1, false);
+        });
+    }
+    pac::TIM2.ccr(0).write_value(0);
+    pac::TIM2.ccr(1).write_value(0);
+    pac::TIM2.ccr(2).write_value(0);
+    pac::TIM2.ccr(3).write_value(0);
+    for reg in [0usize, 1] {
+        pac::TIM2.ccmr_output(reg).modify(|w| {
+            w.set_ocpe(0, true);
+            w.set_ocpe(1, true);
+        });
+    }
     pac::TIM2.ccr(0).write_value(0);
     pac::TIM2.ccr(1).write_value(0);
     pac::TIM2.ccr(2).write_value(0);
     pac::TIM2.ccr(3).write_value(0);
     pac::TIM2.egr().write(|w| w.set_ug(true));
-
-    gpio_glitch_guard_to_af();
 
     pac::TIM2.ccer().modify(|w| {
         w.set_cce(0, true);
@@ -706,6 +866,28 @@ fn switch_channels_to_output_compare() {
         w.set_cce(2, true);
         w.set_cce(3, true);
     });
+
+    // The update event above is NOT enough: measured on hardware
+    // 2026-07-26, all four pads sit LOW after this function returns, and
+    // stay there for milliseconds — until an update event is issued with
+    // the channels *enabled*. The bench probe isolated it: writing CCR1
+    // alone changed nothing, but a single EGR.UG released all four pads to
+    // idle HIGH at once, so what matters is the timer-wide update, not the
+    // per-channel compare value.
+    //
+    // The earlier UG runs while CCxE=0 and reloads CNT but evidently
+    // leaves the CCRn shadow registers holding what the RX phase left in
+    // them, so the comparator keeps OCxREF asserted (= LOW under the bidir
+    // CCxP=1 inversion). Re-issuing it here, after CCxE=1 and after the
+    // pins are back on AF, reproduces exactly the sequence that was proven
+    // to release the line.
+    //
+    // ARR must be restored to the cell period *before* the UG, since the
+    // UG is what transfers the preload into the shadow — this is why the
+    // caller no longer does it.
+    pac::TIM2.arr().write_value(MOTOR_BITLENGTH - 1);
+    pac::TIM2.egr().write(|w| w.set_ug(true));
+
 }
 
 /// Read NDTR for one DMA1 stream (0..7). Returns the remaining
