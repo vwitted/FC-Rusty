@@ -113,6 +113,39 @@ pub fn log_rx_loopback_result(edges: [u32; 4], m1_buf: &[u32]) {
     }
 }
 
+/// Pad level through the transmit setup, sampled on one frame.
+///
+/// The idle probe shows the pad HIGH when the direction switch finishes, yet
+/// the frame begins with ~2 cells of stuck-LOW. Since the switch now runs
+/// immediately before transmit, whatever asserts the line does so inside the
+/// handful of statements between them. These five samples bracket each one,
+/// so the culprit is whichever step the level drops at rather than something
+/// to be deduced from the reference manual.
+///
+/// Reads are single register accesses, so the trace costs nanoseconds and
+/// does not shift the timing it is measuring. Logged after the frame has
+/// gone out, for the same reason.
+pub fn log_tx_setup_trace(idr: [u8; 5]) {
+    defmt::info!(
+        "TX setup trace [{=str}] PA0..3: after switch={=u8:04b} | after ARR/CNT={=u8:04b} | after CCxDE={=u8:04b} | after DMA armed={=u8:04b} | after frame={=u8:04b}",
+        BUILD_TAG,
+        idr[0], idr[1], idr[2], idr[3], idr[4],
+    );
+    let names = [
+        "already low when the switch returned (contradicts the idle probe)",
+        "the ARR/CNT/ARPE writes",
+        "enabling CCxDE",
+        "arming the DMA streams",
+    ];
+    for (i, name) in names.iter().enumerate() {
+        if idr[i] & 1 == 0 {
+            defmt::error!("  M1 first goes LOW at: {=str}", *name);
+            return;
+        }
+    }
+    defmt::info!("  M1 stayed HIGH through the whole setup — the stuck LOW starts inside the frame itself");
+}
+
 /// One-shot probe of the bidir RX→TX direction switch.
 ///
 /// The scope shows ~8 µs of LOW on M1 between the telemetry window and the

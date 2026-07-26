@@ -444,6 +444,49 @@ impl<'d> DshotQuad<'d> {
         let ccr4 = pac::TIM2.ccr(3).as_ptr();
 
         unsafe {
+            // Order matters, and it is BF's (pwmCompleteDshotMotorUpdate):
+            //
+            //     LL_TIM_DisableARRPreload(timer);
+            //     timer->ARR = outputPeriod;
+            //     LL_TIM_SetCounter(timer, 0);
+            //     LL_EX_TIM_EnableIT(timer, timerDmaSources);  // request enable
+            //     xLL_EX_DMA_EnableResource(motor->dmaRef);    // stream LAST
+            //
+            // The timer is fully configured and the DMA request enabled
+            // before any stream comes alive. This port had it inverted:
+            // `Transfer::new_write` arms the stream on construction, so the
+            // streams were live before ARR/CNT were touched — an ordering
+            // choice made by Embassy's abstraction rather than by us, in the
+            // exact stretch of the cycle where a stray LOW still precedes
+            // each frame. Constructing the transfers last restores BF's
+            // sequence without having to replace the DMA layer.
+            //
+            // Requests raised while a stream is disabled are dropped rather
+            // than latched, so enabling CCxDE first costs at most one cell
+            // of startup latency — which is what BF accepts too.
+            let tx_probe = self.frame_count == PROBE_FRAME + 2;
+            let mut idr = [0u8; 5];
+            if tx_probe {
+                idr[0] = dshot_diag::read_pa_low();
+            }
+
+            pac::TIM2.cr1().modify(|w| w.set_arpe(false));
+            pac::TIM2.arr().write_value(MOTOR_BITLENGTH - 1);
+            pac::TIM2.cnt().write_value(0);
+            if tx_probe {
+                idr[1] = dshot_diag::read_pa_low();
+            }
+
+            pac::TIM2.dier().modify(|w| {
+                w.set_ccde(0, true);
+                w.set_ccde(1, true);
+                w.set_ccde(2, true);
+                w.set_ccde(3, true);
+            });
+            if tx_probe {
+                idr[2] = dshot_diag::read_pa_low();
+            }
+
             let m1_req = <DMA1_CH2 as TimChDma<TIM2, Ch1>>::request(&self.dma_m1);
             let t_m1 = Transfer::new_write(
                 self.dma_m1.reborrow(),
@@ -477,18 +520,16 @@ impl<'d> DshotQuad<'d> {
                 tx_opts,
             );
 
-            pac::TIM2.cr1().modify(|w| w.set_arpe(false));
-            pac::TIM2.arr().write_value(MOTOR_BITLENGTH - 1);
-            pac::TIM2.cnt().write_value(0);
-
-            pac::TIM2.dier().modify(|w| {
-                w.set_ccde(0, true);
-                w.set_ccde(1, true);
-                w.set_ccde(2, true);
-                w.set_ccde(3, true);
-            });
+            if tx_probe {
+                idr[3] = dshot_diag::read_pa_low();
+            }
 
             join4(t_m1, t_m2, t_m3, t_m4).await;
+
+            if tx_probe {
+                idr[4] = dshot_diag::read_pa_low();
+                dshot_diag::log_tx_setup_trace(idr);
+            }
         }
 
         pac::TIM2.dier().modify(|w| {
