@@ -469,3 +469,90 @@ sensor health). Deferred as its own subsystem; notes for when we return:
   both ends.
 - Right-sized for general status/voice; the per-feature LED stays as the
   no-radio fallback.
+
+---
+
+## Journal — 2026-07-26: bidirectional DShot bring-up (unresolved)
+
+Long bench session on the DAKEFPV H743 chasing why bidirectional DShot
+does not work while plain DShot does. **Not resolved.** Bidir still fails:
+the ESC does not accept frames (motors do not spin) and no telemetry is
+ever decoded (`NoEdge` on every frame). Plain DShot is unaffected and
+works end to end, including in the flight firmware.
+
+### Fixed and confirmed on hardware
+
+Three real defects, all in the bidir-only RX→TX path (`dshot_hw.rs`):
+
+1. **Stale compare register** left the line asserted for ~8 µs before
+   every frame, swallowing bit 0's falling edge — the edge BLHeli syncs
+   on. The old guard wrote `CCRn` with `OCxPE=1`, so the zero landed in
+   the preload register and never reached the active one.
+2. **The update event needed `CCxE=1`** to take effect. Isolated with a
+   bench probe: writing `CCR1` alone changed nothing, a single `EGR.UG`
+   released all four pads at once.
+3. **A GPIO glitch guard in the output direction that BF does not have.**
+   BF's H7 guard exists only in `pwmDshotSetDirectionInput`;
+   `pwmDshotSetDirectionOutput` touches no GPIO. Ours was symmetric.
+
+Also: the direction switch back to output now happens immediately before
+transmit (as BF does from `pwmTelemetryDecode`) rather than when the
+response window closes, and the transmit path follows BF's register
+order with the DMA streams armed last. That shortened the stuck-LOW
+first bit from ~8 µs to 3.4 µs — it moved the symptom, not the cause.
+
+### The open problem
+
+The transmit-setup pad trace localises it exactly:
+
+    after switch=0000 | after ARR/CNT=0000 | after CCxDE=0000
+    | after DMA armed=1111 | after frame=1111
+
+The line is LOW from the moment the direction switch returns, and only
+goes HIGH once the DMA writes a cell value. The idle probe narrows it
+further: `OCM=FORCE_INACTIVE` gives idle-high, but PWM mode 1 with what
+should be `CCR=0` gives an **active** output. So the active compare
+register still holds an RX capture value, and with `ARR` at `0xFFFFFFFF`
+the `CNT < CCR` condition stays true for a long time.
+
+**Unexplained:** why the active compare register cannot be cleared by
+writing it with preload disabled — which is all BF's `LL_TIM_OC_Init`
+does, and BF works on this exact board and ESC.
+
+### Next steps
+
+- **Reference capture.** Flash BF (known working bidir on this hardware)
+  and capture one full frame period at ~10 µs/div. Gives the ESC's real
+  reply timing and edge spacing — which calibrates `DEADTIME_US` and the
+  GCR decoder — and settles whether BF's idle line is clean.
+- **Finish the port properly.** The header claims a direct port of BF's
+  H7 driver; it is not. The DMA lifecycle is the substituted piece: BF
+  tears down and reconfigures the stream *inside* the direction switches
+  with an explicit `Direction` field, while we construct and drop Embassy
+  `Transfer` objects per frame. Needing an `EGR.UG` that BF does not need
+  is itself evidence the port diverges structurally.
+- **Confirm `UDE` vs `CCxDE`** for H7 specifically. Our port assumes
+  per-channel compare DMA; one BF source read suggested update-event DMA
+  ("exactly one transfer per TIM cycle"), but that fetch mixed in H5/N6
+  detail and was not confirmed.
+- **Recalibrate the RX self-test** before trusting it. It reports 2 of 8
+  self-driven edges captured, but the capture timestamps show ~145 ticks
+  between them rather than the ~24 expected, so the pulse generator's
+  timing is wrong, not necessarily the capture path. Register dump
+  confirms the RX config is correct (`CCS=1 ICPSC=0`, both-edge `CCER`).
+
+### Bench tooling added
+
+- Build stamp (`<epoch>-<sha>[-dirty]`) logged at DShot init and echoed
+  by the flash scripts with the binary's SHA-256, so "is this the
+  firmware I just built" is answerable.
+- `rerun-if-env-changed` for the motor-test env vars. Without it,
+  `LOOP_KHZ=2 ./scripts/flash-motor-test.sh` recompiled nothing and
+  flashed the previous config — very likely the cause of the
+  "motor bidir setting not responding to code changes" note from
+  2026-07-25.
+- `DEADTIME_US=<n>` build-time override. Moving it moves the direction
+  switch, which is how the stray pulse was pinned to our code rather
+  than the ESC.
+- Idle probe, transmit-setup pad trace, and RX loopback self-test, all
+  gated to single frames inside the MotorStop arming window.
