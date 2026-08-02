@@ -501,6 +501,10 @@ response window closes, and the transmit path follows BF's register
 order with the DMA streams armed last. That shortened the stuck-LOW
 first bit from ~8 µs to 3.4 µs — it moved the symptom, not the cause.
 
+The transmit reorder sits in the path **shared with non-bidir**, so it
+was re-verified on hardware afterwards: plain DShot still spins the
+motors normally. No regression to the working protocol.
+
 ### The open problem
 
 The transmit-setup pad trace localises it exactly:
