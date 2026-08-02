@@ -523,6 +523,41 @@ the `CNT < CCR` condition stays true for a long time.
 writing it with preload disabled — which is all BF's `LL_TIM_OC_Init`
 does, and BF works on this exact board and ESC.
 
+### 2026-08-02 — the reference was the wrong file
+
+`dshot_bitbang = AUTO` (the BF default) resolves to **bit-banging** on
+H7. Verified verbatim in `src/platform/common/stm32/dshot_bitbang_shared.c`:
+
+    bool isDshotBitbangActive(const motorDevConfig_t *motorDevConfig)
+    {
+    #if defined(STM32F4) || defined(APM32F4)
+        return useDshotBitbang == ON ||
+            (useDshotBitbang == AUTO && useDshotTelemetry
+             && motorProtocol != PROSHOT1000);
+    #else
+        return useDshotBitbang == ON ||
+            (useDshotBitbang == AUTO && motorProtocol != PROSHOT1000);
+    #endif
+    }
+
+H7 takes the `#else` branch: AUTO means bitbang for any protocol except
+ProShot1000, regardless of whether telemetry is enabled. Only F4
+additionally requires `useDshotTelemetry`.
+
+So the working Betaflight on this board is **bit-banging**, for both
+bidir and plain DShot, and `pwm_output_dshot_hal.c` — the file this
+driver claims to port and which the 2026-07-26 session transliterated
+against — is not the code producing that waveform.
+
+**This voids the open question above** rather than answering it. "Why
+can we not clear the active compare register when BF's `LL_TIM_OC_Init`
+can?" assumed BF does so successfully on this hardware. It does not do
+it at all. There was no working counter-example.
+
+It does not prove the timer-DMA path cannot work on H7 — BF still ships
+it for when bitbang is off — only that we have no evidence it does, and
+that BF defaults away from it on every family after F4.
+
 ### Next steps
 
 - **Reference capture.** Flash BF (known working bidir on this hardware)
