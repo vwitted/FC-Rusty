@@ -16,6 +16,8 @@ pub struct MotorTestConfig {
     pub bidir: bool,
     /// Send-loop frequency in kHz (2..=8).
     pub loop_khz: u8,
+    /// Which DShot driver to exercise: false = timer-DMA (dshot_hw), true = bit-bang.
+    pub use_bitbang: bool,
 }
 
 /// Hard safety ceiling on any motor's throttle. Raising it requires a
@@ -28,6 +30,7 @@ const DEFAULT_BIDIR: bool = true;
 const DEFAULT_LOOP_KHZ: u8 = 8;
 const MIN_LOOP_KHZ: u8 = 2;
 const MAX_LOOP_KHZ: u8 = 8;
+const DEFAULT_USE_BITBANG: bool = false;
 
 /// Parse + clamp raw string inputs into a `MotorTestConfig`. Pure (no env
 /// IO) so it can be unit-tested with arbitrary inputs.
@@ -35,6 +38,7 @@ fn parse_config(
     motor: [Option<&str>; 4],
     bidir: Option<&str>,
     loop_khz: Option<&str>,
+    driver: Option<&str>,
 ) -> MotorTestConfig {
     let motor_pct = core::array::from_fn(|i| {
         motor[i]
@@ -51,10 +55,16 @@ fn parse_config(
         .and_then(|s| s.trim().parse::<u8>().ok())
         .unwrap_or(DEFAULT_LOOP_KHZ)
         .clamp(MIN_LOOP_KHZ, MAX_LOOP_KHZ);
+    let use_bitbang = match driver.map(|s| s.trim()) {
+        Some("bitbang") => true,
+        Some("timer") => false,
+        _ => DEFAULT_USE_BITBANG,
+    };
     MotorTestConfig {
         motor_pct,
         bidir,
         loop_khz,
+        use_bitbang,
     }
 }
 
@@ -102,6 +112,25 @@ const fn env_bidir_ok(v: Option<&str>) -> bool {
     i == j || (j - i == 1 && (b[i] == b'0' || b[i] == b'1'))
 }
 
+/// Build-time validation for DRIVER: unset, blank, "timer" or "bitbang" only.
+const fn env_driver_ok(v: Option<&str>) -> bool {
+    let Some(s) = v else { return true };
+    let b = s.as_bytes();
+    let (i, j) = trimmed(b);
+    if i == j {
+        return true;
+    }
+    let n = j - i;
+    if n == 5 {
+        return b[i] == b't' && b[i+1] == b'i' && b[i+2] == b'm' && b[i+3] == b'e' && b[i+4] == b'r';
+    }
+    if n == 7 {
+        return b[i] == b'b' && b[i+1] == b'i' && b[i+2] == b't' && b[i+3] == b'b'
+            && b[i+4] == b'a' && b[i+5] == b'n' && b[i+6] == b'g';
+    }
+    false
+}
+
 // Fail the motor-test build outright on unparseable values for the env vars
 // it knows about. Unset vars still default; misspelt *names* remain
 // undetectable — the startup banner logging the resolved config covers those.
@@ -113,6 +142,7 @@ const _: () = {
     assert!(env_u8_ok(option_env!("M4_PCT")), "M4_PCT must be an integer 0-255");
     assert!(env_bidir_ok(option_env!("BIDIR")), "BIDIR must be 0 or 1");
     assert!(env_u8_ok(option_env!("LOOP_KHZ")), "LOOP_KHZ must be an integer (kHz)");
+    assert!(env_driver_ok(option_env!("DRIVER")), "DRIVER must be `timer` or `bitbang`");
 };
 
 /// Read the build-time env values and resolve them into a clamped config.
@@ -127,6 +157,7 @@ pub fn resolve_config() -> MotorTestConfig {
         ],
         option_env!("BIDIR"),
         option_env!("LOOP_KHZ"),
+        option_env!("DRIVER"),
     )
 }
 
@@ -162,20 +193,6 @@ pub async fn run(p: embassy_stm32::Peripherals) -> ! {
         }
     }
 
-    let mut dshot = DshotQuad::new(
-        p.TIM2,
-        p.PA0,
-        p.PA1,
-        p.PA2,
-        p.PA3,
-        p.DMA1_CH2,
-        p.DMA1_CH3,
-        p.DMA1_CH4,
-        p.DMA1_CH7,
-        DshotSpeed::Dshot600,
-        cfg.bidir,
-    );
-
     // Per-motor frames are constant for the run; 0% maps to MotorStop.
     let frames: [DshotFrame; 4] =
         core::array::from_fn(|i| DshotFrame::from_normalised(cfg.motor_pct[i] as f32 / 100.0, cfg.bidir));
@@ -188,26 +205,56 @@ pub async fn run(p: embassy_stm32::Peripherals) -> ! {
     // a nonzero first frame locks them out. Stream MotorStop for 3s (expect
     // the ESC arm beeps during this window) before any real throttle.
     let stop: [DshotFrame; 4] = [DshotFrame::motor_stop(cfg.bidir); 4];
-    defmt::info!("motor-test: arming ESCs (zero throttle, 3s)");
-    for _ in 0..(cfg.loop_khz as u32 * 3000) {
-        dshot.send_throttles_and_receive(stop).await;
-        ticker.next().await;
-    }
 
-    defmt::info!("motor-test: driving motors");
-    loop {
-        let telem = dshot.send_throttles_and_receive(frames).await;
-        n = n.wrapping_add(1);
-        if cfg.bidir && n % log_every == 0 {
-            defmt::info!(
-                "motor-test RX: M1={=?} M2={=?} M3={=?} M4={=?}",
-                telem[0],
-                telem[1],
-                telem[2],
-                telem[3],
-            );
+    if cfg.use_bitbang {
+        let mut dshot = crate::drivers::dshot_bitbang::DshotBitbang::new(
+            p.TIM1, p.DMA2_CH2, p.PA0, p.PA1, p.PA2, p.PA3, cfg.bidir,
+        );
+        defmt::info!("motor-test: arming ESCs (zero throttle, 3s) [bitbang]");
+        for _ in 0..(cfg.loop_khz as u32 * 3000) {
+            dshot.send(stop).await;
+            ticker.next().await;
         }
-        ticker.next().await;
+        defmt::info!("motor-test: driving motors [bitbang]");
+        loop {
+            dshot.send(frames).await;
+            ticker.next().await;
+        }
+    } else {
+        let mut dshot = DshotQuad::new(
+            p.TIM2,
+            p.PA0,
+            p.PA1,
+            p.PA2,
+            p.PA3,
+            p.DMA1_CH2,
+            p.DMA1_CH3,
+            p.DMA1_CH4,
+            p.DMA1_CH7,
+            DshotSpeed::Dshot600,
+            cfg.bidir,
+        );
+        defmt::info!("motor-test: arming ESCs (zero throttle, 3s)");
+        for _ in 0..(cfg.loop_khz as u32 * 3000) {
+            dshot.send_throttles_and_receive(stop).await;
+            ticker.next().await;
+        }
+
+        defmt::info!("motor-test: driving motors");
+        loop {
+            let telem = dshot.send_throttles_and_receive(frames).await;
+            n = n.wrapping_add(1);
+            if cfg.bidir && n % log_every == 0 {
+                defmt::info!(
+                    "motor-test RX: M1={=?} M2={=?} M3={=?} M4={=?}",
+                    telem[0],
+                    telem[1],
+                    telem[2],
+                    telem[3],
+                );
+            }
+            ticker.next().await;
+        }
     }
 }
 
@@ -217,7 +264,7 @@ mod tests {
 
     #[test]
     fn defaults_when_all_unset() {
-        let c = parse_config([None; 4], None, None);
+        let c = parse_config([None; 4], None, None, None);
         assert_eq!(c.motor_pct, [5, 5, 5, 5]); // bare motor test spins gently
         assert!(c.bidir);
         assert_eq!(c.loop_khz, 8);
@@ -225,27 +272,55 @@ mod tests {
 
     #[test]
     fn explicit_zero_still_stops_motor() {
-        let c = parse_config([Some("0"), None, None, None], None, None);
+        let c = parse_config([Some("0"), None, None, None], None, None, None);
         assert_eq!(c.motor_pct[0], 0);
     }
 
     #[test]
     fn parses_each_motor_independently() {
-        let c = parse_config([Some("3"), None, Some("7"), None], None, None);
+        let c = parse_config([Some("3"), None, Some("7"), None], None, None, None);
         assert_eq!(c.motor_pct, [3, 5, 7, 5]);
     }
 
     #[test]
     fn clamps_motor_to_max_pct() {
-        let c = parse_config([Some("90"), Some("25"), Some("26"), Some("0")], None, None);
+        let c = parse_config([Some("90"), Some("25"), Some("26"), Some("0")], None, None, None);
         assert_eq!(c.motor_pct, [25, 25, 25, 0]);
     }
 
     #[test]
     fn bidir_explicit_zero_one_else_default() {
-        assert!(!parse_config([None; 4], Some("0"), None).bidir);
-        assert!(parse_config([None; 4], Some("1"), None).bidir);
-        assert!(parse_config([None; 4], Some("yes"), None).bidir); // garbage → default true
+        assert!(!parse_config([None; 4], Some("0"), None, None).bidir);
+        assert!(parse_config([None; 4], Some("1"), None, None).bidir);
+        assert!(parse_config([None; 4], Some("yes"), None, None).bidir); // garbage → default true
+    }
+
+    #[test]
+    fn driver_defaults_to_timer() {
+        let c = parse_config([None; 4], None, None, None);
+        assert!(!c.use_bitbang);
+    }
+
+    #[test]
+    fn driver_selects_bitbang() {
+        let c = parse_config([None; 4], None, None, Some("bitbang"));
+        assert!(c.use_bitbang);
+    }
+
+    #[test]
+    fn driver_garbage_falls_back_to_timer() {
+        let c = parse_config([None; 4], None, None, Some("nonsense"));
+        assert!(!c.use_bitbang);
+    }
+
+    #[test]
+    fn env_driver_ok_accepts_only_known_drivers() {
+        assert!(env_driver_ok(None));
+        assert!(env_driver_ok(Some("")));
+        assert!(env_driver_ok(Some(" timer ")));
+        assert!(env_driver_ok(Some("bitbang")));
+        assert!(!env_driver_ok(Some("bit-bang")));
+        assert!(!env_driver_ok(Some("dma")));
     }
 
     #[test]
@@ -280,9 +355,9 @@ mod tests {
 
     #[test]
     fn loop_khz_clamped_to_range() {
-        assert_eq!(parse_config([None; 4], None, Some("1")).loop_khz, 2);
-        assert_eq!(parse_config([None; 4], None, Some("9")).loop_khz, 8);
-        assert_eq!(parse_config([None; 4], None, Some("4")).loop_khz, 4);
-        assert_eq!(parse_config([None; 4], None, Some("x")).loop_khz, 8); // garbage → default
+        assert_eq!(parse_config([None; 4], None, Some("1"), None).loop_khz, 2);
+        assert_eq!(parse_config([None; 4], None, Some("9"), None).loop_khz, 8);
+        assert_eq!(parse_config([None; 4], None, Some("4"), None).loop_khz, 4);
+        assert_eq!(parse_config([None; 4], None, Some("x"), None).loop_khz, 8); // garbage → default
     }
 }

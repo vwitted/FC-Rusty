@@ -55,6 +55,7 @@ mod drivers {
     pub mod crsf;
     pub mod dshot_bb_decode;
     pub mod dshot_bb_frame;
+    pub mod dshot_bitbang;
     pub mod dshot_diag;
     pub mod dshot_frame;
     pub mod dshot_hw;
