@@ -53,6 +53,7 @@ use panic_probe as _; // panic handler that works with probe
 mod drivers {
     pub mod baro;
     pub mod crsf;
+    pub mod dshot_bb_frame;
     pub mod dshot_diag;
     pub mod dshot_frame;
     pub mod dshot_hw;
