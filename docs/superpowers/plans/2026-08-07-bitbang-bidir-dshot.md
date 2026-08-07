@@ -68,7 +68,8 @@ Both frequency errors are far inside DShot tolerance.
 | `src/drivers/dshot_bb_frame.rs` | **Create.** Pure. 16-bit DShot frame → 51-word `BSRR` buffer. No hardware. |
 | `src/drivers/dshot_bb_decode.rs` | **Create.** Pure. Oversampled `IDR` samples → GCR → eRPM. No hardware. |
 | `src/drivers/dshot_bitbang.rs` | **Create.** Hardware: pacer timer, DMA, GPIO direction switching. |
-| `src/drivers/mod.rs` | **Modify.** Declare the three new modules. |
+| `src/lib.rs:38-42` | **Modify.** Declare the two *pure* modules inside `pub mod drivers { … }` so host tests compile them. |
+| `src/main.rs:53-66` | **Modify.** Declare all three new modules inside `mod drivers { … }` so the firmware compiles them. |
 | `src/motor_test.rs` | **Modify.** `DRIVER=bitbang\|timer` selection, default `timer`. |
 | `build.rs` | **Modify.** Add `DRIVER` to `rerun-if-env-changed`. |
 | `src/main.rs` | **Modify (Task 6 only).** Cutover, gated on Task 5 passing on hardware. |
@@ -83,7 +84,7 @@ Transliteration of BF's `bbOutputDataInit` / `bbOutputDataSet` / `bbOutputDataCl
 
 **Files:**
 - Create: `src/drivers/dshot_bb_frame.rs`
-- Modify: `src/drivers/mod.rs`
+- Modify: `src/lib.rs:38-42`, `src/main.rs:53-66`
 
 **Interfaces:**
 - Consumes: nothing.
@@ -208,13 +209,29 @@ mod tests {
 Run: `cargo test --lib --no-default-features --target x86_64-unknown-linux-gnu dshot_bb_frame`
 Expected: FAIL — `cannot find function output_data_init in this scope` (and the module isn't declared yet).
 
-- [ ] **Step 3: Declare the module**
+- [ ] **Step 3: Declare the module in BOTH places**
 
-In `src/drivers/mod.rs`, add alongside the existing `pub mod` lines:
+There is no `src/drivers/mod.rs` in this repo. Driver modules are declared
+inline in two separate lists, and a pure module must appear in both:
+
+`src/lib.rs:38-42` — the host-testable subset, which is what
+`cargo test --lib --no-default-features` compiles. Add in alphabetical order:
 
 ```rust
-pub mod dshot_bb_frame;
+pub mod drivers {
+    pub mod dshot_bb_frame;
+    pub mod dshot_frame;
+    pub mod dshot_telemetry;
+    pub mod nmea;
+}
 ```
+
+`src/main.rs:53-66` — the firmware set. Add `pub mod dshot_bb_frame;` in
+alphabetical order alongside the existing entries.
+
+Omitting the `lib.rs` entry is the failure mode to avoid: the firmware would
+still build, but the host tests would never compile the module and would
+silently pass without running.
 
 - [ ] **Step 4: Write the implementation**
 
@@ -322,7 +339,7 @@ Expected: both succeed.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/drivers/dshot_bb_frame.rs src/drivers/mod.rs
+git add src/drivers/dshot_bb_frame.rs src/lib.rs src/main.rs
 git commit -m "dshot-bb: BSRR frame builder for bit-banged DShot
 
 Transliteration of BF's bbOutputDataInit/Set/Clear. Three pacer states per
@@ -340,7 +357,7 @@ Turns oversampled `IDR` samples into an eRPM period. The GCR run-length reconstr
 
 **Files:**
 - Create: `src/drivers/dshot_bb_decode.rs`
-- Modify: `src/drivers/mod.rs`
+- Modify: `src/lib.rs:38-42`, `src/main.rs:53-66`
 
 **Interfaces:**
 - Consumes: nothing.
@@ -463,13 +480,11 @@ mod tests {
 Run: `cargo test --lib --no-default-features --target x86_64-unknown-linux-gnu dshot_bb_decode`
 Expected: FAIL to compile — `cannot find function decode in this scope`, plus the same for `RX_BUF_LEN`, `OVERSAMPLE`, `GCR_BITS` and `BbTelemetry`, none of which exist yet. A compile failure is the correct red state here.
 
-- [ ] **Step 3: Declare the module**
+- [ ] **Step 3: Declare the module in BOTH places**
 
-In `src/drivers/mod.rs`:
-
-```rust
-pub mod dshot_bb_decode;
-```
+Pure module, so it goes in both lists (see Task 1 Step 3):
+`pub mod dshot_bb_decode;` in `src/lib.rs`'s `pub mod drivers { … }` block
+AND in `src/main.rs`'s `mod drivers { … }` block, alphabetically in each.
 
 - [ ] **Step 4: Write the implementation**
 
@@ -591,7 +606,7 @@ If `round_trips_a_known_erpm_period` fails, the disagreement is between the test
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/drivers/dshot_bb_decode.rs src/drivers/mod.rs
+git add src/drivers/dshot_bb_decode.rs src/lib.rs src/main.rs
 git commit -m "dshot-bb: GCR telemetry decode from oversampled GPIO samples
 
 Run-length reconstruction mirrors dshot_hw::decode_telemetry, so the quintet
@@ -608,7 +623,7 @@ Gets a waveform out. Non-inverted only — bidirectional comes in Task 4, so thi
 
 **Files:**
 - Create: `src/drivers/dshot_bitbang.rs`
-- Modify: `src/drivers/mod.rs`, `src/motor_test.rs`, `build.rs`
+- Modify: `src/main.rs:53-66`, `src/motor_test.rs`, `build.rs`
 
 **Interfaces:**
 - Consumes: `dshot_bb_frame::{BB_BUF_LEN, output_data_init, output_data_clear, output_data_set}`
@@ -796,7 +811,9 @@ fn set_idle_level(bidir: bool) {
 
 - [ ] **Step 3: Declare the module and add driver selection**
 
-In `src/drivers/mod.rs`:
+In `src/main.rs`'s `mod drivers { … }` block only — **not** `lib.rs`. This
+module uses `embassy_stm32`, so putting it in `lib.rs` would break the
+host test build:
 
 ```rust
 pub mod dshot_bitbang;
@@ -937,7 +954,7 @@ If nothing comes out, check in this order: TIM1 clock enabled (`RCC.APB2ENR.TIM1
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/drivers/dshot_bitbang.rs src/drivers/mod.rs src/motor_test.rs build.rs
+git add src/drivers/dshot_bitbang.rs src/main.rs src/motor_test.rs build.rs
 git commit -m "dshot-bb: bit-banged transmit on TIM1 pacer + DMA2_CH2
 
 TIM1 drives no pin; it paces DMA writes of BSRR words to GPIOA. Motor pins
@@ -1182,7 +1199,7 @@ Flash the flight firmware and confirm motors arm and spin, then confirm eRPM tel
 git rm src/drivers/dshot_hw.rs src/drivers/dshot_diag.rs
 ```
 
-Remove their `pub mod` lines from `src/drivers/mod.rs` and the `DRIVER` selection from `motor_test.rs` (there is only one driver now). Keep `dshot_frame.rs` — the frame encoder is shared.
+Remove their `pub mod` lines from `src/main.rs`'s `mod drivers { … }` block and the `DRIVER` selection from `motor_test.rs` (there is only one driver now). Keep `dshot_frame.rs` — the frame encoder is shared.
 
 - [ ] **Step 4: Correct the documentation**
 
