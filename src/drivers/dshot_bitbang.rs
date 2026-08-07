@@ -69,9 +69,19 @@ impl<'d> DshotBitbang<'d> {
         // GPIO: plain push-pull output, low slew. ArduPilot notes bidir DShot
         // needs push-pull and below-MID2 slew to avoid noise on the
         // output→input transition; BF uses GPIO_SPEED_FREQ_LOW.
+        // Pull direction follows the idle level, not a fixed PULL_UP: for
+        // BIDIR=0 the line idles LOW, so pulling it UP while the pins are
+        // still analog inputs (before MODER below) contradicts the idle
+        // contract. Becomes load-bearing in Task 4, when the pin returns to
+        // being an input for the telemetry read.
+        let pupd = if bidir {
+            pac::gpio::vals::Pupdr::PULL_UP
+        } else {
+            pac::gpio::vals::Pupdr::PULL_DOWN
+        };
         pac::GPIOA.pupdr().modify(|w| {
             for p in MOTOR_PINS {
-                w.set_pupdr(p as usize, pac::gpio::vals::Pupdr::PULL_UP);
+                w.set_pupdr(p as usize, pupd);
             }
         });
         pac::GPIOA.otyper().modify(|w| {
@@ -93,7 +103,19 @@ impl<'d> DshotBitbang<'d> {
         });
 
         // TIM1 as pacer: no output, update event only.
-        pac::RCC.apb2enr().modify(|w| w.set_tim1en(true));
+        //
+        // Must go through embassy's enable_and_reset, not a raw APB2ENR
+        // write: `modify()` reads-then-writes so there is no read-after-
+        // write barrier, and the peripheral clock needs ~2 cycles to start
+        // before register writes to it land (embassy's own RCC path does
+        // this enable + a dummy read + dsb() for exactly this reason — see
+        // embassy-stm32 rcc/mod.rs). Also resets TIM1 via APB2RSTR, which
+        // matters here because TIM1 is an advanced-control timer with RCR
+        // (a repetition counter TIM2 doesn't have): left nonzero from a
+        // stale prior config, the update event — and therefore every DMA
+        // request driving this waveform — would only fire once every
+        // RCR+1 overflows.
+        embassy_stm32::rcc::enable_and_reset::<TIM1>();
         pac::TIM1.cr1().write(|_| {}); // counter disabled while configuring
         pac::TIM1.psc().write_value(0);
         pac::TIM1
