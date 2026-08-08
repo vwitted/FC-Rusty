@@ -59,7 +59,6 @@ mod drivers {
     pub mod dshot_bb_frame;
     pub mod dshot_bitbang;
     pub mod dshot_frame;
-    pub mod dshot_telemetry;
     pub mod icm42688;
     pub mod ism6hg256x;
     pub mod lis2mdl;

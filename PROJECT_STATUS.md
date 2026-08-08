@@ -22,7 +22,7 @@ material hardware or design change lands (see `CLAUDE.md`).
 | SPI1 + PA4             | ICM-42688P IMU1 (onboard)         | ✅ verified — 8 kHz reads, MEKF fusing         |
 | SPI4 + PB1             | ICM-42688P IMU2 (onboard)         | ✅ verified — 8 kHz reads, averaged with IMU1  |
 | I2C2 (PB10/PB11)       | SPL06 barometer (onboard)         | ✅ proper driver — 128 Hz, correct calibration              |
-| PA0/PA1/PA2/PA3 (GPIO) | DShot300 bit-banged, motors M1–M4 | ✅ bidir verified 2026-08-08 — decoded eRPM on M1/M2/M3; M4 returns no reply (off-chip fault, open). TIM1 is a pacer only; DMA2_CH2 drives BSRR / samples IDR |
+| PA0/PA1/PA2/PA3 (GPIO) | DShot600 bit-banged, motors M1–M4 | ✅ bidir verified 2026-08-08 — decoded eRPM on M1/M2/M3; M4 replies outside the capture window (ESC-side, open). TIM1 is a pacer only; DMA2_CH2 drives BSRR / samples IDR |
 | PD10                   | Status LED (active low)           | ✅ heartbeat blink task                        |
 | USB-C                  | DFU flashing                      | ✅ verified — no SWD on this board             |
 | UART4 (PD1/PD0)        | DisplayPort / VTX (T4/R4)         | ⚪ not wired                                   |
@@ -353,7 +353,6 @@ All host-tested (`cargo test --lib --no-default-features --target x86_64-unknown
 | DShot BSRR frame | `drivers/dshot_bb_frame.rs` | Pure builder: 51 BSRR words per frame (16 bits × 3 states + 3 hold); inversion is a half-word swap |
 | DShot GCR decode | `drivers/dshot_bb_decode.rs` | Pure decoder: samples → 21 GCR bits → quintets → eRPM period. No EDT frame-type discrimination yet |
 | DShot frame      | `drivers/dshot_frame.rs` | 16-bit frame encoder, bidir CRC inversion; MSB-first wire unpack |
-| DShot telemetry  | `drivers/dshot_telemetry.rs` | GCR 5→4 decode + EDT/eRPM payload parse + period→RPM. **Orphaned** since the cutover — no callers |
 | Physics sim      | `sim/sim.rs`             | 6DOF rigid body, τ=30ms motor lag, NED, ground collision     |
 | Sensor sim       | `sim/sensors.rs`         | GPS (10 Hz + noise), baro (50 Hz + noise/drift), xorshift64  |
 | TinyMPC solver   | `control/tinympc-rs/`    | ADMM, no_std, const-generic dimensions                        |
@@ -697,3 +696,42 @@ followed the driver into the armed flight loop. It emits eight
 interrupts-off, repeating, in flight. Now gated behind the `motor-test`
 feature. The 10 Hz telemetry log in `control_loop` has the same blocking
 property and predates the cutover; it should get the same treatment.
+
+### 2026-08-08 (later still) — DShot600, measured `dt`, telemetry decoder retired
+
+Three follow-ups after the cutover, all bench-driven:
+
+**DShot600.** At DShot300 a bidirectional frame was ~181 µs against the
+8 kHz loop's 125 µs period, so the loop could not hold its rate. `TX_ARR`
+265→132 and `RX_ARR` 212→106 give ~91 µs. ESCs auto-detect the bit rate,
+so no ESC-side change was needed. Note the ESC turnaround is a *fixed*
+delay, so halving the sample period doubles the share of the RX buffer it
+consumes: the first falling edge moved from sample 26 to 51, both ≈23 µs.
+
+**Measured `dt`.** `control_loop` hardcoded `dt = 0.000125` while awaiting
+a DShot frame each iteration, and `mekf_task` measured its predict step
+with `Instant::now()`. Both are now DWT cycle counts. embassy-time is
+configured `tick-hz-32_768` — one tick is 30.5 µs, so a true 125 µs
+interval read as 122 or 153 µs, which is worse than the constant it would
+have replaced. `CORE_HZ` must track `board_config`: the M7 core and DWT
+run at SYSCLK (480 MHz), not the 240 MHz AHB.
+
+**`dshot_telemetry.rs` deleted.** It was the decode half of the retired
+timer-DMA driver and had no callers. Its wire-format documentation moved
+into `dshot_bb_decode.rs`, and its external reference vector (uf-dshot,
+raw 0x15EA6F → 0xB83F) became a test there — the first fixed vector in
+that module's suite, which until now was self-consistent only. Note that
+vector anchors the *quintet table* alone: 0xB83F is not a CRC-valid frame,
+so it cannot be pushed through `decode` end to end.
+
+**M4 telemetry, still open.** Its ESC drives motors correctly at DShot600
+and a scope shows an eRPM response on the wire, but our capture holds only
+4–8 samples of noise at wandering positions 71–100, where a healthy reply
+occupies ~52 contiguous samples between the leading idle (51) and trailing
+idle (37). A truncated reply would fill the rest of the buffer with
+alternating runs; this does not. So the reply falls outside the 62.4 µs
+window entirely. `RX_SAMPLES` now overrides the window width at build time
+to test that (`RX_SAMPLES=400 BIDIR=1 LOOP_KHZ=2`, bench only — 400 samples
+is 178 µs and does not fit the flight period). Current intention is to
+swap the ESC regardless: one unit of four needing 3× its siblings'
+turnaround is not something the flight firmware should be shaped around.
