@@ -50,9 +50,18 @@ const TX_ARR: u32 = 265;
 /// `outputFreq * 5 * 2 * OVER_SAMPLE / 24`, which is `outputFreq × 5/4`.)
 const RX_ARR: u32 = 212;
 
-/// Frame count at which `send_and_receive` dumps a one-shot RX probe, so the
-/// bench run reports what arrived without needing a scope.
-const RX_PROBE_FRAME: u32 = 100;
+/// Frame counts at which `send_and_receive` dumps an RX probe, so the bench
+/// run reports what arrived without needing a scope.
+///
+/// These are deliberately late and repeating. The original one-shot at frame
+/// 100 fired ~50 ms in, inside the ESC's power-on/beep sequence, and read
+/// "0 transitions" on a link that was in fact healthy — a false "ESC silent"
+/// that only went uncaught because another motor happened to work. At
+/// LOOP_KHZ=2 the arming stream is 3 s = 6000 frames, so 8000 lands ~1 s into
+/// the drive phase and every 4000 after is one probe per 2 s. Repeating also
+/// catches *intermittent* replies, which a one-shot cannot.
+const RX_PROBE_START: u32 = 8000;
+const RX_PROBE_EVERY: u32 = 4000;
 
 /// Cache-line-aligned TX buffer. H7 DMA requires 32-byte alignment for clean
 /// cache maintenance; do not assume D-cache is disabled.
@@ -246,18 +255,40 @@ impl<'d> DshotBitbang<'d> {
             }
         });
 
-        if self.frame_count == RX_PROBE_FRAME {
-            let m1_low = rx.iter().filter(|&&s| s & 1 == 0).count();
-            let transitions = rx.windows(2).filter(|w| (w[0] ^ w[1]) & 1 != 0).count();
-            defmt::info!(
-                "bitbang RX probe: {=usize} of {=usize} samples low on M1, {=usize} transitions",
-                m1_low, RX_BUF_LEN, transitions,
-            );
-            defmt::info!(
-                "  first 16 samples (M1 bit): {=u16:016b}",
-                rx.iter().take(16).enumerate()
-                    .fold(0u16, |acc, (i, &s)| acc | (((s & 1) as u16) << i)),
-            );
+        if self.frame_count >= RX_PROBE_START && self.frame_count % RX_PROBE_EVERY == 0 {
+            // Per-pin, because a NoSignal on one motor and clean eRPM on
+            // another is the case worth telling apart: zero transitions means
+            // nothing came back at all (ESC config or wiring), whereas
+            // transitions plus a failed decode means the samples arrived but
+            // the reconstruction is off.
+            for (i, p) in MOTOR_PINS.iter().enumerate() {
+                let m = 1u16 << p;
+                let low = rx.iter().filter(|&&s| s & m == 0).count();
+                let transitions = rx.windows(2).filter(|w| (w[0] ^ w[1]) & m != 0).count();
+                defmt::info!(
+                    "bitbang RX probe M{=usize}: {=usize}/{=usize} low, {=usize} transitions",
+                    i + 1,
+                    low,
+                    RX_BUF_LEN,
+                    transitions,
+                );
+                // Dump from the first falling edge, not from index 0. The ESC
+                // turnaround is ~30 us (~34 samples), so the head of the
+                // buffer is always idle and dumping it showed all-ones on a
+                // working link. MSB-first so the printout reads left-to-right
+                // in time order.
+                match rx.iter().position(|&s| s & m == 0) {
+                    Some(idx) => defmt::info!(
+                        "  M{=usize}16 samples from edge @{=usize}: {=u16:016b}",
+                        i + 1,
+                        idx,
+                        rx[idx..].iter().take(16).enumerate().fold(0u16, |acc, (k, &s)| {
+                            if s & m != 0 { acc | (1 << (15 - k)) } else { acc }
+                        }),
+                    ),
+                    None => defmt::info!("  M{=usize}: no falling edge in window", i + 1),
+                }
+            }
         }
 
         *rx
