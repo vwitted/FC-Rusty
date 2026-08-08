@@ -6,7 +6,10 @@
 // every state period. DMA writes 32-bit BSRR words to GPIOA, producing the
 // waveform directly. The motor pins are plain GPIO throughout — never in
 // alternate-function mode — which is why none of the compare-register or
-// AF-handover failure modes of dshot_hw.rs exist here.
+// AF-handover failure modes of the retired timer-output-compare driver
+// exist here. That driver (a port of BF's `pwm_output_dshot_hal.c`) never
+// got bidir working and was removed in the 2026-08-08 cutover; it survives
+// on `archive/dakefpv-h743-timer-dma-dshot` if the history is ever needed.
 //
 // M1..M4 are PA0..PA3, one port, so all four motors share one buffer and one
 // DMA stream. Per-pin data lives in the middle state of each symbol.

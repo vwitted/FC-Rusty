@@ -20,12 +20,14 @@
 //   IMU2 on SPI4 (SCK=PE12, MISO=PE13, MOSI=PE14, CS=PB1) — ROTATION_PITCH_180
 // Both are read at 8 kHz and averaged for √2 noise reduction.
 //
-// Motors (DShot600 via a single timer multi-channel burst):
-//   TIM2_CH1 → PA0 → M1
-//   TIM2_CH2 → PA1 → M2
-//   TIM2_CH3 → PA2 → M3
-//   TIM2_CH4 → PA3 → M4
-//   See src/drivers/dshot_hw.rs for DMA stream / timing details.
+// Motors (DShot300, bit-banged — TIM1 paces DMA writes to GPIOA's BSRR;
+// the pins are plain GPIO, never in alternate-function mode):
+//   PA0 → M1
+//   PA1 → M2
+//   PA2 → M3
+//   PA3 → M4
+//   All four share one buffer and one DMA stream (DMA2_CH2) because they
+//   are on one port. See src/drivers/dshot_bitbang.rs for timing details.
 //
 // Flashing: board has no SWD; use DFU over USB-C. Hold BOOT while
 // plugging in, then run `scripts/flash-dfu.sh` (see that script for
@@ -56,9 +58,7 @@ mod drivers {
     pub mod dshot_bb_decode;
     pub mod dshot_bb_frame;
     pub mod dshot_bitbang;
-    pub mod dshot_diag;
     pub mod dshot_frame;
-    pub mod dshot_hw;
     pub mod dshot_telemetry;
     pub mod icm42688;
     pub mod ism6hg256x;
@@ -106,8 +106,8 @@ use control::position::{PositionController, PositionGains};
 use drivers::baro::{self, BaroSample};
 use drivers::crsf::RcChannels;
 use drivers::lis2mdl::{Lis2mdl, MagSample, Orientation as MagOrientation};
-use drivers::dshot_frame::{DshotFrame, DshotSpeed};
-use drivers::dshot_hw::DshotQuad;
+use drivers::dshot_bitbang::DshotBitbang;
+use drivers::dshot_frame::DshotFrame;
 use drivers::icm42688::RawImu;
 use drivers::nmea::{FixMode, GpsData, NmeaParser};
 use drivers::wt901b::{
@@ -180,9 +180,15 @@ const FAILSAFE_BLIND_THROTTLE_FRAC: f32 = 0.9;
 
 // ---- DShot configuration ----
 /// Set `true` for bidir DShot (line idles HIGH, telemetry-request bit
-/// set, inverted CRC, and an input-capture RX phase after each frame).
+/// set, inverted CRC, and a sampled RX phase after each frame).
 /// Must match the ESC's EEPROM config from BLHeli/BlueJay/AM32. When
 /// false the driver runs the plain non-bidir TX-only path.
+///
+/// This flag is load-bearing beyond telemetry: with bidir the ESC drives
+/// the line low to reply, so the RX phase (which puts the pins back to
+/// INPUT) must run after *every* frame. Skipping it would leave our
+/// push-pull output fighting the ESC. Hence the `if DSHOT_BIDIR` branches
+/// in `control_loop` rather than an unconditional `send()`.
 const DSHOT_BIDIR: bool = true;
 
 // ---- Interrupt bindings ----
@@ -567,30 +573,17 @@ async fn main(spawner: Spawner) {
     spawner.spawn(gps_task(gps_rx)).unwrap();
     defmt::info!("GPS task spawned (NMEA at 9600)");
 
-    // DShot ESC outputs (all 4 channels on TIM2).
-    //   TIM2 CH1 → PA0 → M1 (DMA1_CH2)
-    //   TIM2 CH2 → PA1 → M2 (DMA1_CH3)
-    //   TIM2 CH3 → PA2 → M3 (DMA1_CH4)
-    //   TIM2 CH4 → PA3 → M4 (DMA1_CH7)
-    // Per-channel CC DMA (BF-style port), four DMA1 streams.
-    let dshot = DshotQuad::new(
-        p.TIM2,
-        p.PA0,      // CH1 → M1
-        p.PA1,      // CH2 → M2
-        p.PA2,      // CH3 → M3
-        p.PA3,      // CH4 → M4
-        p.DMA1_CH2, // TIM2_CH1 → M1
-        p.DMA1_CH3, // TIM2_CH2 → M2
-        p.DMA1_CH4, // TIM2_CH3 → M3
-        p.DMA1_CH7, // TIM2_CH4 → M4
-        DshotSpeed::Dshot600,
+    // DShot ESC outputs, bit-banged on PA0..PA3 (M1..M4). TIM1 is a pacer
+    // only — it drives no pin; DMA2_CH2 writes BSRR words to GPIOA at each
+    // update event. One port, so one buffer and one stream for all four.
+    let dshot = DshotBitbang::new(
+        p.TIM1,
+        p.DMA2_CH2,
+        p.PA0, // M1
+        p.PA1, // M2
+        p.PA2, // M3
+        p.PA3, // M4
         DSHOT_BIDIR,
-    );
-
-    dshot.log_config();
-    defmt::info!(
-        "DShot initialised on TIM2 (4 per-channel CC DMA streams, bidir={=bool})",
-        DSHOT_BIDIR
     );
 
     // ---- Run the 50 Hz outer loop as a spawned task ----
@@ -2550,7 +2543,7 @@ async fn navigation_task() {
 // Reads the latest target rates and thrust from the outer loop, runs
 // the rate PID, and pushes commands to the ESCs via DShot.
 
-async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
+async fn control_loop(mut dshot: DshotBitbang<'static>) -> ! {
     defmt::info!("Fast inner loop started (8 kHz synced to IMU_DATA)");
 
     // ---- PID rate inner loop (8 kHz) ----
@@ -2626,27 +2619,38 @@ async fn control_loop(mut dshot: DshotQuad<'static>) -> ! {
                 DshotFrame::from_normalised(motor_outputs.motors[i], DSHOT_BIDIR)
             });
 
-            let telemetry = dshot.send_throttles_and_receive(frames).await;
+            if DSHOT_BIDIR {
+                let telemetry = dshot.send_and_decode(frames).await;
 
-            // Telemetry log at ~10 Hz (every 800 frames at 8 kHz). Each
-            // per-motor result is Erpm{period_us} / NoEdge / InvalidGcr
-            // / InvalidCrc — the key signal that bidir RX is decoding.
-            use core::sync::atomic::{AtomicU32, Ordering};
-            static TELEM_LOG_N: AtomicU32 = AtomicU32::new(0);
-            let n = TELEM_LOG_N.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-            if DSHOT_BIDIR && n.is_multiple_of(800) {
-                defmt::info!(
-                    "DShot RX: M1={=?} M2={=?} M3={=?} M4={=?}",
-                    telemetry[0],
-                    telemetry[1],
-                    telemetry[2],
-                    telemetry[3],
-                );
+                // Telemetry log at ~10 Hz (every 800 frames at 8 kHz). Each
+                // per-motor result is Erpm{period_us} / NoSignal / InvalidGcr
+                // / InvalidCrc — the key signal that bidir RX is decoding.
+                use core::sync::atomic::{AtomicU32, Ordering};
+                static TELEM_LOG_N: AtomicU32 = AtomicU32::new(0);
+                let n = TELEM_LOG_N.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                if n.is_multiple_of(800) {
+                    defmt::info!(
+                        "DShot RX: M1={=?} M2={=?} M3={=?} M4={=?}",
+                        telemetry[0],
+                        telemetry[1],
+                        telemetry[2],
+                        telemetry[3],
+                    );
+                }
+            } else {
+                dshot.send(frames).await;
             }
         } else {
             rate_pid.reset();
             let frames: [DshotFrame; 4] = [DshotFrame::motor_stop(DSHOT_BIDIR); 4];
-            let _ = dshot.send_throttles_and_receive(frames).await;
+            // Disarmed still runs the RX phase under bidir: the ESC replies
+            // to every frame, armed or not, and the line must be released
+            // for it. The decoded result is discarded.
+            if DSHOT_BIDIR {
+                dshot.send_and_receive(frames).await;
+            } else {
+                dshot.send(frames).await;
+            }
         }
     }
 }

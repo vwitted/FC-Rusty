@@ -23,7 +23,7 @@ fn main() {
 /// changed value invalidate the build.
 fn emit_motor_test_env_deps() {
     for var in [
-        "M1_PCT", "M2_PCT", "M3_PCT", "M4_PCT", "BIDIR", "LOOP_KHZ", "DEADTIME_US", "DRIVER",
+        "M1_PCT", "M2_PCT", "M3_PCT", "M4_PCT", "BIDIR", "LOOP_KHZ", "DEADTIME_US",
     ] {
         println!("cargo:rerun-if-env-changed={var}");
     }

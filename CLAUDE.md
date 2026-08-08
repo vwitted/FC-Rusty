@@ -55,6 +55,14 @@ is what prevents regressions.
   the GPS, and the ST-Link. If you're writing code or docs that
   touch ESC wiring, carry this warning forward.
 
+### DShot
+
+- **DShot is bit-banged, not timer output-compare.** BF resolves
+  `dshot_bitbang = AUTO` to bit-banging on everything after F4, so the
+  timer-DMA path (`pwm_output_dshot_hal.c`) is not the reference for this
+  board — `dshot_bitbang.c` is. A week was lost in July 2026 porting the
+  wrong one.
+
 ### Git / destructive operations
 
 - Default to creating new commits, not amending.
@@ -94,7 +102,10 @@ Disable it (`--no-default-features`) when building on the host.
 - `src/estimation.rs` — 6-state PosKF.
 - `src/attitude_mekf.rs` — quaternion MEKF (gyro-bias state).
 - `src/drivers/` — ICM-42688P, DPS310, CRSF, NMEA, WT901B (fallback),
-  DShot.
+  DShot. The DShot driver is `dshot_bitbang.rs` (TIM1-paced DMA to
+  GPIOA BSRR/IDR) with `dshot_bb_frame.rs` building the BSRR words and
+  `dshot_bb_decode.rs` decoding the bidir reply; `dshot_frame.rs` is
+  the shared 16-bit frame encoder.
 - `src/sim/` — host-side 6DOF physics + sensor models.
 - `src/control/tinympc-rs/` — no_std MPC solver (vendored).
 - `examples/sim_*.rs` — host sim harnesses.

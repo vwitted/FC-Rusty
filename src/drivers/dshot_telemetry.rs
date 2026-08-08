@@ -26,10 +26,13 @@
 //   - BLHeli_S source (esp. `BLHeli_S.asm` telemetry transmit
 //     routines)
 //
-// This module exposes the well-tested encoding/decoding **logic**
-// (GCR symbol table, payload parsing). The wire-side bit-stream
-// reconstruction (from captured edges) is in `dshot_hw.rs` and is
-// architecture-dependent (TIM input-capture vs GPIO IDR DMA).
+// NOTE: nothing calls this module. It was the decode half of the
+// retired timer-DMA driver; the live bidir path is
+// `dshot_bb_decode.rs`, which carries its own copy of the GCR table
+// and CRC because it reconstructs bits from oversampled IDR runs
+// rather than from captured edges. Kept for the prose above and as a
+// second, independently-written reference for the same wire format —
+// delete it if it ever starts drifting from `dshot_bb_decode.rs`.
 
 /// GCR 5-bit → 4-bit decode table. 0xFF marks invalid symbols
 /// (every 5-bit pattern not in the BLHeli encoding alphabet).

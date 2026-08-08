@@ -6,10 +6,10 @@
 // rate, so a run of N samples at one level is round(N / OVERSAMPLE) bit
 // times.
 //
-// Reconstruction mirrors `dshot_hw::decode_telemetry`: each run of n bit
-// times emits a `1` followed by n-1 zeros, which performs the transition
-// decode inline — so the quintet table and CRC below are the same ones the
-// timer-DMA driver uses.
+// Reconstruction works by run length: each run of n bit times emits a `1`
+// followed by n-1 zeros, which performs the transition decode inline. The
+// quintet table and CRC below are the standard BLHeli ones (the same values
+// `dshot_telemetry.rs` documents at length).
 
 /// Samples per GCR bit (BF: `DSHOT_BITBANG_TELEMETRY_OVER_SAMPLE`).
 pub const OVERSAMPLE: usize = 3;
