@@ -14,7 +14,40 @@
 /// Samples per GCR bit (BF: `DSHOT_BITBANG_TELEMETRY_OVER_SAMPLE`).
 pub const OVERSAMPLE: usize = 3;
 /// Samples captured per response window (BF: `DSHOT_BB_PORT_IP_BUF_LENGTH`).
-pub const RX_BUF_LEN: usize = 140;
+///
+/// 140 samples at the DShot600 receive rate (445.8 ns each) is a 62.4 µs
+/// window. A healthy ESC answers at ~22.7 µs and its 21-bit reply occupies
+/// ~52 samples, so the default has ample margin and fits the 8 kHz flight
+/// loop budget.
+///
+/// Overridable at build time (`RX_SAMPLES=400 ./scripts/flash-motor-test.sh`)
+/// purely as a bench instrument: if an ESC answers *later* than the window,
+/// its reply is invisible to us while still plainly present on a scope, and
+/// the only way to tell that apart from a dead telemetry line is to widen the
+/// window and look. Do not raise this for flight — the window is awaited
+/// inside the control loop, so 400 samples is 178 µs and blows the 125 µs
+/// period. Pair a raised value with `LOOP_KHZ=2`.
+pub const RX_BUF_LEN: usize = parse_rx_samples();
+
+const fn parse_rx_samples() -> usize {
+    let Some(s) = option_env!("RX_SAMPLES") else {
+        return 140;
+    };
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut v: usize = 0;
+    if b.is_empty() {
+        return 140;
+    }
+    while i < b.len() {
+        if b[i] < b'0' || b[i] > b'9' {
+            return 140;
+        }
+        v = v * 10 + (b[i] - b'0') as usize;
+        i += 1;
+    }
+    if v < 64 { 140 } else { v }
+}
 /// GCR bits in one reply.
 pub const GCR_BITS: usize = 21;
 
