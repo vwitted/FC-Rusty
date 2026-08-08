@@ -595,3 +595,56 @@ that BF defaults away from it on every family after F4.
   than the ESC.
 - Idle probe, transmit-setup pad trace, and RX loopback self-test, all
   gated to single frames inside the MotorStop arming window.
+
+### 2026-08-08 — bidirectional DShot works on the bit-banged driver
+
+Bidirectional DShot now works on the bit-banged driver
+(`src/drivers/dshot_bitbang.rs` + `src/drivers/dshot_bb_decode.rs`). The
+older timer-DMA driver (`dshot_hw.rs`), the subject of the investigation
+above, never achieved it and remains unfixed; plain (non-bidir) DShot
+does work there.
+
+The rewrite happened because of the 2026-08-02 finding above: Betaflight
+resolves `dshot_bitbang = AUTO` to bit-banging on everything after F4,
+including H7, so the whole timer-DMA port was built against the wrong
+reference. In the bitbang design the timer is only a pacer; DMA writes
+BSRR words to GPIOA to produce the waveform and reads IDR with 3×
+oversampling to capture the reply.
+
+Measured/derived timing actually in the code: TX pacer ARR=265 (240 MHz
+/ 266 = 902 kHz state rate, 3 states per bit = 3.325 µs/bit = DShot300,
++0.25% fast). RX pacer ARR=212 (1.125 MHz = reply rate 5/4 × 300 kHz,
+oversampled 3×). One frame is 51 states = 56.5 µs; the RX window is 140
+samples = 124 µs.
+
+Bench result 2026-08-08 with `DRIVER=bitbang BIDIR=1 LOOP_KHZ=2`: motors
+ran and reply data resembling eRPM appeared on the scope after the
+frame. Caveat: one of the four motors was physically unsoldered on the
+bench rig, so this was a 3-of-4 result, not a clean sweep. Decoded
+telemetry has **not** yet been confirmed in the logs — that remains the
+pending bench gate. This entry adds the decode wrapper
+(`DshotBitbang::send_and_decode`, commit `6f5cb61`) and wires it into the
+bitbang drive loop in `motor_test.rs`, logging
+`motor-test RX [bitbang]: M1=… M2=… M3=… M4=…` at ~10 Hz; the arming
+loop still calls the undecoded `send_and_receive`, mirroring the timer
+path's arming loop, which also doesn't decode or log. Bench-verifying
+that log line is still open.
+
+Three defects were found in the implementation plan document itself
+during execution, worth recording as a caution about that document: a
+GCR test-encoder helper that drove the line HIGH at frame start when a
+real ESC pulls it LOW; PAC type errors (TIM1 needs `ArrCore`/`CntCore`
+newtypes, TIM2 does not); and `Transfer::new_read` requiring
+`peri_addr: *mut W`, not `*const W`.
+
+One code-review finding was raised as Critical and then downgraded to
+Minor after the bench disproved it: a predicted stray pulse in the idle
+gap from the input→output MODER switch. It did not appear. The reviewer
+had cited the Betaflight hold-states rationale as its mechanism, but
+that rationale is explicitly about the transition *to* an input, which
+the hold states already cover — not the transition back to output. That
+distinction has now misled one reviewer; worth checking carefully before
+citing it again.
+
+Still outstanding: the driver is bench-only (`motor-test` feature), not
+yet wired into the flight path — that's Task 6.
