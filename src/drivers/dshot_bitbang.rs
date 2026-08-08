@@ -33,7 +33,7 @@ use embassy_stm32::Peri;
 use embassy_stm32::pac;
 use embassy_stm32::peripherals::{DMA2_CH2, PA0, PA1, PA2, PA3, TIM1};
 
-use super::dshot_bb_decode::RX_BUF_LEN;
+use super::dshot_bb_decode::{BbTelemetry, RX_BUF_LEN, decode};
 use super::dshot_bb_frame::{BB_BUF_LEN, output_data_clear, output_data_init, output_data_set};
 use super::dshot_frame::DshotFrame;
 
@@ -261,6 +261,12 @@ impl<'d> DshotBitbang<'d> {
         }
 
         *rx
+    }
+
+    /// Send one frame and decode all four replies.
+    pub async fn send_and_decode(&mut self, frames: [DshotFrame; 4]) -> [BbTelemetry; 4] {
+        let rx = self.send_and_receive(frames).await;
+        core::array::from_fn(|i| decode(&rx[..], MOTOR_PINS[i]))
     }
 }
 

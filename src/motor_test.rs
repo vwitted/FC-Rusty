@@ -222,7 +222,17 @@ pub async fn run(p: embassy_stm32::Peripherals) -> ! {
         defmt::info!("motor-test: driving motors [bitbang]");
         loop {
             if cfg.bidir {
-                dshot.send_and_receive(frames).await;
+                let telem = dshot.send_and_decode(frames).await;
+                n = n.wrapping_add(1);
+                if n % log_every == 0 {
+                    defmt::info!(
+                        "motor-test RX [bitbang]: M1={=?} M2={=?} M3={=?} M4={=?}",
+                        telem[0],
+                        telem[1],
+                        telem[2],
+                        telem[3],
+                    );
+                }
             } else {
                 dshot.send(frames).await;
             }
