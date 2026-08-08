@@ -279,7 +279,7 @@ impl<'d> DshotBitbang<'d> {
                 // in time order.
                 match rx.iter().position(|&s| s & m == 0) {
                     Some(idx) => defmt::info!(
-                        "  M{=usize}16 samples from edge @{=usize}: {=u16:016b}",
+                        "  M{=usize}: 16 samples from edge @{=usize}: {=u16:016b}",
                         i + 1,
                         idx,
                         rx[idx..].iter().take(16).enumerate().fold(0u16, |acc, (k, &s)| {
