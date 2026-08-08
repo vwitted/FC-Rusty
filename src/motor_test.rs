@@ -172,6 +172,14 @@ pub async fn run(p: embassy_stm32::Peripherals) -> ! {
 
     let cfg = resolve_config();
 
+    // Build stamp first, before anything else can scroll it away. A stale
+    // board decoded against a fresh ELF yields garbage — defmt resolves
+    // format strings by index, so a shifted index prints one log line's
+    // arguments through another's format string, which reads as a plausible
+    // but nonsensical hardware result rather than as an error. Compare this
+    // against the stamp echoed by scripts/flash-motor-test.sh.
+    defmt::info!("motor-test build: [{=str}]", env!("FC_BUILD_STAMP"));
+
     defmt::warn!(
         "MOTOR TEST — REMOVE PROPS. Spinning in 5s: M1={}% M2={}% M3={}% M4={}% bidir={} loop={}kHz",
         cfg.motor_pct[0],
