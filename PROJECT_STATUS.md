@@ -22,7 +22,7 @@ material hardware or design change lands (see `CLAUDE.md`).
 | SPI1 + PA4             | ICM-42688P IMU1 (onboard)         | ✅ verified — 8 kHz reads, MEKF fusing         |
 | SPI4 + PB1             | ICM-42688P IMU2 (onboard)         | ✅ verified — 8 kHz reads, averaged with IMU1  |
 | I2C2 (PB10/PB11)       | SPL06 barometer (onboard)         | ✅ proper driver — 128 Hz, correct calibration              |
-| TIM2 (PA0/PA1/PA2/PA3) | DShot600, motors M1–M4            | ⚠️ BF-style per-channel CC DMA port (bidir-capable); non-bidir motor spin verified pre-port, bidir RX decode unverified on HW |
+| PA0/PA1/PA2/PA3 (GPIO) | DShot300 bit-banged, motors M1–M4 | ✅ bidir verified 2026-08-08 — decoded eRPM on M1/M2/M3; M4 returns no reply (off-chip fault, open). TIM1 is a pacer only; DMA2_CH2 drives BSRR / samples IDR |
 | PD10                   | Status LED (active low)           | ✅ heartbeat blink task                        |
 | USB-C                  | DFU flashing                      | ✅ verified — no SWD on this board             |
 | UART4 (PD1/PD0)        | DisplayPort / VTX (T4/R4)         | ⚪ not wired                                   |
@@ -349,9 +349,11 @@ All host-tested (`cargo test --lib --no-default-features --target x86_64-unknown
 | ISM6HG256X driver | `drivers/ism6hg256x.rs` | ±16 g / ±4000 dps / 7.68 kHz, SPI; written for Beta breakout, unreferenced |
 | LIS2MDL driver   | `drivers/lis2mdl.rs`     | 3-axis mag, I2C addr 0x1E, 100 Hz HR + LPF + OFF_CANC; wired into baro_task + fused in MEKF for yaw |
 | IMU LPF          | `imu_filter.rs`          | 2nd-order Butterworth biquad bank on the fused dual-IMU stream; 150 Hz gyro / 25 Hz accel default |
-| DShot driver     | `drivers/dshot_hw.rs`    | TIM2 per-channel CC DMA (4 streams, CCxDE), DShot600, bidir-capable; line-by-line BF `pwm_output_dshot_hal.c` port |
+| DShot driver     | `drivers/dshot_bitbang.rs` | TIM1 as pacer only; DMA2_CH2 writes BSRR to GPIOA, reads IDR 3× oversampled. DShot300, bidir working on hardware. Replaced the timer-output-compare driver on 2026-08-08 |
+| DShot BSRR frame | `drivers/dshot_bb_frame.rs` | Pure builder: 51 BSRR words per frame (16 bits × 3 states + 3 hold); inversion is a half-word swap |
+| DShot GCR decode | `drivers/dshot_bb_decode.rs` | Pure decoder: samples → 21 GCR bits → quintets → eRPM period. No EDT frame-type discrimination yet |
 | DShot frame      | `drivers/dshot_frame.rs` | 16-bit frame encoder, bidir CRC inversion; MSB-first wire unpack |
-| DShot telemetry  | `drivers/dshot_telemetry.rs` | GCR 5→4 decode + EDT/eRPM payload parse + period→RPM |
+| DShot telemetry  | `drivers/dshot_telemetry.rs` | GCR 5→4 decode + EDT/eRPM payload parse + period→RPM. **Orphaned** since the cutover — no callers |
 | Physics sim      | `sim/sim.rs`             | 6DOF rigid body, τ=30ms motor lag, NED, ground collision     |
 | Sensor sim       | `sim/sensors.rs`         | GPS (10 Hz + noise), baro (50 Hz + noise/drift), xorshift64  |
 | TinyMPC solver   | `control/tinympc-rs/`    | ADMM, no_std, const-generic dimensions                        |
@@ -617,7 +619,9 @@ Measured/derived timing actually in the code: TX pacer ARR=265 (240 MHz
 oversampled 3×). One frame is 51 states = 56.5 µs; the RX window is 140
 samples = 124 µs.
 
-Bench result 2026-08-08 with `DRIVER=bitbang BIDIR=1 LOOP_KHZ=2`: motors
+Bench result 2026-08-08 with `BIDIR=1 LOOP_KHZ=2` (at the time this also
+took `DRIVER=bitbang`; the timer driver was retired later the same day and
+that variable no longer exists): motors
 ran and reply data resembling eRPM appeared on the scope after the
 frame. Caveat: one of the four motors was physically unsoldered on the
 bench rig, so this was a 3-of-4 result, not a clean sweep. Decoded
@@ -648,3 +652,48 @@ citing it again.
 
 Still outstanding: the driver is bench-only (`motor-test` feature), not
 yet wired into the flight path — that's Task 6.
+
+### 2026-08-08 (later) — cutover: timer-DMA DShot retired
+
+The bit-banged driver replaced `dshot_hw.rs` on the flight path.
+`dshot_hw.rs` and `dshot_diag.rs` are deleted; `dshot_frame.rs` stays
+(shared encoder). Work moved to branch `dakefpv-h743-bitbang-dshot`;
+the pre-cutover tree is preserved on `archive/dakefpv-h743-timer-dma-dshot`
+and, more portably, at commit `bbf2d2b`.
+
+Justification for deleting rather than keeping a fallback: the bitbang
+driver covers *both* modes. Plain DShot (`BIDIR=0`) was the Task 3 bench
+gate and motors spun; bidirectional was verified with decoded eRPM on
+three channels. So the timer driver was redundant, not a safety net.
+
+Bench state at cutover: M1/M2/M3 return stable eRPM ~3900–4100 µs at 5%
+throttle (≈15,200 eRPM ≈ 2,170 mechanical RPM on a 14-pole motor). M4
+returns `NoSignal` — its line never goes low in any of the 140 samples,
+across every probe burst. Since all four pins are read from one `IDR`
+word in a single DMA transfer with `MODER` written for all four together,
+there is no per-channel code path that could single out M4, so this is
+an off-chip fault. Two candidates were considered and both weakened:
+ESC-side bidir config (there is none — ESCs auto-detect the inverted
+signalling) and a broken signal wire (M4 spins at the correct frequency,
+so TX arrives intact). The asymmetry worth probing is that the MCU drives
+push-pull both ways while the ESC only pulls *low* against our internal
+pull-up, so a degraded path can pass TX and still fail RX. Unresolved;
+scope the M4 pad during the receive window.
+
+**Open, and load-bearing for flight:** `control_loop` hardcodes
+`dt = 0.000125` (8 kHz), but a bidirectional DShot300 frame is ~181 µs
+(TX 56.5 + RX 124.2) against a 125 µs period. The loop cannot hold 8 kHz;
+because `IMU_DATA` is a latest-value `Signal` it free-runs at ~5.5 kHz and
+drops gyro samples rather than lagging. The rate PID then sees
+non-uniformly sampled gyro *and* a `dt` wrong by ~45%. Fix under
+consideration is DShot600 (`TX_ARR` 265→132, `RX_ARR` 212→106, total
+~91 µs) plus a measured rather than hardcoded `dt`. **Do not read
+anything into 8 kHz inner-loop behaviour until this is settled.**
+
+A code review of the cutover also caught that the bench RX probe had
+followed the driver into the armed flight loop. It emits eight
+`defmt::info!` lines, and `logger::putc` busy-waits on USART6 TXE at
+115200 baud inside a global `critical_section` — milliseconds of
+interrupts-off, repeating, in flight. Now gated behind the `motor-test`
+feature. The 10 Hz telemetry log in `control_loop` has the same blocking
+property and predates the cutover; it should get the same treatment.

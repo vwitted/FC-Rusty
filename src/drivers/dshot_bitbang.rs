@@ -9,7 +9,9 @@
 // AF-handover failure modes of the retired timer-output-compare driver
 // exist here. That driver (a port of BF's `pwm_output_dshot_hal.c`) never
 // got bidir working and was removed in the 2026-08-08 cutover; it survives
-// on `archive/dakefpv-h743-timer-dma-dshot` if the history is ever needed.
+// at `bbf2d2b:src/drivers/dshot_hw.rs` if the history is ever needed (that
+// commit is an ancestor of this branch, so it is reachable in any clone —
+// unlike a branch name, which may be local to one machine).
 //
 // M1..M4 are PA0..PA3, one port, so all four motors share one buffer and one
 // DMA stream. Per-pin data lives in the middle state of each symbol.
@@ -258,6 +260,14 @@ impl<'d> DshotBitbang<'d> {
             }
         });
 
+        // Bench only, and it must stay that way. `logger::putc` busy-waits on
+        // USART6 TXE at 115200 baud (~87 us/byte) inside a global
+        // `critical_section`, so these eight lines hold interrupts off for
+        // milliseconds. At 2 kHz on the bench that is harmless; in the armed
+        // 8 kHz flight loop it would stall the inner loop for tens of
+        // iterations, and because IMU_DATA is a latest-value Signal the gyro
+        // samples produced during the stall are lost outright.
+        #[cfg(feature = "motor-test")]
         if self.frame_count >= RX_PROBE_START && self.frame_count % RX_PROBE_EVERY == 0 {
             // Per-pin, because a NoSignal on one motor and clean eRPM on
             // another is the case worth telling apart: zero transitions means
