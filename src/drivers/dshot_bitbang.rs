@@ -16,8 +16,8 @@
 // M1..M4 are PA0..PA3, one port, so all four motors share one buffer and one
 // DMA stream. Per-pin data lives in the middle state of each symbol.
 //
-// Timing (DShot300, TIM1 at 240 MHz): 3 states per symbol → 900 kHz pacer,
-// ARR = 240e6/900e3 - 1 = 265.
+// Timing (DShot600, TIM1 at 240 MHz): 3 states per symbol → 1.8 MHz pacer,
+// ARR = 240e6/1.8e6 - 1 = 132. See TX_ARR/RX_ARR for why 600 and not 300.
 //
 // --- Step 1 probe result (embassy-stm32 0.4.0) ---
 // `UpDma` lives at `embassy_stm32::timer::UpDma` (defined via the
@@ -46,14 +46,29 @@ use super::dshot_frame::DshotFrame;
 const PORT_MASK: u16 = 0b1111;
 const MOTOR_PINS: [u8; 4] = [0, 1, 2, 3];
 
-/// TIM1 counter period for the transmit pacer. 240 MHz / 900 kHz - 1.
-const TX_ARR: u32 = 265;
+/// TIM1 counter period for the transmit pacer. 3 states per bit at 600 kbit/s
+/// is a 1.8 MHz state rate; 240 MHz / 1.8 MHz - 1 = 132.3 → 132, giving
+/// 240e6/133 = 1.8045 MHz (601.5 kbit/s, +0.25%). Frame = 51 states = 28.3 µs.
+///
+/// DShot600, not 300, because the flight loop runs at 8 kHz = 125 µs and a
+/// bidirectional frame must fit inside that with room for MEKF and PID. At
+/// DShot300 the frame was ~181 µs and the loop could not hold its rate.
+/// ESCs auto-detect the bit rate, so this needs no ESC-side change.
+const TX_ARR: u32 = 132;
 
 /// TIM1 counter period for the receive pacer. The reply runs at 5/4 the DShot
-/// bit rate and we oversample 3×, so 300 kHz × 5/4 × 3 = 1.125 MHz.
-/// 240 MHz / 1.125 MHz - 1 = 212. (BF derives this as
+/// bit rate and we oversample 3×, so 600 kHz × 5/4 × 3 = 2.25 MHz.
+/// 240 MHz / 2.25 MHz - 1 = 105.7 → 106. (BF derives this as
 /// `outputFreq * 5 * 2 * OVER_SAMPLE / 24`, which is `outputFreq × 5/4`.)
-const RX_ARR: u32 = 212;
+///
+/// Window budget, and the thing to watch on the bench: the ESC's turnaround
+/// is a fixed delay, so halving the sample period doubles how much of the
+/// buffer it eats. At DShot300 the first falling edge landed consistently at
+/// sample 26-27 = 23-24 µs; at this rate (445.8 ns/sample) that same delay is
+/// ~53 samples, plus 21 GCR bits × 3 = 63, leaving ~24 of RX_BUF_LEN spare.
+/// Comfortable, but if a slower ESC pushes the edge past ~sample 77 the reply
+/// gets truncated and decodes as InvalidGcr — raise RX_BUF_LEN if that shows up.
+const RX_ARR: u32 = 106;
 
 /// Frame counts at which `send_and_receive` dumps an RX probe, so the bench
 /// run reports what arrived without needing a scope.

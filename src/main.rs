@@ -383,6 +383,15 @@ fn board_config() -> embassy_stm32::Config {
     config
 }
 
+/// Core clock in Hz, for converting DWT cycle counts to seconds.
+///
+/// This is SYSCLK (`PLL1_P`, 480 MHz above), *not* AHB — the M7 core and the
+/// DWT counter run ahead of the 240 MHz bus. Must track `board_config`: an
+/// error here scales every measured `dt` by the same factor, which is exactly
+/// the failure the measurement replaces.
+#[cfg(feature = "firmware")]
+const CORE_HZ: f32 = 480_000_000.0;
+
 /// Bench motor-test entry point — drives DShot directly, no flight stack.
 #[cfg(feature = "motor-test")]
 #[embassy_executor::main]
@@ -407,6 +416,14 @@ async fn main(spawner: Spawner) {
     // Disable D-cache as early as possible
     let mut core = cortex_m::Peripherals::take().unwrap();
     core.SCB.disable_dcache(&mut core.CPUID);
+
+    // DWT cycle counter, used by control_loop to measure its own interval.
+    // embassy-time is not usable for that: `tick-hz-32_768` means one tick is
+    // 30.5 µs, so an 8 kHz period reads as either 122 µs or 153 µs — ±22% on
+    // a quantity the rate PID divides by. DWT counts core cycles, so at
+    // 480 MHz it resolves 2.08 ns and costs no peripheral.
+    core.DCB.enable_trace();
+    core.DWT.enable_cycle_counter();
 
     // Bring up USART6 TX (PC6) for defmt output before anything else
     // so the first defmt::info! below actually lands on the wire.
@@ -2567,7 +2584,8 @@ async fn control_loop(mut dshot: DshotBitbang<'static>) -> ! {
     };
     let mut rate_pid = RatePidController::new(rate_gains, rate_gains, yaw_gains, limits);
 
-    let dt: f32 = 0.000125; // 8 kHz
+    // Seeded from the first DWT read; every later dt is measured (see loop).
+    let mut last_cyc = cortex_m::peripheral::DWT::cycle_count();
     let mut receiver = OUTER_CMD.receiver().unwrap();
 
     // Airmode is withheld until throttle first crosses this floor after
@@ -2578,6 +2596,17 @@ async fn control_loop(mut dshot: DshotBitbang<'static>) -> ! {
     loop {
         // Wait for the next 8 kHz IMU sample
         let imu = IMU_DATA.wait().await;
+
+        // Measure the interval rather than assuming it. This loop awaits a
+        // DShot frame each iteration, so its true period is set by how long
+        // that takes, not by the IMU's nominal rate — and IMU_DATA is a
+        // latest-value Signal, so falling behind silently drops samples
+        // instead of backing the loop up. A dt that disagrees with reality
+        // mis-scales the PID's I-term (accumulates per sample) and D-term
+        // (divides by dt) in opposite directions.
+        let now_cyc = cortex_m::peripheral::DWT::cycle_count();
+        let dt = ((now_cyc.wrapping_sub(last_cyc) as f32) / CORE_HZ).clamp(50.0e-6, 2.0e-3);
+        last_cyc = now_cyc;
 
         // Get the latest commands from the outer loop
         // We use try_get() so it never blocks the fast loop
