@@ -300,20 +300,52 @@ impl<'d> DshotBitbang<'d> {
                     RX_BUF_LEN,
                     transitions,
                 );
-                // Dump from the first falling edge, not from index 0. The ESC
-                // turnaround is ~30 us (~34 samples), so the head of the
-                // buffer is always idle and dumping it showed all-ones on a
-                // working link. MSB-first so the printout reads left-to-right
-                // in time order.
-                match rx.iter().position(|&s| s & m == 0) {
-                    Some(idx) => defmt::info!(
-                        "  M{=usize}: 16 samples from edge @{=usize}: {=u16:016b}",
+                // Whole-window run lengths. A 16-sample keyhole cannot tell
+                // "reply arriving at half the expected bit rate" from "reply
+                // truncated by the end of the buffer" — both look like a
+                // fragment. Run lengths show bit width and structure directly:
+                // a healthy reply is ~21 runs averaging OVERSAMPLE samples,
+                // ending well inside RX_BUF_LEN. Double-width runs mean a rate
+                // mismatch; a final run that hits the buffer end means the
+                // window is too short.
+                {
+                    let mut runs = [0u8; 40];
+                    let mut levels: u64 = 0;
+                    let mut n = 0usize;
+                    let mut cur = rx[0] & m;
+                    let mut len = 0u8;
+                    for &s in rx.iter() {
+                        if (s & m) == cur {
+                            len = len.saturating_add(1);
+                        } else {
+                            if n < runs.len() {
+                                runs[n] = len;
+                                if cur != 0 {
+                                    levels |= 1 << n;
+                                }
+                                n += 1;
+                            }
+                            cur = s & m;
+                            len = 1;
+                        }
+                    }
+                    if n < runs.len() {
+                        runs[n] = len;
+                        if cur != 0 {
+                            levels |= 1 << n;
+                        }
+                        n += 1;
+                    }
+                    defmt::info!(
+                        "  M{=usize} runs n={=usize} hi={=u64:b} lens={=[u8]}",
                         i + 1,
-                        idx,
-                        rx[idx..].iter().take(16).enumerate().fold(0u16, |acc, (k, &s)| {
-                            if s & m != 0 { acc | (1 << (15 - k)) } else { acc }
-                        }),
-                    ),
+                        n,
+                        levels,
+                        &runs[..n],
+                    );
+                }
+                match rx.iter().position(|&s| s & m == 0) {
+                    Some(idx) => defmt::info!("  M{=usize} first edge @{=usize}", i + 1, idx),
                     None => defmt::info!("  M{=usize}: no falling edge in window", i + 1),
                 }
             }
