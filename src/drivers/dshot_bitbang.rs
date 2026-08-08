@@ -33,6 +33,7 @@ use embassy_stm32::Peri;
 use embassy_stm32::pac;
 use embassy_stm32::peripherals::{DMA2_CH2, PA0, PA1, PA2, PA3, TIM1};
 
+use super::dshot_bb_decode::RX_BUF_LEN;
 use super::dshot_bb_frame::{BB_BUF_LEN, output_data_clear, output_data_init, output_data_set};
 use super::dshot_frame::DshotFrame;
 
@@ -43,12 +44,28 @@ const MOTOR_PINS: [u8; 4] = [0, 1, 2, 3];
 /// TIM1 counter period for the transmit pacer. 240 MHz / 900 kHz - 1.
 const TX_ARR: u32 = 265;
 
+/// TIM1 counter period for the receive pacer. The reply runs at 5/4 the DShot
+/// bit rate and we oversample 3×, so 300 kHz × 5/4 × 3 = 1.125 MHz.
+/// 240 MHz / 1.125 MHz - 1 = 212. (BF derives this as
+/// `outputFreq * 5 * 2 * OVER_SAMPLE / 24`, which is `outputFreq × 5/4`.)
+const RX_ARR: u32 = 212;
+
+/// Frame count at which `send_and_receive` dumps a one-shot RX probe, so the
+/// bench run reports what arrived without needing a scope.
+const RX_PROBE_FRAME: u32 = 100;
+
 /// Cache-line-aligned TX buffer. H7 DMA requires 32-byte alignment for clean
 /// cache maintenance; do not assume D-cache is disabled.
 #[repr(C, align(32))]
 struct TxBuf([u32; BB_BUF_LEN]);
 
 static mut TX_BUF: TxBuf = TxBuf([0; BB_BUF_LEN]);
+
+/// Cache-line-aligned RX buffer, same rationale as `TxBuf`.
+#[repr(C, align(32))]
+struct RxBuf([u16; RX_BUF_LEN]);
+
+static mut RX_BUF: RxBuf = RxBuf([0; RX_BUF_LEN]);
 
 pub struct DshotBitbang<'d> {
     dma: Peri<'d, DMA2_CH2>,
@@ -172,6 +189,78 @@ impl<'d> DshotBitbang<'d> {
         }
 
         self.frame_count = self.frame_count.wrapping_add(1);
+    }
+
+    /// Send one frame, then release the line and sample the ESC's reply.
+    /// Returns the raw port samples; decoding is the caller's job.
+    pub async fn send_and_receive(&mut self, frames: [DshotFrame; 4]) -> [u16; RX_BUF_LEN] {
+        use embassy_stm32::dma::{Burst, FifoThreshold, Transfer, TransferOptions};
+        use embassy_stm32::timer::UpDma;
+
+        self.send(frames).await;
+
+        // Release the line. The three hold states at the end of the frame have
+        // already given the ESC time to sample the last bit, so this
+        // transition is safe here and only here.
+        pac::GPIOA.moder().modify(|w| {
+            for p in MOTOR_PINS {
+                w.set_moder(p as usize, pac::gpio::vals::Moder::INPUT);
+            }
+        });
+
+        // SAFETY: as for TX — awaited to completion before returning.
+        let rx = unsafe { &mut *core::ptr::addr_of_mut!(RX_BUF.0) };
+        rx.fill(0);
+
+        let mut opts = TransferOptions::default();
+        opts.fifo_threshold = Some(FifoThreshold::Quarter);
+        opts.mburst = Burst::Single;
+        opts.pburst = Burst::Single;
+
+        let idr = pac::GPIOA.idr().as_ptr() as *mut u16;
+
+        unsafe {
+            pac::TIM1
+                .arr()
+                .write_value(pac::timer::regs::ArrCore(RX_ARR));
+            pac::TIM1.cnt().write_value(pac::timer::regs::CntCore(0));
+            pac::TIM1.egr().write(|w| w.set_ug(true));
+            pac::TIM1.dier().modify(|w| w.set_ude(true));
+
+            let req = <DMA2_CH2 as UpDma<TIM1>>::request(&self.dma);
+            let t = Transfer::new_read(self.dma.reborrow(), req, idr, &mut rx[..], opts);
+            t.await;
+
+            pac::TIM1.dier().modify(|w| w.set_ude(false));
+            pac::TIM1
+                .arr()
+                .write_value(pac::timer::regs::ArrCore(TX_ARR));
+            pac::TIM1.egr().write(|w| w.set_ug(true));
+        }
+
+        // Back to driving the line at its idle level.
+        set_idle_level(self.bidir);
+        pac::GPIOA.moder().modify(|w| {
+            for p in MOTOR_PINS {
+                w.set_moder(p as usize, pac::gpio::vals::Moder::OUTPUT);
+            }
+        });
+
+        if self.frame_count == RX_PROBE_FRAME {
+            let m1_low = rx.iter().filter(|&&s| s & 1 == 0).count();
+            let transitions = rx.windows(2).filter(|w| (w[0] ^ w[1]) & 1 != 0).count();
+            defmt::info!(
+                "bitbang RX probe: {=usize} of {=usize} samples low on M1, {=usize} transitions",
+                m1_low, RX_BUF_LEN, transitions,
+            );
+            defmt::info!(
+                "  first 16 samples (M1 bit): {=u16:016b}",
+                rx.iter().take(16).enumerate()
+                    .fold(0u16, |acc, (i, &s)| acc | (((s & 1) as u16) << i)),
+            );
+        }
+
+        *rx
     }
 }
 

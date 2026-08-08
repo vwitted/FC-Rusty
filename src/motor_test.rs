@@ -212,12 +212,20 @@ pub async fn run(p: embassy_stm32::Peripherals) -> ! {
         );
         defmt::info!("motor-test: arming ESCs (zero throttle, 3s) [bitbang]");
         for _ in 0..(cfg.loop_khz as u32 * 3000) {
-            dshot.send(stop).await;
+            if cfg.bidir {
+                dshot.send_and_receive(stop).await;
+            } else {
+                dshot.send(stop).await;
+            }
             ticker.next().await;
         }
         defmt::info!("motor-test: driving motors [bitbang]");
         loop {
-            dshot.send(frames).await;
+            if cfg.bidir {
+                dshot.send_and_receive(frames).await;
+            } else {
+                dshot.send(frames).await;
+            }
             ticker.next().await;
         }
     } else {
