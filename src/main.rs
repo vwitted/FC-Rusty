@@ -981,7 +981,8 @@ async fn mekf_task() {
         mekf.euler()[2] * RAD2DEG,
     );
 
-    let mut last_predict = Instant::now();
+    // Seeded from the first DWT read; every later dt is measured (see loop).
+    let mut last_predict_cyc = cortex_m::peripheral::DWT::cycle_count();
     let mut sample_count: u32 = 0;
     let mut last_report = Instant::now();
     let mut updates_applied: u32 = 0;
@@ -1034,13 +1035,24 @@ async fn mekf_task() {
             mekf.update_yaw_reference(yaw_cog, SIGMA_YAW_COG);
         }
 
-        let now = Instant::now();
+        // DWT, not Instant: `tick-hz-32_768` resolves 30.5 µs, so a true
+        // 125 µs interval reads as 122 or 153 µs — ±22% jitter on the
+        // integration step of an attitude filter, where the error does not
+        // just perturb a gain but accumulates into the estimate. DWT counts
+        // core cycles at CORE_HZ (2.08 ns) and wraps every ~8.9 s, which
+        // `wrapping_sub` handles for any interval this short.
+        //
         // Clamp dt to sane bounds — a missed sample stretches dt to
         // ~250 µs which the filter handles; anything beyond 2 ms is a
         // stall we shouldn't integrate through.
-        let dt_us = (now - last_predict).as_micros() as f32;
-        let dt = (dt_us * 1.0e-6).clamp(50.0e-6, 2.0e-3);
-        last_predict = now;
+        let now_cyc = cortex_m::peripheral::DWT::cycle_count();
+        let dt = ((now_cyc.wrapping_sub(last_predict_cyc) as f32) / CORE_HZ).clamp(50.0e-6, 2.0e-3);
+        last_predict_cyc = now_cyc;
+
+        // Separate coarse clock for the 1 Hz diagnostic report below. Its
+        // 30.5 µs resolution is immaterial over a one-second interval, and
+        // Instant is cheaper to compare against a Duration than cycles are.
+        let now = Instant::now();
 
         let g_dps = raw.gyro_dps();
         let gyro_rad = [g_dps[0] * DEG2RAD, g_dps[1] * DEG2RAD, g_dps[2] * DEG2RAD];
