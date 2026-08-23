@@ -17,6 +17,11 @@
 #       Drive and sample M4 alone; the other three pins stay high-Z on their
 #       pull-ups, so those ESCs never reply. Use it to tell "this ESC never
 #       answers" apart from "its answer is swamped by its neighbours".
+#   MOTOR_PIN_ORDER=4231 scripts/flash-motor-test.sh
+#       Remap motor -> pad. Four digits, one per motor, naming the pad it
+#       drives; must be a permutation (a bad value is a compile error, not a
+#       silent fallback). Pair it with a physical ESC lead swap so throttle,
+#       telemetry decode and the RX probe all keep following the same motor.
 #   RX_SAMPLES=400 LOOP_KHZ=2 scripts/flash-motor-test.sh
 #       Widen the telemetry capture window to catch a reply that lands after
 #       the default 140 samples. Never for flight: 400 samples is 178 us and

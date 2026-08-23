@@ -44,7 +44,49 @@ use super::dshot_frame::DshotFrame;
 
 /// PA0..PA3 = M1..M4.
 const PORT_MASK: u16 = 0b1111;
-const MOTOR_PINS: [u8; 4] = [0, 1, 2, 3];
+/// Motor index -> GPIOA pin. Default M1..M4 = PA0..PA3.
+///
+/// `MOTOR_PIN_ORDER` remaps it at build time: four digits naming the *pad*
+/// each motor drives, so `MOTOR_PIN_ORDER=4231` sends M1's frame to the M4
+/// pad and M4's to the M1 pad, leaving M2/M3 alone.
+///
+/// The point is to pair with a physical lead swap. Moving the software
+/// mapping alone does not tell a bad pin from a bad ESC — the ESC is still
+/// soldered to the same pad — but after re-plugging two ESC leads this keeps
+/// motor numbering honest end to end: throttle, telemetry decode and the RX
+/// probe all follow the same table, so the logs stay readable.
+///
+/// A malformed value is a compile error rather than a silent fallback: a
+/// typo'd bench mapping would otherwise cost a whole session of confused
+/// readings.
+const MOTOR_PINS: [u8; 4] = parse_pin_order();
+
+const fn parse_pin_order() -> [u8; 4] {
+    let Some(s) = option_env!("MOTOR_PIN_ORDER") else {
+        return [0, 1, 2, 3];
+    };
+    let b = s.as_bytes();
+    if b.len() != 4 {
+        panic!("MOTOR_PIN_ORDER must be exactly 4 digits, e.g. MOTOR_PIN_ORDER=4231");
+    }
+    let mut out = [0u8; 4];
+    let mut seen = [false; 4];
+    let mut i = 0;
+    while i < 4 {
+        let d = b[i];
+        if d < b'1' || d > b'4' {
+            panic!("MOTOR_PIN_ORDER digits must each be 1-4");
+        }
+        let pad = (d - b'1') as usize;
+        if seen[pad] {
+            panic!("MOTOR_PIN_ORDER must be a permutation — a pad is used twice");
+        }
+        seen[pad] = true;
+        out[i] = pad as u8;
+        i += 1;
+    }
+    out
+}
 
 /// Bench isolation: `ONLY_MOTOR=4 ./scripts/flash-motor-test.sh` drives and
 /// samples that motor alone, leaving the other three pins as high-Z inputs
@@ -227,6 +269,15 @@ impl<'d> DshotBitbang<'d> {
             bidir,
             ACTIVE_MASK,
         );
+        if MOTOR_PINS[0] != 0 || MOTOR_PINS[1] != 1 || MOTOR_PINS[2] != 2 || MOTOR_PINS[3] != 3 {
+            defmt::warn!(
+                "MOTOR_PIN_ORDER remap active: M1->PA{=u8} M2->PA{=u8} M3->PA{=u8} M4->PA{=u8}",
+                MOTOR_PINS[0],
+                MOTOR_PINS[1],
+                MOTOR_PINS[2],
+                MOTOR_PINS[3],
+            );
+        }
         if let Some(m) = ONLY_MOTOR {
             defmt::warn!(
                 "ONLY_MOTOR={=u8}: M{=u8} driven alone, other pins high-Z (bench isolation)",
