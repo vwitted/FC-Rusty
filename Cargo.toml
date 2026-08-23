@@ -74,8 +74,13 @@ persist-selftest = []
 nalgebra = { version = "0.34", default-features = false, features = ["libm"] }
 libm = "0.2"
 
-# MPC solver
-tinympc-rs = { path = "src/control/tinympc-rs", default-features = false }
+# MPC solver.
+# Was a path dep on `src/control/tinympc-rs`, but that path is a gitlink
+# (mode 160000, commit c3b3980) with no `.gitmodules` entry, so it can never
+# be checked out — the directory is empty in every clone. Use the published
+# crate instead. Its `std` feature is opt-in (`default = []`), so this is
+# already a no_std build.
+tinympc-rs = "0.2.0"
 
 # ---- Firmware-only dependencies (optional) ----
 # Pulled in by the "firmware" feature. All marked optional = true.
