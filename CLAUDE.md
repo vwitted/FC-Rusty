@@ -82,8 +82,13 @@ cargo build --release
 # Flash to DAKEFPV H743 via USB DFU (hold boot button, plug USB)
 ./scripts/flash-dfu.sh
 
-# Host unit tests (strips firmware feature so cortex-m isn't pulled in)
-cargo test --lib --no-default-features --target x86_64-unknown-linux-gnu
+# Host unit tests (strips firmware feature so cortex-m isn't pulled in).
+# The tests run as a native binary, so they need the host triple, not the
+# thumbv7em default from .cargo/config.toml. These wrappers read it from
+# `rustc -vV`, so the same command works on Debian and on Windows.
+scripts/test-host.sh                    # Debian, or Git Bash on Windows
+scripts\test-host.cmd                   # Windows PowerShell / cmd
+scripts/test-host.sh persist::record    # filter to one module or test
 
 # Simulation examples
 cargo run --example sim_mpc_hover --no-default-features
