@@ -309,4 +309,114 @@ mod tests {
         let buf = samples_from_gcr(gcr_from_payload(word), 0);
         assert_eq!(decode(&buf, 0), BbTelemetry::Erpm { period_us: 0 });
     }
+
+    // ---- Field captures from the bench RX probe (2026-08, motor-test) ----
+    //
+    // Run lengths as printed by the probe, starting from the idle-high line:
+    // `hi=1010...` means run 0 is high. M1-M3 decode cleanly; M4 is the
+    // motor that never yields eRPM. Kept as a regression fixture so a change
+    // to the reconstruction is checked against real wire data, not just
+    // synthesised frames.
+
+    /// Rebuild a port sample buffer from a probe run-length list.
+    fn samples_from_runs(runs: &[usize], pin: u8) -> [u16; RX_BUF_LEN] {
+        let mut buf = [0xFFFFu16; RX_BUF_LEN];
+        let mut idx = 0usize;
+        let mut high = true;
+        for &len in runs {
+            for _ in 0..len {
+                if idx >= RX_BUF_LEN {
+                    return buf;
+                }
+                if !high {
+                    buf[idx] &= !(1u16 << pin);
+                }
+                idx += 1;
+            }
+            high = !high;
+        }
+        buf
+    }
+
+    /// Healthy captures: first edge at 51, 14-16 transitions.
+    const HEALTHY: [&[usize]; 3] = [
+        &[51, 3, 5, 3, 2, 5, 3, 2, 8, 9, 5, 2, 3, 2, 37],   // M1 @ 6.659
+        &[51, 3, 5, 2, 3, 5, 3, 2, 3, 2, 2, 6, 2, 2, 6, 2, 41], // M2 @ 6.663
+        &[51, 3, 5, 2, 3, 5, 2, 3, 2, 3, 2, 3, 5, 2, 9, 2, 38], // M3 @ 6.668
+    ];
+
+    /// M4 captures: first edge late and drifting (71-100), 0-6 transitions.
+    const M4_BAD: [&[usize]; 4] = [
+        &[71, 3, 2, 2, 62],   // @ 6.673
+        &[84, 3, 53],         // @ 12.898
+        &[99, 1, 40],         // @ 29.500
+        &[140],               // @ 19.124  no falling edge at all
+    ];
+
+    #[test]
+    fn healthy_field_captures_decode_to_erpm() {
+        for (i, runs) in HEALTHY.iter().enumerate() {
+            let buf = samples_from_runs(runs, i as u8);
+            let got = decode(&buf, i as u8);
+            assert!(
+                matches!(got, BbTelemetry::Erpm { .. }),
+                "M{} healthy capture should decode to Erpm, got {:?}",
+                i + 1,
+                got
+            );
+        }
+    }
+
+    #[test]
+    fn m4_field_captures_never_decode_to_erpm() {
+        for (i, runs) in M4_BAD.iter().enumerate() {
+            let buf = samples_from_runs(runs, 3);
+            let got = decode(&buf, 3);
+            assert!(
+                !matches!(got, BbTelemetry::Erpm { .. }),
+                "M4 capture {} is noise, must not decode as eRPM, got {:?}",
+                i,
+                got
+            );
+        }
+    }
+
+    /// The decoder must treat every pin identically -- the same wire data on
+    /// pin 0 and pin 3 must give the same answer. Rules out an index-boundary
+    /// bug as the explanation for one motor behaving differently.
+    #[test]
+    fn decode_is_identical_across_all_four_pins() {
+        for runs in HEALTHY.iter().chain(M4_BAD.iter()) {
+            let reference = decode(&samples_from_runs(runs, 0), 0);
+            for pin in 1..4u8 {
+                let got = decode(&samples_from_runs(runs, pin), pin);
+                assert_eq!(got, reference, "pin {} differs from pin 0", pin);
+            }
+        }
+    }
+
+    /// All four motors share one buffer and one window, so a healthy reply on
+    /// three pins must not rescue -- or corrupt -- the fourth.
+    #[test]
+    fn four_pins_in_one_buffer_decode_independently() {
+        let mut buf = [0xFFFFu16; RX_BUF_LEN];
+        for (pin, runs) in HEALTHY.iter().enumerate() {
+            let one = samples_from_runs(runs, pin as u8);
+            for (dst, src) in buf.iter_mut().zip(one.iter()) {
+                *dst &= *src | !(1u16 << pin);
+            }
+        }
+        let bad = samples_from_runs(M4_BAD[0], 3);
+        for (dst, src) in buf.iter_mut().zip(bad.iter()) {
+            *dst &= *src | !(1u16 << 3);
+        }
+        for pin in 0..3u8 {
+            assert!(
+                matches!(decode(&buf, pin), BbTelemetry::Erpm { .. }),
+                "pin {} should still decode in the shared buffer",
+                pin
+            );
+        }
+        assert!(!matches!(decode(&buf, 3), BbTelemetry::Erpm { .. }));
+    }
 }
