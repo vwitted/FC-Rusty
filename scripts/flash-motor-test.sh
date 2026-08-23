@@ -12,6 +12,16 @@
 #   scripts/flash-dfu.sh              # release build, then flash
 #   scripts/flash-dfu.sh --debug      # debug build (larger, slower)
 #
+# Bench knobs (compile-time, so set them on this script's invocation):
+#   ONLY_MOTOR=4 scripts/flash-motor-test.sh
+#       Drive and sample M4 alone; the other three pins stay high-Z on their
+#       pull-ups, so those ESCs never reply. Use it to tell "this ESC never
+#       answers" apart from "its answer is swamped by its neighbours".
+#   RX_SAMPLES=400 LOOP_KHZ=2 scripts/flash-motor-test.sh
+#       Widen the telemetry capture window to catch a reply that lands after
+#       the default 140 samples. Never for flight: 400 samples is 178 us and
+#       blows the 125 us loop period, hence the paired LOOP_KHZ.
+#
 # To put the board in DFU mode: hold BOOT, plug USB-C, release BOOT.
 # Verify with `lsusb | grep STMicroelectronics` — you should see the
 # "STM Device in DFU Mode" VID:PID 0483:df11 enumerate.

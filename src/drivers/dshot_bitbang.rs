@@ -46,6 +46,57 @@ use super::dshot_frame::DshotFrame;
 const PORT_MASK: u16 = 0b1111;
 const MOTOR_PINS: [u8; 4] = [0, 1, 2, 3];
 
+/// Bench isolation: `ONLY_MOTOR=4 ./scripts/flash-motor-test.sh` drives and
+/// samples that motor alone, leaving the other three pins as high-Z inputs
+/// (their pull-ups hold them at the bidir idle level, so those ESCs see no
+/// command and never transmit a reply).
+///
+/// Why this exists: on the rig one motor returns no eRPM while the other
+/// three decode cleanly, and its only line activity falls at samples 71..100
+/// — entirely inside the window where the other three are toggling their
+/// replies, never before it. That is what crosstalk looks like. Running the
+/// suspect motor alone separates "this ESC never answers" from "its answer is
+/// being swamped by its neighbours".
+///
+/// Deliberately NOT a matter of holding the other pins as driven outputs:
+/// an ESC pulling the line low against a push-pull output driving it high is
+/// a short through both drivers. High-Z can never fight.
+const ONLY_MOTOR: Option<u8> = parse_only_motor();
+
+const fn parse_only_motor() -> Option<u8> {
+    let Some(s) = option_env!("ONLY_MOTOR") else {
+        return None;
+    };
+    let b = s.as_bytes();
+    if b.len() != 1 || b[0] < b'1' || b[0] > b'4' {
+        return None;
+    }
+    Some(b[0] - b'1')
+}
+
+/// Is this motor index driven in this build?
+const fn is_active(i: usize) -> bool {
+    match ONLY_MOTOR {
+        Some(m) => i == m as usize,
+        None => true,
+    }
+}
+
+/// Port mask covering only the driven pins.
+const ACTIVE_MASK: u16 = match ONLY_MOTOR {
+    Some(m) => 1u16 << MOTOR_PINS[m as usize],
+    None => PORT_MASK,
+};
+
+/// The pins driven in this build, in motor order.
+fn active_pins() -> impl Iterator<Item = u8> {
+    MOTOR_PINS
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| is_active(*i))
+        .map(|(_, p)| p)
+}
+
 /// TIM1 counter period for the transmit pacer. 3 states per bit at 600 kbit/s
 /// is a 1.8 MHz state rate; 240 MHz / 1.8 MHz - 1 = 132.3 → 132, giving
 /// 240e6/133 = 1.8045 MHz (601.5 kbit/s, +0.25%). Frame = 51 states = 28.3 µs.
@@ -143,7 +194,7 @@ impl<'d> DshotBitbang<'d> {
         // Idle level before the pins become outputs: bidir idles HIGH.
         set_idle_level(bidir);
         pac::GPIOA.moder().modify(|w| {
-            for p in MOTOR_PINS {
+            for p in active_pins() {
                 w.set_moder(p as usize, pac::gpio::vals::Moder::OUTPUT);
             }
         });
@@ -174,8 +225,15 @@ impl<'d> DshotBitbang<'d> {
             "DShot bitbang init: TIM1 pacer ARR={=u32} bidir={=bool} port_mask={=u16:04b}",
             TX_ARR,
             bidir,
-            PORT_MASK,
+            ACTIVE_MASK,
         );
+        if let Some(m) = ONLY_MOTOR {
+            defmt::warn!(
+                "ONLY_MOTOR={=u8}: M{=u8} driven alone, other pins high-Z (bench isolation)",
+                m + 1,
+                m + 1,
+            );
+        }
 
         Self { dma, bidir, frame_count: 0 }
     }
@@ -190,12 +248,14 @@ impl<'d> DshotBitbang<'d> {
         let buf = unsafe { &mut *core::ptr::addr_of_mut!(TX_BUF.0) };
 
         if self.frame_count == 0 {
-            output_data_init(buf, PORT_MASK, self.bidir);
+            output_data_init(buf, ACTIVE_MASK, self.bidir);
         } else {
             output_data_clear(buf);
         }
         for (i, pin) in MOTOR_PINS.iter().enumerate() {
-            output_data_set(buf, *pin, frames[i].raw, self.bidir);
+            if is_active(i) {
+                output_data_set(buf, *pin, frames[i].raw, self.bidir);
+            }
         }
 
         let mut opts = TransferOptions::default();
@@ -232,7 +292,7 @@ impl<'d> DshotBitbang<'d> {
         // already given the ESC time to sample the last bit, so this
         // transition is safe here and only here.
         pac::GPIOA.moder().modify(|w| {
-            for p in MOTOR_PINS {
+            for p in active_pins() {
                 w.set_moder(p as usize, pac::gpio::vals::Moder::INPUT);
             }
         });
@@ -270,7 +330,7 @@ impl<'d> DshotBitbang<'d> {
         // Back to driving the line at its idle level.
         set_idle_level(self.bidir);
         pac::GPIOA.moder().modify(|w| {
-            for p in MOTOR_PINS {
+            for p in active_pins() {
                 w.set_moder(p as usize, pac::gpio::vals::Moder::OUTPUT);
             }
         });
@@ -364,7 +424,7 @@ impl<'d> DshotBitbang<'d> {
 /// Drive the four motor pins to their idle level via BSRR.
 fn set_idle_level(bidir: bool) {
     pac::GPIOA.bsrr().write(|w| {
-        for p in MOTOR_PINS {
+        for p in active_pins() {
             if bidir {
                 w.set_bs(p as usize, true); // bidir idles HIGH
             } else {
