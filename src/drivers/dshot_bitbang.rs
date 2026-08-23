@@ -44,99 +44,131 @@ use super::dshot_frame::DshotFrame;
 
 /// PA0..PA3 = M1..M4.
 const PORT_MASK: u16 = 0b1111;
-/// Motor index -> GPIOA pin. Default M1..M4 = PA0..PA3.
+/// Motor index -> the GPIOA pad it drives, or `None` for "not driven".
+/// Default is M1..M4 = PA0..PA3, all four active.
 ///
-/// `MOTOR_PIN_ORDER` remaps it at build time: four digits naming the *pad*
-/// each motor drives, so `MOTOR_PIN_ORDER=4231` sends M1's frame to the M4
-/// pad and M4's to the M1 pad, leaving M2/M3 alone.
+/// Set with `MOTOR_PIN_ORDER`: four digits, one per motor, naming the pad it
+/// drives. `0` means that motor is left unassigned — its pad is never claimed
+/// as an output, never flipped to input, and sits at high-Z on its pull-up, so
+/// the ESC there sees no command and transmits nothing.
 ///
-/// The point is to pair with a physical lead swap. Moving the software
-/// mapping alone does not tell a bad pin from a bad ESC — the ESC is still
-/// soldered to the same pad — but after re-plugging two ESC leads this keeps
-/// motor numbering honest end to end: throttle, telemetry decode and the RX
-/// probe all follow the same table, so the logs stay readable.
+///     MOTOR_PIN_ORDER=1234   default, all four (same as unset)
+///     MOTOR_PIN_ORDER=4231   swap M1 and M4, leave M2/M3 alone
+///     MOTOR_PIN_ORDER=0004   drive M4 alone -- what ONLY_MOTOR=4 expands to
+///     MOTOR_PIN_ORDER=0204   M2 and M4 only, M2 moved to the M2 pad
 ///
-/// A malformed value is a compile error rather than a silent fallback: a
-/// typo'd bench mapping would otherwise cost a whole session of confused
-/// readings.
-const MOTOR_PINS: [u8; 4] = parse_pin_order();
+/// Two distinct uses, and it is worth keeping them apart:
+///
+///   * Remapping (a permutation) pairs with a *physical* lead swap. Moving the
+///     software mapping alone cannot tell a bad pin from a bad ESC — the ESC
+///     stays soldered to the same pad — but after re-plugging two ESC leads it
+///     keeps motor numbering honest end to end, so throttle, telemetry decode
+///     and the RX probe all still refer to the motor they claim to.
+///
+///   * Unassigning motors isolates a line electrically, which is what
+///     separates "this ESC never answers" from "its answer is swamped by its
+///     neighbours".
+///
+/// Unassigning is deliberately high-Z rather than a driven-idle output: an ESC
+/// pulling the line low against a push-pull output driving it high shorts both
+/// drivers together. High-Z can never fight.
+///
+/// A malformed value is a compile error, not a silent fallback to the default.
+/// A typo'd bench mapping that quietly reverted would cost a whole session of
+/// confused readings.
+const MOTOR_PADS: [Option<u8>; 4] = parse_mapping();
 
-const fn parse_pin_order() -> [u8; 4] {
-    let Some(s) = option_env!("MOTOR_PIN_ORDER") else {
-        return [0, 1, 2, 3];
+/// The pad each motor is associated with, ignoring whether it is driven.
+/// Unassigned motors keep their default pad so logs can still name it.
+const MOTOR_PINS: [u8; 4] = {
+    let mut out = [0u8; 4];
+    let mut i = 0;
+    while i < 4 {
+        out[i] = match MOTOR_PADS[i] {
+            Some(p) => p,
+            None => i as u8,
+        };
+        i += 1;
+    }
+    out
+};
+
+const fn parse_mapping() -> [Option<u8>; 4] {
+    // ONLY_MOTOR is shorthand for the common isolation case. Accepting both
+    // knobs at once would leave which one wins undefined, so refuse.
+    let order = option_env!("MOTOR_PIN_ORDER");
+    let only = option_env!("ONLY_MOTOR");
+    if order.is_some() && only.is_some() {
+        panic!("set MOTOR_PIN_ORDER or ONLY_MOTOR, not both (ONLY_MOTOR=4 is MOTOR_PIN_ORDER=0004)");
+    }
+
+    if let Some(s) = only {
+        let b = s.as_bytes();
+        if b.len() != 1 || b[0] < b'1' || b[0] > b'4' {
+            panic!("ONLY_MOTOR must be a single digit 1-4");
+        }
+        let m = (b[0] - b'1') as usize;
+        let mut out = [None; 4];
+        out[m] = Some(m as u8);
+        return out;
+    }
+
+    let Some(s) = order else {
+        return [Some(0), Some(1), Some(2), Some(3)];
     };
     let b = s.as_bytes();
     if b.len() != 4 {
         panic!("MOTOR_PIN_ORDER must be exactly 4 digits, e.g. MOTOR_PIN_ORDER=4231");
     }
-    let mut out = [0u8; 4];
+    let mut out = [None; 4];
     let mut seen = [false; 4];
+    let mut any = false;
     let mut i = 0;
     while i < 4 {
         let d = b[i];
+        if d == b'0' {
+            i += 1;
+            continue; // unassigned
+        }
         if d < b'1' || d > b'4' {
-            panic!("MOTOR_PIN_ORDER digits must each be 1-4");
+            panic!("MOTOR_PIN_ORDER digits must each be 0-4 (0 = motor not driven)");
         }
         let pad = (d - b'1') as usize;
         if seen[pad] {
-            panic!("MOTOR_PIN_ORDER must be a permutation — a pad is used twice");
+            panic!("MOTOR_PIN_ORDER must not use the same pad twice");
         }
         seen[pad] = true;
-        out[i] = pad as u8;
+        out[i] = Some(pad as u8);
+        any = true;
         i += 1;
+    }
+    if !any {
+        panic!("MOTOR_PIN_ORDER leaves every motor unassigned — nothing would be driven");
     }
     out
 }
 
-/// Bench isolation: `ONLY_MOTOR=4 ./scripts/flash-motor-test.sh` drives and
-/// samples that motor alone, leaving the other three pins as high-Z inputs
-/// (their pull-ups hold them at the bidir idle level, so those ESCs see no
-/// command and never transmit a reply).
-///
-/// Why this exists: on the rig one motor returns no eRPM while the other
-/// three decode cleanly, and its only line activity falls at samples 71..100
-/// — entirely inside the window where the other three are toggling their
-/// replies, never before it. That is what crosstalk looks like. Running the
-/// suspect motor alone separates "this ESC never answers" from "its answer is
-/// being swamped by its neighbours".
-///
-/// Deliberately NOT a matter of holding the other pins as driven outputs:
-/// an ESC pulling the line low against a push-pull output driving it high is
-/// a short through both drivers. High-Z can never fight.
-const ONLY_MOTOR: Option<u8> = parse_only_motor();
-
-const fn parse_only_motor() -> Option<u8> {
-    let Some(s) = option_env!("ONLY_MOTOR") else {
-        return None;
-    };
-    let b = s.as_bytes();
-    if b.len() != 1 || b[0] < b'1' || b[0] > b'4' {
-        return None;
-    }
-    Some(b[0] - b'1')
-}
-
-/// Is this motor index driven in this build?
+/// Is this motor driven in this build?
 const fn is_active(i: usize) -> bool {
-    match ONLY_MOTOR {
-        Some(m) => i == m as usize,
-        None => true,
-    }
+    MOTOR_PADS[i].is_some()
 }
 
-/// Port mask covering only the driven pins.
-const ACTIVE_MASK: u16 = match ONLY_MOTOR {
-    Some(m) => 1u16 << MOTOR_PINS[m as usize],
-    None => PORT_MASK,
+/// Port mask covering only the driven pads.
+const ACTIVE_MASK: u16 = {
+    let mut mask = 0u16;
+    let mut i = 0;
+    while i < 4 {
+        if let Some(p) = MOTOR_PADS[i] {
+            mask |= 1u16 << p;
+        }
+        i += 1;
+    }
+    mask
 };
 
-/// The pins driven in this build, in motor order.
+/// The pads driven in this build, in motor order.
 fn active_pins() -> impl Iterator<Item = u8> {
-    MOTOR_PINS
-        .into_iter()
-        .enumerate()
-        .filter(|(i, _)| is_active(*i))
-        .map(|(_, p)| p)
+    MOTOR_PADS.into_iter().flatten()
 }
 
 /// TIM1 counter period for the transmit pacer. 3 states per bit at 600 kbit/s
@@ -269,21 +301,18 @@ impl<'d> DshotBitbang<'d> {
             bidir,
             ACTIVE_MASK,
         );
-        if MOTOR_PINS[0] != 0 || MOTOR_PINS[1] != 1 || MOTOR_PINS[2] != 2 || MOTOR_PINS[3] != 3 {
-            defmt::warn!(
-                "MOTOR_PIN_ORDER remap active: M1->PA{=u8} M2->PA{=u8} M3->PA{=u8} M4->PA{=u8}",
-                MOTOR_PINS[0],
-                MOTOR_PINS[1],
-                MOTOR_PINS[2],
-                MOTOR_PINS[3],
-            );
-        }
-        if let Some(m) = ONLY_MOTOR {
-            defmt::warn!(
-                "ONLY_MOTOR={=u8}: M{=u8} driven alone, other pins high-Z (bench isolation)",
-                m + 1,
-                m + 1,
-            );
+        // Announce any non-default mapping. A stale flash whose mapping does
+        // not match what the bench notes assume is the kind of thing that
+        // silently invalidates a whole session of readings.
+        if ACTIVE_MASK != PORT_MASK || MOTOR_PINS[0] != 0 || MOTOR_PINS[1] != 1
+            || MOTOR_PINS[2] != 2 || MOTOR_PINS[3] != 3
+        {
+            for i in 0..4usize {
+                match MOTOR_PADS[i] {
+                    Some(p) => defmt::warn!("motor map: M{=usize} -> PA{=u8}", i + 1, p),
+                    None => defmt::warn!("motor map: M{=usize} -> unassigned (high-Z)", i + 1),
+                }
+            }
         }
 
         Self { dma, bidir, frame_count: 0 }
@@ -468,7 +497,12 @@ impl<'d> DshotBitbang<'d> {
     /// Send one frame and decode all four replies.
     pub async fn send_and_decode(&mut self, frames: [DshotFrame; 4]) -> [BbTelemetry; 4] {
         let rx = self.send_and_receive(frames).await;
-        core::array::from_fn(|i| decode(&rx[..], MOTOR_PINS[i]))
+        core::array::from_fn(|i| match MOTOR_PADS[i] {
+            Some(pad) => decode(&rx[..], pad),
+            // Not driven and not sampled — report absence rather than
+            // decoding an idle line and calling it a dead ESC.
+            None => BbTelemetry::NoSignal,
+        })
     }
 }
 

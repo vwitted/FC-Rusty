@@ -13,15 +13,19 @@
 #   scripts/flash-dfu.sh --debug      # debug build (larger, slower)
 #
 # Bench knobs (compile-time, so set them on this script's invocation):
+#   MOTOR_PIN_ORDER=NNNN scripts/flash-motor-test.sh
+#       Motor -> pad mapping, one digit per motor; 0 means that motor is not
+#       driven at all (its pad stays high-Z on its pull-up, so that ESC sees
+#       no command and never replies). Must not use a pad twice, and must
+#       leave at least one motor driven; anything malformed is a compile
+#       error, not a silent fallback.
+#           1234  default, all four
+#           4231  swap M1 and M4 -- pair this with a physical ESC lead swap
+#           0004  drive M4 alone, to tell "this ESC never answers" apart
+#                 from "its answer is swamped by its neighbours"
 #   ONLY_MOTOR=4 scripts/flash-motor-test.sh
-#       Drive and sample M4 alone; the other three pins stay high-Z on their
-#       pull-ups, so those ESCs never reply. Use it to tell "this ESC never
-#       answers" apart from "its answer is swamped by its neighbours".
-#   MOTOR_PIN_ORDER=4231 scripts/flash-motor-test.sh
-#       Remap motor -> pad. Four digits, one per motor, naming the pad it
-#       drives; must be a permutation (a bad value is a compile error, not a
-#       silent fallback). Pair it with a physical ESC lead swap so throttle,
-#       telemetry decode and the RX probe all keep following the same motor.
+#       Shorthand for the isolation case above; exactly MOTOR_PIN_ORDER=0004.
+#       Setting both is an error.
 #   RX_SAMPLES=400 LOOP_KHZ=2 scripts/flash-motor-test.sh
 #       Widen the telemetry capture window to catch a reply that lands after
 #       the default 140 samples. Never for flight: 400 samples is 178 us and
