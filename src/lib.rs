@@ -53,5 +53,7 @@ pub mod sim {
     mod sim;
     #[path = "sensors.rs"]
     pub mod sensors;
+    #[path = "degrade.rs"]
+    pub mod degrade;
     pub use sim::*;
 }
