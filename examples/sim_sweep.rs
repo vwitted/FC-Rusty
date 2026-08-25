@@ -83,6 +83,41 @@ const TARGET_ALT: f32 = 5.0;
 /// 0.009 baseline), which is exactly where a sqrt2 change is legible.
 const GYRO_FLOOR_DPS: f32 = 1.0;
 
+/// Plant parameters, overridable for sensitivity checks.
+///
+/// QuadParams::default() is labelled "reasonable defaults for a 5in racing
+/// quad" -- plausible textbook values, not measurements of this airframe.
+/// Two of them bear directly on any stability result: motor_tau sets the
+/// loop's dominant phase lag (30 ms puts its corner at 5.3 Hz), and
+/// max_thrust sets loop gain. motor_tau's own comment gives a RANGE
+/// (20-50 ms), not a value, so the honest thing is to sweep it rather than
+/// trust it.
+fn plant_params() -> QuadParams {
+    let mut p = QuadParams::default();
+    if let Some(v) = std::env::var("PLANT_TAU").ok().and_then(|v| v.parse().ok()) {
+        p.motor_tau = v;
+    }
+    if let Some(v) = std::env::var("PLANT_THRUST").ok().and_then(|v| v.parse().ok()) {
+        p.max_thrust = v;
+    }
+    if let Some(v) = std::env::var("PLANT_INERTIA").ok().and_then(|v| v.parse().ok()) {
+        p.inertia = [v, v, v * 2.0];
+    }
+    // Trap worth guarding: AltitudeController clamps to min_thrust = 0.1, so
+    // once max_thrust is high enough that hover sits below that floor, the
+    // controller CANNOT command hover and the aircraft climbs no matter how
+    // stable the attitude loop is. At 60 N hover is 0.098 -- every run reads
+    // as a flyaway, and it means nothing. Fails loudly rather than quietly
+    // producing a table of artefacts.
+    let hover = p.mass * 9.81 / p.max_thrust;
+    assert!(
+        hover > 0.12,
+        "max_thrust {} N puts hover throttle at {:.3}, at or under the          AltitudeController's 0.1 floor -- every run would be a false flyaway",
+        p.max_thrust, hover
+    );
+    p
+}
+
 /// Spread the disturbances over this many ms instead of stepping the state.
 /// 0 keeps the original instantaneous poke.
 fn disturb_ms() -> f32 {
@@ -229,7 +264,7 @@ fn to_dual(cfg: &Degradation) -> DualImuConfig {
 /// no amount of staring at the summary would have revealed.
 fn run_case_traced(cfg: Degradation, seed: u64, r: Rates, filter: bool,
                    trace: bool, dual: bool) -> Metrics {
-    let params = QuadParams::default();
+    let params = plant_params();
     let hover_throttle = (params.mass * 9.81) / params.max_thrust;
     let mut sim = QuadSim::new_hovering(params, TARGET_ALT);
     let mut deg = Degrader::new(cfg, seed);
