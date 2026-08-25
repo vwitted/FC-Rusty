@@ -55,5 +55,7 @@ pub mod sim {
     pub mod sensors;
     #[path = "degrade.rs"]
     pub mod degrade;
+    #[path = "dual_imu.rs"]
+    pub mod dual_imu;
     pub use sim::*;
 }

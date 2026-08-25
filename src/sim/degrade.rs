@@ -95,15 +95,18 @@ impl Default for Degradation {
 }
 
 /// Tracks online/offline runs for one channel.
+///
+/// Visible to the rest of `sim` so `dual_imu` can reuse it: the duty-cycle
+/// derivation below is subtle enough that a second copy would be a liability.
 #[derive(Debug, Clone, Copy)]
-struct DropoutState {
+pub(super) struct DropoutState {
     online: bool,
     started: bool,
     remaining_s: f32,
 }
 
 impl DropoutState {
-    const fn new() -> Self {
+    pub(super) const fn new() -> Self {
         Self { online: true, started: false, remaining_s: 0.0 }
     }
 
@@ -120,7 +123,7 @@ impl DropoutState {
     ///
     /// Run lengths are exponentially distributed about their mean, so
     /// dropouts are bursty rather than periodic.
-    fn tick(&mut self, f: &ChannelFault, dt: f32, rng: &mut Rng) -> bool {
+    pub(super) fn tick(&mut self, f: &ChannelFault, dt: f32, rng: &mut Rng) -> bool {
         if f.p_online >= 1.0 {
             return true;
         }
