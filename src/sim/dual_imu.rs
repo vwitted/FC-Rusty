@@ -72,6 +72,14 @@ pub struct DualImuConfig {
     pub per_sensor: [ImuFault; 2],
     /// Applied identically to both, same vibration phase. Airframe motion
     /// the two parts genuinely share. Averaging cannot touch this.
+    ///
+    /// `common.gyro.p_online` is a CORRELATED outage: both sensors drop
+    /// together. That is the realistic way to lose both, because main.rs
+    /// awaits IMU1 then IMU2 inside one task -- starve that task, or dip the
+    /// shared 3V3 rail, and neither read lands. Per-sensor dropout stays
+    /// independent (separate buses, separate CS), so the two mechanisms
+    /// compose: both-down happens either by coincidence, (1-p)^2, or by a
+    /// common outage.
     pub common: ImuFault,
     /// Seconds between the two reads. The firmware awaits IMU1 then IMU2
     /// inside one 125 us tick, so IMU2's sample is roughly one SPI burst
@@ -128,6 +136,9 @@ pub struct DualImu {
     rng: [Rng; 2],
     t: f32,
     drop: [super::degrade::DropoutState; 2],
+    /// Correlated outage taking both sensors down together.
+    common_drop: super::degrade::DropoutState,
+    common_rng: Rng,
     prev_truth: Option<([f32; 3], [f32; 3])>,
     last_fused: ([f32; 3], [f32; 3]),
 }
@@ -139,6 +150,8 @@ impl DualImu {
             rng: [Rng::new(seed), Rng::new(seed ^ 0x9E37_79B9_7F4A_7C15)],
             t: 0.0,
             drop: [super::degrade::DropoutState::new(); 2],
+            common_drop: super::degrade::DropoutState::new(),
+            common_rng: Rng::new(seed ^ 0xD1B5_4A32_D192_ED03),
             prev_truth: None,
             last_fused: ([0.0; 3], [0.0; 3]),
         }
@@ -180,8 +193,12 @@ impl DualImu {
 
         // A failed SPI read loses that chip's gyro AND accel, so sensor
         // availability is one decision per sensor, keyed off its gyro fault.
-        let on0 = self.drop[0].tick(&self.cfg.per_sensor[0].gyro, dt, &mut self.rng[0]);
-        let on1 = self.drop[1].tick(&self.cfg.per_sensor[1].gyro, dt, &mut self.rng[1]);
+        // Tick every chain unconditionally, so a common outage does not
+        // desynchronise the per-sensor RNG streams and silently change the
+        // noise a run sees.
+        let bus_up = self.common_drop.tick(&self.cfg.common.gyro, dt, &mut self.common_rng);
+        let on0 = self.drop[0].tick(&self.cfg.per_sensor[0].gyro, dt, &mut self.rng[0]) && bus_up;
+        let on1 = self.drop[1].tick(&self.cfg.per_sensor[1].gyro, dt, &mut self.rng[1]) && bus_up;
 
         let s0 = self.sample(0, truth1, common_vib_g, common_vib_a);
         let s1 = self.sample(1, truth2, common_vib_g, common_vib_a);
@@ -406,6 +423,51 @@ mod tests {
             assert_eq!(a, A, "accel must be untouched by a gyro-only fault");
             assert!(g != G, "gyro should be corrupted");
         }
+    }
+
+    /// A common outage takes BOTH sensors down, however healthy each is
+    /// individually. This is the shared-task / shared-rail failure, and it
+    /// is the realistic way to reach Fusion::Held.
+    #[test]
+    fn a_common_outage_downs_both_healthy_sensors() {
+        let cfg = DualImuConfig {
+            common: ImuFault::gyro(ChannelFault { p_online: 0.0, ..ChannelFault::none() }),
+            ..DualImuConfig::none()
+        };
+        let mut d = DualImu::new(cfg, 5);
+        for _ in 0..200 {
+            assert_eq!(d.read(G, A, DT).1, Fusion::Held);
+        }
+    }
+
+    /// Independent per-sensor dropout reaches both-down only by coincidence,
+    /// at about (1-p)^2 -- rare where a common outage is not.
+    #[test]
+    fn independent_dropout_reaches_both_down_at_roughly_p_squared() {
+        const P: f32 = 0.7;
+        let flaky = ChannelFault {
+            p_online: P,
+            dropout_dwell_s: 0.01,
+            ..ChannelFault::none()
+        };
+        let cfg = DualImuConfig {
+            per_sensor: [ImuFault::gyro(flaky), ImuFault::gyro(flaky)],
+            ..DualImuConfig::none()
+        };
+        let mut d = DualImu::new(cfg, 9);
+        let (mut held, mut n) = (0usize, 0usize);
+        for _ in 0..400_000 {
+            if d.read(G, A, DT).1 == Fusion::Held {
+                held += 1;
+            }
+            n += 1;
+        }
+        let got = held as f32 / n as f32;
+        let want = (1.0 - P) * (1.0 - P);
+        assert!(
+            (got - want).abs() < 0.03,
+            "both-down fraction {got} should be ~{want} = (1-p)^2"
+        );
     }
 
     #[test]

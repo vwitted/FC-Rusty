@@ -67,6 +67,22 @@ impl Rates {
 }
 const TARGET_ALT: f32 = 5.0;
 
+/// Gyro noise floor used on the intermittency axis, deg/s RMS.
+///
+/// Sweeping dropout against ZERO noise measures nothing under --dual: the
+/// surviving sensor carries perfect truth, so losing its partner costs
+/// exactly zero and the column sits flat at baseline. The real cost of
+/// dropping to one sensor is sqrt2 more noise, and that only shows if there
+/// is noise to double.
+///
+/// 1.0 is not the datasheet figure. An ICM-42688P at 0.0028 dps/sqrt(Hz)
+/// through the firmware's 150 Hz filter (ENB ~166 Hz) gives ~0.036 dps RMS,
+/// two orders below this. In flight the gyro floor is vibration-dominated,
+/// not electronic, and 1.0 dps is a realistic build. It also sits where the
+/// noise axis shows visible-but-not-dominant degradation (att_rms 0.029 vs
+/// 0.009 baseline), which is exactly where a sqrt2 change is legible.
+const GYRO_FLOOR_DPS: f32 = 1.0;
+
 /// Spread the disturbances over this many ms instead of stepping the state.
 /// 0 keeps the original instantaneous poke.
 fn disturb_ms() -> f32 {
@@ -161,23 +177,48 @@ fn run_case(cfg: Degradation, seed: u64, r: Rates, filter: bool, dual: bool) -> 
 fn to_dual(cfg: &Degradation) -> DualImuConfig {
     let g = cfg.gyro;
     let noise = ChannelFault { sigma: g.sigma, ..ChannelFault::none() };
+    // Dropout is INDEPENDENT per sensor by default: separate buses, separate
+    // CS lines, so both-down happens only by coincidence at (1-p)^2. Set
+    // CORRELATED_DROPOUT=1 to route the same p to the shared-bus outage
+    // instead -- one task awaits both reads, so starving it (or dipping 3V3)
+    // takes both together. Same p, very different consequence.
+    let correlated = std::env::var("CORRELATED_DROPOUT").is_ok();
+    let drop = ChannelFault {
+        p_online: g.p_online,
+        dropout_dwell_s: g.dropout_dwell_s,
+        ..ChannelFault::none()
+    };
+    let per_drop = if correlated { ChannelFault::none() } else { drop };
     DualImuConfig {
         per_sensor: [
-            ImuFault { gyro: ChannelFault { bias: g.bias, ..noise }, accel: cfg.accel },
             ImuFault {
                 gyro: ChannelFault {
-                    p_online: g.p_online,
-                    dropout_dwell_s: g.dropout_dwell_s,
+                    bias: g.bias,
+                    p_online: per_drop.p_online,
+                    dropout_dwell_s: per_drop.dropout_dwell_s,
+                    ..noise
+                },
+                accel: cfg.accel,
+            },
+            ImuFault {
+                gyro: ChannelFault {
+                    p_online: per_drop.p_online,
+                    dropout_dwell_s: per_drop.dropout_dwell_s,
                     ..noise
                 },
                 accel: cfg.accel,
             },
         ],
-        common: ImuFault::gyro(ChannelFault {
-            vib_amplitude: g.vib_amplitude,
-            vib_hz: g.vib_hz,
-            ..ChannelFault::none()
-        }),
+        common: ImuFault {
+            gyro: ChannelFault {
+                vib_amplitude: g.vib_amplitude,
+                vib_hz: g.vib_hz,
+                p_online: if correlated { drop.p_online } else { 1.0 },
+                dropout_dwell_s: drop.dropout_dwell_s,
+                ..ChannelFault::none()
+            },
+            accel: ChannelFault::none(),
+        },
         skew_s: 0.0,
     }
 }
@@ -541,10 +582,17 @@ fn main() {
     }
 
     // --- intermittent gyro: stale samples held, not gaps ---
-    if !csv { header("gyro intermittency (p online)", "p"); }
+    if !csv {
+        header(&format!("gyro intermittency (p online), sigma {GYRO_FLOOR_DPS} dps"), "p");
+    }
     for &p in &p_onlines {
         let cfg = Degradation {
-            gyro: ChannelFault { p_online: p, dropout_dwell_s: 0.02, ..ChannelFault::none() },
+            gyro: ChannelFault {
+                p_online: p,
+                dropout_dwell_s: 0.02,
+                sigma: GYRO_FLOOR_DPS,
+                ..ChannelFault::none()
+            },
             ..Degradation::none()
         };
         let a = aggregate(cfg, seeds, rates, filter, dual);
