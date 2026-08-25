@@ -66,6 +66,12 @@ impl Rates {
 }
 const TARGET_ALT: f32 = 5.0;
 
+/// Spread the disturbances over this many ms instead of stepping the state.
+/// 0 keeps the original instantaneous poke.
+fn disturb_ms() -> f32 {
+    std::env::var("DISTURB_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0)
+}
+
 /// Why a run ended early. These are not interchangeable: a sink with the
 /// attitude still level says the mixer traded thrust away to hold attitude
 /// (airmode working as designed, and the altitude threshold is what caught
@@ -184,10 +190,36 @@ fn run_case_traced(cfg: Degradation, seed: u64, r: Rates, filter: bool,
         let t = step as f32 * r.dt;
 
         // Same disturbances as sim_mpc_hover, for comparability.
-        if step == (2.0 / r.dt) as usize {
-            sim.state.roll_rate += 10.0;
-        } else if step == (5.0 / r.dt) as usize {
-            sim.state.vz += 2.0;
+        //
+        // These are direct state pokes: an instantaneous step in angular
+        // rate is infinite angular acceleration, with flat spectral content
+        // to Nyquist. Nothing physical can do that -- a real torque acts
+        // through inertia, so rate is continuous. DISTURB_MS spreads the
+        // same total momentum over a raised-cosine window instead, which is
+        // what a gust actually looks like, to test whether a result depends
+        // on the unphysical edge.
+        let dm = disturb_ms();
+        if dm <= 0.0 {
+            if step == (2.0 / r.dt) as usize {
+                sim.state.roll_rate += 10.0;
+            } else if step == (5.0 / r.dt) as usize {
+                sim.state.vz += 2.0;
+            }
+        } else {
+            let win = (dm * 1e-3 / r.dt).max(1.0) as usize;
+            // Raised cosine integrating to 1 over `win` steps.
+            let shape = |k: usize| {
+                let x = (k as f32 + 0.5) / win as f32;
+                (1.0 - libm::cosf(2.0 * PI * x)) / win as f32
+            };
+            let s2 = (2.0 / r.dt) as usize;
+            let s5 = (5.0 / r.dt) as usize;
+            if step >= s2 && step < s2 + win {
+                sim.state.roll_rate += 10.0 * shape(step - s2);
+            }
+            if step >= s5 && step < s5 + win {
+                sim.state.vz += 2.0 * shape(step - s5);
+            }
         }
 
         let truth = sim.read_imu();
