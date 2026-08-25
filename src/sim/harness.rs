@@ -121,6 +121,36 @@ impl Tunables {
     }
 }
 
+/// A commanded attitude step, for measuring TRACKING rather than only
+/// disturbance rejection.
+///
+/// Without this the harness only ever asks for level flight, and a search
+/// scored on it will filter as hard as its bounds allow and wind the
+/// integral up as far as it can -- both are free when nothing ever asks the
+/// aircraft to move. That is not a hypothetical: the first GA run pinned
+/// gyro_fc, d_lpf_tau and ki against their bounds for exactly this reason.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AttitudeStep {
+    pub at_s: f32,
+    pub roll_deg: f32,
+    pub pitch_deg: f32,
+    /// Return to level at this time. A step that is HELD to the end of the
+    /// flight never charges an integrator for its windup -- the offset it
+    /// accumulated is exactly what the held command wants. Commanding the
+    /// way back is what makes overshoot cost something, and without it a
+    /// search drives ki to whatever ceiling it is given.
+    pub return_at_s: f32,
+}
+
+impl AttitudeStep {
+    pub const NONE: AttitudeStep = AttitudeStep {
+        at_s: f32::INFINITY,
+        roll_deg: 0.0,
+        pitch_deg: 0.0,
+        return_at_s: f32::INFINITY,
+    };
+}
+
 /// The exam: everything the tuner may NOT change.
 #[derive(Debug, Clone, Copy)]
 pub struct HarnessCfg {
@@ -134,6 +164,9 @@ pub struct HarnessCfg {
     pub dual: bool,
     /// Dual-IMU fault mapping. Ignored unless `dual`.
     pub dual_cfg: DualImuConfig,
+    /// Commanded attitude step. `AttitudeStep::NONE` keeps the old
+    /// regulate-about-level behaviour exactly.
+    pub cmd: AttitudeStep,
 }
 
 impl HarnessCfg {
@@ -146,6 +179,7 @@ impl HarnessCfg {
             disturb_ms: 0.0,
             dual: false,
             dual_cfg: DualImuConfig::none(),
+            cmd: AttitudeStep::NONE,
         }
     }
 }
@@ -185,6 +219,8 @@ pub fn run_case(
 
     let mut mpc = AttitudeMpc::new();
     mpc.set_reference([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
+    let mut ref_deg = [0.0f32; 2];
+    let mut commanded = false;
 
     let mut rate_pid =
         RatePidController::new(tun.rate, tun.rate, tun.yaw, tun.limits);
@@ -263,6 +299,23 @@ pub fn run_case(
             truth.angle[2] + (angle_err[2] - truth.accel[2]),
         ];
 
+        // Two edges: out to the commanded attitude, then back to level.
+        let want = if t >= h.cmd.return_at_s {
+            [0.0, 0.0]
+        } else if t >= h.cmd.at_s {
+            [h.cmd.roll_deg, h.cmd.pitch_deg]
+        } else {
+            [0.0, 0.0]
+        };
+        if want != ref_deg || !commanded {
+            commanded = true;
+            ref_deg = want;
+            mpc.set_reference(
+                [ref_deg[0] * DEG2RAD, ref_deg[1] * DEG2RAD, 0.0],
+                [0.0, 0.0, 0.0],
+            );
+        }
+
         if step % r.outer_div == 0 {
             let alt = -sim.state.z;
             let vz_up = -sim.state.vz;
@@ -338,7 +391,8 @@ pub fn run_case(
             return Metrics::failed(t, c);
         }
 
-        let att = libm::sqrtf(roll * roll + pitch * pitch);
+        let (re, pe) = (roll - ref_deg[0], pitch - ref_deg[1]);
+        let att = libm::sqrtf(re * re + pe * pe);
         att_max = att_max.max(att);
         att_sq += (att * att) as f64;
         let ae = alt - h.target_alt;

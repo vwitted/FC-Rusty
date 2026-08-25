@@ -200,6 +200,8 @@ fn harness_cfg(cfg: &Degradation, r: Rates, dual: bool) -> (HarnessCfg, Tunables
         disturb_ms: disturb_ms(),
         dual,
         dual_cfg: to_dual(cfg),
+        // The sweep measures regulation about level, as before.
+        cmd: fc_rusty::sim::harness::AttitudeStep::NONE,
     };
     (h, tunables())
 }

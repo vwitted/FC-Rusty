@@ -34,6 +34,11 @@ name = "sim_gps_rescue"
 path = "examples/sim_gps_rescue.rs"
 required-features = []
 
+[[example]]
+name = "ga_tune"
+path = "examples/ga_tune.rs"
+required-features = []
+
 # ---- Features ----
 # "firmware" pulls in all Embassy/Cortex-M/defmt deps for the embedded binary.
 # Disable it (--no-default-features) to build the library and sim examples
