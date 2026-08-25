@@ -733,8 +733,10 @@ async fn dual_icm_read_task(
     let mut last_diag = Instant::now();
 
     // Software LPF on the fused IMU stream. Filters the post-average
-    // signal once with one identical chain rather than relying on the
-    // (different) on-chip filters of the MPU6000 and ICM-42688P.
+    // signal once with one identical chain, so the consumer sees the
+    // same response whether both sensors read or only one did.
+    // (This used to cite the MPU6000's different on-chip filter; the
+    // board carries dual ICM-42688P, two identical parts.)
     // Defaults are 150 Hz gyro / 25 Hz accel — see `imu_filter.rs` for
     // the design notes. Primed lazily on the first successful sample
     // so the consumer doesn't see a startup ramp from zero.

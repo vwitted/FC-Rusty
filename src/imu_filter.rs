@@ -1,20 +1,17 @@
 // imu_filter.rs — Software low-pass filtering for the dual-IMU stream.
 //
-// We left both on-chip UI filters at their wide defaults (ICM-42688P:
-// 1st-order, ODR/2 ≈ 4 kHz; MPU6000: DLPF off, ~256 Hz bandwidth) and
-// do the filtering downstream in software, *after* averaging. Two
-// reasons:
+// We leave both on-chip UI filters at their wide defaults (ICM-42688P:
+// 1st-order, ODR/2 ≈ 4 kHz) and do the filtering downstream in software,
+// *after* averaging, so one identical chain shapes the fused signal and
+// the response stays the same when one sensor drops out.
 //
-//   1. The two chips have different stock filter responses; enabling
-//      hardware filters on only one of them (or matching them exactly
-//      on both) leaves the averaged signal with a mismatched
-//      pass/stop band. Software downstream applies one identical
-//      filter to the fused output.
-//
-//   2. On the MPU6000, enabling the DLPF at any non-zero setting also
-//      drops the gyro ODR from 8 kHz to 1 kHz — a hard chip-level
-//      coupling we can't decouple. Software filtering keeps the full
-//      8 kHz read/predict rate intact.
+// NOTE: this rationale used to be written around an ICM-42688P + MPU6000
+// pair — mismatched stock filter responses, and the MPU6000's DLPF/ODR
+// coupling that dropped the gyro to 1 kHz. This board carries dual
+// ICM-42688P, two identical parts, so neither of those reasons applies
+// any more. Post-average software filtering is still the right call for
+// the dropout-consistency reason above, but if you are re-deciding it,
+// re-decide it on that basis and not on the old one.
 //
 // The MEKF decimates accel 80:1 (8 kHz → 100 Hz gravity update) with
 // **no anti-alias filter today**: anything above 50 Hz aliases into
@@ -24,10 +21,23 @@
 // attenuation fast — 30 Hz only gets −9 dB at 50 Hz — so the default
 // is intentionally on the tight side.
 //
-// Gyro filtering is cosmetic by comparison: the rate PID at 8 kHz
-// integrates noisy gyro directly, but a 150 Hz cutoff adds only ~7°
-// of phase lag at 30 Hz (well above any quad attitude dynamic) so
-// it's mostly free in terms of PID feel.
+// Gyro filtering is NOT cosmetic, and this comment used to say it was.
+// Two corrections, both measured against the biquad below at fs = 8 kHz:
+//
+//   * The lag at 30 Hz is 16.4°, not ~7°. (7° is about right for 10 Hz.)
+//   * More importantly, 30 Hz is the wrong frequency to judge it at. The
+//     rate loop's stability is set by the phase at ITS crossover, not in
+//     the attitude band, and this filter reaches −59° at 100 Hz and −90°
+//     at 150 Hz.
+//
+// examples/sim_sweep.rs finds the loop unstable with this filter at the
+// firmware's own gains, and stable from a ~300 Hz cutoff up; the boundary
+// survives disturbances shaped over 100 ms, so it is not an artefact of a
+// sharp test input. Treat that as a suspicion, not a verdict — the sim's
+// plant is small-angle Euler and its inertia and motor lag are not
+// calibrated to this airframe. But it lines up with the concern already
+// flagged at the rate_gains definition in main.rs: those gains were tuned
+// at 200 Hz and have never been retuned for 8 kHz.
 //
 // Implementation: per-axis Direct-Form-I biquad. With cutoff/sample
 // ratios in the range we use (30/8000 = 0.00375 ... 150/8000 =
