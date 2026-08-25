@@ -66,19 +66,60 @@ impl Rates {
 }
 const TARGET_ALT: f32 = 5.0;
 
+/// Why a run ended early. These are not interchangeable: a sink with the
+/// attitude still level says the mixer traded thrust away to hold attitude
+/// (airmode working as designed, and the altitude threshold is what caught
+/// it), whereas a divergence says the inner loop actually lost the aircraft.
+/// Collapsing them into one "failed" bool made those two indistinguishable
+/// in the table, which is how a mis-set threshold could pass for
+/// instability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailCause {
+    /// Attitude past 90 deg -- control lost.
+    Diverged,
+    /// Reached the ground with attitude still in range.
+    Crashed,
+    /// Climbed past 50 m.
+    Flyaway,
+    /// NaN/inf in the state. Always a harness or solver defect, never a
+    /// flight outcome -- report it separately so it can never be read as one.
+    NonFinite,
+}
+
+impl FailCause {
+    const ALL: [FailCause; 4] = [FailCause::Diverged, FailCause::Crashed,
+                                 FailCause::Flyaway, FailCause::NonFinite];
+    fn idx(self) -> usize {
+        match self {
+            FailCause::Diverged => 0,
+            FailCause::Crashed => 1,
+            FailCause::Flyaway => 2,
+            FailCause::NonFinite => 3,
+        }
+    }
+    fn short(self) -> &'static str {
+        match self {
+            FailCause::Diverged => "div",
+            FailCause::Crashed => "crash",
+            FailCause::Flyaway => "away",
+            FailCause::NonFinite => "nan",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Metrics {
     att_rms: f32,
     att_max: f32,
     alt_rms: f32,
     air_frac: f32,
-    failed_at: Option<f32>,
+    failed_at: Option<(f32, FailCause)>,
 }
 
 impl Metrics {
-    fn failed(t: f32) -> Self {
+    fn failed(t: f32, cause: FailCause) -> Self {
         Self { att_rms: f32::NAN, att_max: f32::NAN, alt_rms: f32::NAN,
-               air_frac: f32::NAN, failed_at: Some(t) }
+               air_frac: f32::NAN, failed_at: Some((t, cause)) }
     }
 }
 
@@ -86,6 +127,15 @@ impl Metrics {
 /// between truth and the controllers, and the same two disturbances so
 /// results are comparable to that example.
 fn run_case(cfg: Degradation, seed: u64, r: Rates, filter: bool) -> Metrics {
+    run_case_traced(cfg, seed, r, filter, false)
+}
+
+/// `trace` prints one row per outer tick. Added because the aggregate table
+/// cannot show WHEN a run leaves the envelope, only that it did -- and the
+/// first real finding here was that the undegraded baseline flies away, which
+/// no amount of staring at the summary would have revealed.
+fn run_case_traced(cfg: Degradation, seed: u64, r: Rates, filter: bool,
+                   trace: bool) -> Metrics {
     let params = QuadParams::default();
     let hover_throttle = (params.mass * 9.81) / params.max_thrust;
     let mut sim = QuadSim::new_hovering(params, TARGET_ALT);
@@ -109,7 +159,11 @@ fn run_case(cfg: Degradation, seed: u64, r: Rates, filter: bool) -> Metrics {
     // anything downstream sees it (imu_filter.rs, applied in the IMU read
     // task). Omitting it does not model a worse quad -- it models a quad
     // that does not exist, and vibration results without it are meaningless.
-    let fc = ImuFilterParams::default().gyro_fc_hz;
+    // GYRO_LPF_HZ overrides the cutoff, for diagnosis only: sweeping it
+    // separates "the filter's phase lag destabilises the loop" from "the
+    // Biquad is mis-parameterised". Default is the firmware's own value.
+    let fc = std::env::var("GYRO_LPF_HZ").ok().and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| ImuFilterParams::default().gyro_fc_hz);
     let mut gyro_lpf = if filter {
         [Biquad::new_lowpass_butterworth(fc, r.inner_hz()); 3]
     } else {
@@ -124,6 +178,7 @@ fn run_case(cfg: Degradation, seed: u64, r: Rates, filter: bool) -> Metrics {
     let mut alt_sq = 0.0f64;
     let mut att_max = 0.0f32;
     let mut air_steps = 0usize;
+    let mut trace_due = false;
 
     for step in 0..steps {
         let t = step as f32 * r.dt;
@@ -164,6 +219,7 @@ fn run_case(cfg: Degradation, seed: u64, r: Rates, filter: bool) -> Metrics {
             let alt = -sim.state.z;
             let vz_up = -sim.state.vz;
             current_thrust = alt_ctrl.update(TARGET_ALT, alt, vz_up, r.dt * r.outer_div as f32);
+            trace_due = trace;
 
             let angles_rad = [angle[0] * DEG2RAD, angle[1] * DEG2RAD, angle[2] * DEG2RAD];
             let rates_rad = [gyro[0] * DEG2RAD, gyro[1] * DEG2RAD, gyro[2] * DEG2RAD];
@@ -185,6 +241,14 @@ fn run_case(cfg: Degradation, seed: u64, r: Rates, filter: bool) -> Metrics {
         let mixed = QUAD_X.apply(&demand);
         let motors = deg.motors(mixed.motors);
 
+        if trace_due {
+            trace_due = false;
+            let msum: f32 = motors.iter().sum();
+            println!("{:6.3} alt={:8.3} vz_up={:8.3} thr_dmd={:6.3} msum/4={:6.3} roll={:7.3} rollrate={:8.2} pid_roll={:7.3}",
+                     t, -sim.state.z, -sim.state.vz, current_thrust, msum / 4.0,
+                     sim.state.roll, sim.state.roll_rate, pid_output[0]);
+        }
+
         // Post-airmode: a motor on a rail means the mixer had nothing left
         // to give, and thrust has already been traded away to hold attitude.
         if motors.iter().any(|&m| m <= 0.001 || m >= 0.999) {
@@ -197,10 +261,24 @@ fn run_case(cfg: Degradation, seed: u64, r: Rates, filter: bool) -> Metrics {
         let pitch = sim.state.pitch;
         let alt = -sim.state.z;
 
-        if !roll.is_finite() || !pitch.is_finite() || !alt.is_finite()
-            || roll.abs() > 90.0 || pitch.abs() > 90.0 || alt <= 0.0 || alt > 50.0
-        {
-            return Metrics::failed(t);
+        // Order matters. NonFinite first: once a value is NaN every
+        // comparison below is false, so a later arm would silently absorb it.
+        // Divergence before Crashed because a tumble that then hits the
+        // ground is a divergence -- the ground contact is its consequence,
+        // and attributing it to altitude would hide the real cause.
+        let cause = if !roll.is_finite() || !pitch.is_finite() || !alt.is_finite() {
+            Some(FailCause::NonFinite)
+        } else if roll.abs() > 90.0 || pitch.abs() > 90.0 {
+            Some(FailCause::Diverged)
+        } else if alt <= 0.0 {
+            Some(FailCause::Crashed)
+        } else if alt > 50.0 {
+            Some(FailCause::Flyaway)
+        } else {
+            None
+        };
+        if let Some(c) = cause {
+            return Metrics::failed(t, c);
         }
 
         let att = (roll * roll + pitch * pitch).sqrt();
@@ -232,16 +310,19 @@ struct Agg {
     failures: usize,
     n: usize,
     first_fail_t: Option<f32>,
+    /// Per-cause tally, indexed by FailCause::idx.
+    causes: [usize; 4],
 }
 
 fn aggregate(cfg: Degradation, seeds: u64, r: Rates, filter: bool) -> Agg {
     let mut a = Agg { att_rms: 0.0, att_max: 0.0, alt_rms: 0.0, air_frac: 0.0,
-                      failures: 0, n: 0, first_fail_t: None };
+                      failures: 0, n: 0, first_fail_t: None, causes: [0; 4] };
     let mut ok = 0usize;
     for s in 0..seeds {
         let m = run_case(cfg, s * 7919 + 1, r, filter);
-        if let Some(t) = m.failed_at {
+        if let Some((t, cause)) = m.failed_at {
             a.failures += 1;
+            a.causes[cause.idx()] += 1;
             a.first_fail_t = Some(a.first_fail_t.map_or(t, |p: f32| p.min(t)));
             continue;
         }
@@ -263,30 +344,39 @@ fn aggregate(cfg: Degradation, seeds: u64, r: Rates, filter: bool) -> Agg {
 fn header(title: &str, knob: &str) {
     println!();
     println!("== {}", title);
-    println!("{:>10} {:>9} {:>9} {:>9} {:>7} {:>10}",
+    println!("{:>10} {:>9} {:>9} {:>9} {:>7} {:>22}",
              knob, "att_rms", "att_max", "alt_rms", "air%", "fail");
-    println!("{}", "-".repeat(60));
+    println!("{}", "-".repeat(72));
 }
 
 fn row(label: String, a: Agg) {
     let fail = if a.failures == 0 {
         "-".to_string()
     } else {
-        format!("{}/{} @{:.1}s", a.failures, a.n,
+        // Name every cause present, not just the majority: a column reading
+        // "5 crash 3 div" is the signal that two different things are going
+        // wrong across seeds, which a single label would hide.
+        let mix: Vec<String> = FailCause::ALL.iter()
+            .filter(|c| a.causes[c.idx()] > 0)
+            .map(|c| format!("{}{}", a.causes[c.idx()], c.short()))
+            .collect();
+        format!("{}/{} {} @{:.1}s", a.failures, a.n, mix.join("+"),
                 a.first_fail_t.unwrap_or(f32::NAN))
     };
     if a.failures == a.n {
-        println!("{:>10} {:>9} {:>9} {:>9} {:>7} {:>10}", label, "-", "-", "-", "-", fail);
+        println!("{:>10} {:>9} {:>9} {:>9} {:>7} {:>22}", label, "-", "-", "-", "-", fail);
     } else {
-        println!("{:>10} {:>9.3} {:>9.3} {:>9.3} {:>6.1}% {:>10}",
+        println!("{:>10} {:>9.3} {:>9.3} {:>9.3} {:>6.1}% {:>22}",
                  label, a.att_rms, a.att_max, a.alt_rms, a.air_frac * 100.0, fail);
     }
 }
 
 fn csv_row(axis: &str, value: f32, a: Agg) {
-    println!("{},{},{:.4},{:.4},{:.4},{:.4},{},{}",
+    println!("{},{},{:.4},{:.4},{:.4},{:.4},{},{},{},{},{},{}",
              axis, value, a.att_rms, a.att_max, a.alt_rms, a.air_frac,
-             a.failures, a.n);
+             a.failures, a.n,
+             a.causes[FailCause::Diverged.idx()], a.causes[FailCause::Crashed.idx()],
+             a.causes[FailCause::Flyaway.idx()], a.causes[FailCause::NonFinite.idx()]);
 }
 
 fn main() {
@@ -297,6 +387,14 @@ fn main() {
     let rates = if legacy { Rates::LEGACY } else { Rates::FIRMWARE };
     let seeds: u64 = 8;
 
+    // --trace: one undegraded run, one row per outer tick. Diagnostic entry
+    // point for "why did this case fail", which the summary cannot answer.
+    if std::env::args().any(|a| a == "--trace") {
+        let m = run_case_traced(Degradation::none(), 1, rates, filter, true);
+        println!("result: {:?}", m.failed_at);
+        return;
+    }
+
     let gyro_sigmas = [0.0f32, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
     let vib_freqs = [10.0f32, 50.0, 100.0, 200.0, 400.0];
     let vib_amps = [0.0f32, 2.0, 5.0, 10.0, 20.0];
@@ -305,7 +403,7 @@ fn main() {
     let biases = [0.0f32, 0.5, 1.0, 2.0, 5.0, 10.0];
 
     if csv {
-        println!("axis,value,att_rms,att_max,alt_rms,air_frac,failures,seeds");
+        println!("axis,value,att_rms,att_max,alt_rms,air_frac,failures,seeds,diverged,crashed,flyaway,nonfinite");
     } else {
         println!("=== control degradation sweep ===");
         println!("{} s flights, {} seeds per case, {:.0} Hz inner / {:.0} Hz outer{}",
