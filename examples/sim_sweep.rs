@@ -34,6 +34,7 @@ use fc_rusty::control::mixer::{ControlDemand, QUAD_X};
 use fc_rusty::control::mpc::AttitudeMpc;
 use fc_rusty::control::pid::{PidGains, PidLimits, RatePidController};
 use fc_rusty::sim::degrade::{ChannelFault, Degradation, Degrader};
+use fc_rusty::sim::dual_imu::{DualImu, DualImuConfig, ImuFault};
 use fc_rusty::imu_filter::{Biquad, ImuFilterParams};
 use fc_rusty::sim::{MotorForces, QuadParams, QuadSim};
 
@@ -132,8 +133,53 @@ impl Metrics {
 /// One flight. Same cascade as sim_mpc_hover, with degradation applied
 /// between truth and the controllers, and the same two disturbances so
 /// results are comparable to that example.
-fn run_case(cfg: Degradation, seed: u64, r: Rates, filter: bool) -> Metrics {
-    run_case_traced(cfg, seed, r, filter, false)
+fn run_case(cfg: Degradation, seed: u64, r: Rates, filter: bool, dual: bool) -> Metrics {
+    run_case_traced(cfg, seed, r, filter, false, dual)
+}
+
+/// Map a single-channel Degradation onto the two-sensor model.
+///
+/// The mapping is the whole point, so it is explicit rather than uniform:
+///
+///   sigma     -> BOTH sensors, independently. Electronic noise is per-part,
+///                so the fused stream sees sigma/sqrt2.
+///   vibration -> COMMON. One airframe resonance, same phase in both parts;
+///                averaging cannot touch it.
+///   bias      -> ONE sensor. A zero offset belongs to a part, not the
+///                frame, so averaging halves it.
+///   p_online  -> ONE sensor. Losing an IMU degrades to single-IMU
+///                operation; it does not blind the rate loop, which is what
+///                the single-channel model wrongly implied.
+///
+/// CAVEAT on that last one. Because the sweep varies p_online with sigma at
+/// zero, the surviving sensor here carries no noise, so a dropout costs
+/// exactly nothing and the dual column comes out flat at the baseline. That
+/// is real in the sense that matters -- the loop keeps a gyro -- but the
+/// benefit is inflated: with both sensors noisy, losing one costs sqrt2. Do
+/// not read the flat column as "dual gyros are immune to a flaky IMU".
+/// Sweeping p_online against a non-zero sigma would measure it properly.
+fn to_dual(cfg: &Degradation) -> DualImuConfig {
+    let g = cfg.gyro;
+    let noise = ChannelFault { sigma: g.sigma, ..ChannelFault::none() };
+    DualImuConfig {
+        per_sensor: [
+            ImuFault { gyro: ChannelFault { bias: g.bias, ..noise }, accel: cfg.accel },
+            ImuFault {
+                gyro: ChannelFault {
+                    p_online: g.p_online,
+                    dropout_dwell_s: g.dropout_dwell_s,
+                    ..noise
+                },
+                accel: cfg.accel,
+            },
+        ],
+        common: ImuFault::gyro(ChannelFault {
+            vib_amplitude: g.vib_amplitude,
+            vib_hz: g.vib_hz,
+            ..ChannelFault::none()
+        }),
+        skew_s: 0.0,
+    }
 }
 
 /// `trace` prints one row per outer tick. Added because the aggregate table
@@ -141,11 +187,13 @@ fn run_case(cfg: Degradation, seed: u64, r: Rates, filter: bool) -> Metrics {
 /// first real finding here was that the undegraded baseline flies away, which
 /// no amount of staring at the summary would have revealed.
 fn run_case_traced(cfg: Degradation, seed: u64, r: Rates, filter: bool,
-                   trace: bool) -> Metrics {
+                   trace: bool, dual: bool) -> Metrics {
     let params = QuadParams::default();
     let hover_throttle = (params.mass * 9.81) / params.max_thrust;
     let mut sim = QuadSim::new_hovering(params, TARGET_ALT);
     let mut deg = Degrader::new(cfg, seed);
+    // Motors always come from `deg`; only the IMU path forks.
+    let mut dual_imu = DualImu::new(to_dual(&cfg), seed);
 
     let mut alt_ctrl = AltitudeController::new(
         AltitudeGains { kp: 0.15, kd: 0.1, ki: 0.05 },
@@ -223,7 +271,11 @@ fn run_case_traced(cfg: Degradation, seed: u64, r: Rates, filter: bool,
         }
 
         let truth = sim.read_imu();
-        let (gyro_raw, angle_err) = deg.imu(truth.gyro, truth.accel, r.dt);
+        let (gyro_raw, angle_err) = if dual {
+            dual_imu.read(truth.gyro, truth.accel, r.dt).0
+        } else {
+            deg.imu(truth.gyro, truth.accel, r.dt)
+        };
 
         if !primed {
             for i in 0..3 {
@@ -346,12 +398,12 @@ struct Agg {
     causes: [usize; 4],
 }
 
-fn aggregate(cfg: Degradation, seeds: u64, r: Rates, filter: bool) -> Agg {
+fn aggregate(cfg: Degradation, seeds: u64, r: Rates, filter: bool, dual: bool) -> Agg {
     let mut a = Agg { att_rms: 0.0, att_max: 0.0, alt_rms: 0.0, air_frac: 0.0,
                       failures: 0, n: 0, first_fail_t: None, causes: [0; 4] };
     let mut ok = 0usize;
     for s in 0..seeds {
-        let m = run_case(cfg, s * 7919 + 1, r, filter);
+        let m = run_case(cfg, s * 7919 + 1, r, filter, dual);
         if let Some((t, cause)) = m.failed_at {
             a.failures += 1;
             a.causes[cause.idx()] += 1;
@@ -416,13 +468,16 @@ fn main() {
     let legacy = std::env::args().any(|a| a == "--legacy");
     // --nofilter drops the firmware's gyro LPF, to show what it is buying.
     let filter = !std::env::args().any(|a| a == "--nofilter");
+    // --dual: model the board's two gyros (see to_dual). Off by default so
+    // the single-gyro results in f005c4a and ff359bc stay reproducible.
+    let dual = std::env::args().any(|a| a == "--dual");
     let rates = if legacy { Rates::LEGACY } else { Rates::FIRMWARE };
     let seeds: u64 = 8;
 
     // --trace: one undegraded run, one row per outer tick. Diagnostic entry
     // point for "why did this case fail", which the summary cannot answer.
     if std::env::args().any(|a| a == "--trace") {
-        let m = run_case_traced(Degradation::none(), 1, rates, filter, true);
+        let m = run_case_traced(Degradation::none(), 1, rates, filter, true, dual);
         println!("result: {:?}", m.failed_at);
         return;
     }
@@ -453,7 +508,7 @@ fn main() {
             gyro: ChannelFault { sigma: s, ..ChannelFault::none() },
             ..Degradation::none()
         };
-        let a = aggregate(cfg, seeds, rates, filter);
+        let a = aggregate(cfg, seeds, rates, filter, dual);
         if csv { csv_row("gyro_sigma_dps", s, a) } else { row(format!("{:.2}", s), a) }
     }
 
@@ -464,7 +519,7 @@ fn main() {
             gyro: ChannelFault { bias: [b, 0.0, 0.0], ..ChannelFault::none() },
             ..Degradation::none()
         };
-        let a = aggregate(cfg, seeds, rates, filter);
+        let a = aggregate(cfg, seeds, rates, filter, dual);
         if csv { csv_row("gyro_bias_dps", b, a) } else { row(format!("{:.2}", b), a) }
     }
 
@@ -476,7 +531,7 @@ fn main() {
                 gyro: ChannelFault { vib_amplitude: amp, vib_hz: f, ..ChannelFault::none() },
                 ..Degradation::none()
             };
-            let a = aggregate(cfg, seeds, rates, filter);
+            let a = aggregate(cfg, seeds, rates, filter, dual);
             if csv {
                 csv_row(&format!("vib_{:.0}hz_amp_dps", f), amp, a)
             } else {
@@ -492,7 +547,7 @@ fn main() {
             gyro: ChannelFault { p_online: p, dropout_dwell_s: 0.02, ..ChannelFault::none() },
             ..Degradation::none()
         };
-        let a = aggregate(cfg, seeds, rates, filter);
+        let a = aggregate(cfg, seeds, rates, filter, dual);
         if csv { csv_row("gyro_p_online", p, a) } else { row(format!("{:.2}", p), a) }
     }
 
@@ -500,7 +555,7 @@ fn main() {
     if !csv { header("motor 3 thrust scale", "scale"); }
     for &m in &motor_scales {
         let cfg = Degradation { motor_scale: [1.0, 1.0, m, 1.0], ..Degradation::none() };
-        let a = aggregate(cfg, seeds, rates, filter);
+        let a = aggregate(cfg, seeds, rates, filter, dual);
         if csv { csv_row("motor3_scale", m, a) } else { row(format!("{:.2}", m), a) }
     }
 
@@ -519,7 +574,7 @@ fn main() {
                 gyro: ChannelFault { vib_amplitude: 5.0, vib_hz: f, ..ChannelFault::none() },
                 ..Degradation::none()
             };
-            let a = aggregate(cfg, seeds, r, filter);
+            let a = aggregate(cfg, seeds, r, filter, dual);
             if csv {
                 csv_row(&format!("resonance_{}_hz", name.replace(' ', "_")), f, a)
             } else {

@@ -41,15 +41,38 @@ pub enum Fusion {
     Held,
 }
 
+/// One sensor's faults. Gyro and accel are separate because they are
+/// separate signals off the same die: a gyro noise sweep must not quietly
+/// inject the same noise into the accel channel, which downstream stands in
+/// for attitude-estimate error and reaches the controller by another path.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ImuFault {
+    pub gyro: ChannelFault,
+    pub accel: ChannelFault,
+}
+
+impl ImuFault {
+    pub const fn none() -> Self {
+        Self { gyro: ChannelFault::none(), accel: ChannelFault::none() }
+    }
+    /// Gyro-only fault; accel left clean.
+    pub const fn gyro(f: ChannelFault) -> Self {
+        Self { gyro: f, accel: ChannelFault::none() }
+    }
+    pub fn is_clean(&self) -> bool {
+        self.gyro.is_clean() && self.accel.is_clean()
+    }
+}
+
 /// Faults for a two-sensor IMU.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DualImuConfig {
     /// Applied to each sensor independently — its own noise draw, its own
     /// bias, its own dropout run. This is the part averaging can reduce.
-    pub per_sensor: [ChannelFault; 2],
+    pub per_sensor: [ImuFault; 2],
     /// Applied identically to both, same vibration phase. Airframe motion
     /// the two parts genuinely share. Averaging cannot touch this.
-    pub common: ChannelFault,
+    pub common: ImuFault,
     /// Seconds between the two reads. The firmware awaits IMU1 then IMU2
     /// inside one 125 us tick, so IMU2's sample is roughly one SPI burst
     /// later. Averaging samples taken at different instants is a small
@@ -60,8 +83,8 @@ pub struct DualImuConfig {
 impl DualImuConfig {
     pub const fn none() -> Self {
         Self {
-            per_sensor: [ChannelFault::none(), ChannelFault::none()],
-            common: ChannelFault::none(),
+            per_sensor: [ImuFault::none(), ImuFault::none()],
+            common: ImuFault::none(),
             skew_s: 0.0,
         }
     }
@@ -69,15 +92,16 @@ impl DualImuConfig {
     /// Both sensors given the same independent-noise fault. The common
     /// channel stays clean, so this is the case averaging SHOULD help.
     pub const fn independent(f: ChannelFault) -> Self {
-        Self { per_sensor: [f, f], common: ChannelFault::none(), skew_s: 0.0 }
+        let g = ImuFault::gyro(f);
+        Self { per_sensor: [g, g], common: ImuFault::none(), skew_s: 0.0 }
     }
 
     /// A fault both sensors share — prop imbalance, frame resonance. The
     /// case averaging should NOT help.
     pub const fn common_mode(f: ChannelFault) -> Self {
         Self {
-            per_sensor: [ChannelFault::none(), ChannelFault::none()],
-            common: f,
+            per_sensor: [ImuFault::none(), ImuFault::none()],
+            common: ImuFault::gyro(f),
             skew_s: 0.0,
         }
     }
@@ -151,13 +175,16 @@ impl DualImu {
         // both sensors at the SAME phase. Computing it once is what makes it
         // common-mode; drawing it per sensor would quietly turn the airframe's
         // single resonance into two, which averaging would then wrongly halve.
-        let common_vib = vib_at(&self.cfg.common, self.t);
+        let common_vib_g = vib_at(&self.cfg.common.gyro, self.t);
+        let common_vib_a = vib_at(&self.cfg.common.accel, self.t);
 
-        let on0 = self.drop[0].tick(&self.cfg.per_sensor[0], dt, &mut self.rng[0]);
-        let on1 = self.drop[1].tick(&self.cfg.per_sensor[1], dt, &mut self.rng[1]);
+        // A failed SPI read loses that chip's gyro AND accel, so sensor
+        // availability is one decision per sensor, keyed off its gyro fault.
+        let on0 = self.drop[0].tick(&self.cfg.per_sensor[0].gyro, dt, &mut self.rng[0]);
+        let on1 = self.drop[1].tick(&self.cfg.per_sensor[1].gyro, dt, &mut self.rng[1]);
 
-        let s0 = self.sample(0, truth1, common_vib);
-        let s1 = self.sample(1, truth2, common_vib);
+        let s0 = self.sample(0, truth1, common_vib_g, common_vib_a);
+        let s1 = self.sample(1, truth2, common_vib_g, common_vib_a);
 
         let (fused, how) = match (on0, on1) {
             (true, true) => ((mean3(s0.0, s1.0), mean3(s0.1, s1.1)), Fusion::Both),
@@ -177,20 +204,24 @@ impl DualImu {
         &mut self,
         i: usize,
         truth: ([f32; 3], [f32; 3]),
-        common_vib: f32,
+        common_vib_g: f32,
+        common_vib_a: f32,
     ) -> ([f32; 3], [f32; 3]) {
         let per = self.cfg.per_sensor[i];
         let com = self.cfg.common;
-        let per_vib = vib_at(&per, self.t);
+        let per_vib_g = vib_at(&per.gyro, self.t);
+        let per_vib_a = vib_at(&per.accel, self.t);
         let mut g = [0.0f32; 3];
         let mut a = [0.0f32; 3];
         for k in 0..3 {
-            g[k] = truth.0[k] + com.bias[k] + per.bias[k] + common_vib + per_vib
-                + draw(&mut self.rng[i], com.sigma)
-                + draw(&mut self.rng[i], per.sigma);
-            a[k] = truth.1[k] + com.bias[k] + per.bias[k] + common_vib + per_vib
-                + draw(&mut self.rng[i], com.sigma)
-                + draw(&mut self.rng[i], per.sigma);
+            g[k] = truth.0[k] + com.gyro.bias[k] + per.gyro.bias[k]
+                + common_vib_g + per_vib_g
+                + draw(&mut self.rng[i], com.gyro.sigma)
+                + draw(&mut self.rng[i], per.gyro.sigma);
+            a[k] = truth.1[k] + com.accel.bias[k] + per.accel.bias[k]
+                + common_vib_a + per_vib_a
+                + draw(&mut self.rng[i], com.accel.sigma)
+                + draw(&mut self.rng[i], per.accel.sigma);
         }
         (g, a)
     }
@@ -291,7 +322,7 @@ mod tests {
         let mut common = DualImu::new(DualImuConfig::common_mode(f), 7);
         let mut split = DualImu::new(
             DualImuConfig {
-                per_sensor: [f, ChannelFault::none()],
+                per_sensor: [ImuFault::gyro(f), ImuFault::none()],
                 ..DualImuConfig::none()
             },
             7,
@@ -311,7 +342,7 @@ mod tests {
     fn one_sensor_dead_still_tracks_truth() {
         let dead = ChannelFault { p_online: 0.0, ..ChannelFault::none() };
         let cfg = DualImuConfig {
-            per_sensor: [ChannelFault::none(), dead],
+            per_sensor: [ImuFault::none(), ImuFault::gyro(dead)],
             ..DualImuConfig::none()
         };
         let mut d = DualImu::new(cfg, 3);
@@ -326,7 +357,10 @@ mod tests {
     fn both_dead_holds_the_last_good_sample() {
         let dead = ChannelFault { p_online: 0.0, ..ChannelFault::none() };
         let mut d = DualImu::new(
-            DualImuConfig { per_sensor: [dead, dead], ..DualImuConfig::none() },
+            DualImuConfig {
+                per_sensor: [ImuFault::gyro(dead), ImuFault::gyro(dead)],
+                ..DualImuConfig::none()
+            },
             3,
         );
         let ((g, _), how) = d.read(G, A, DT);
@@ -356,6 +390,22 @@ mod tests {
             }
         }
         assert!(last > 0.0);
+    }
+
+    /// The bug this split fixes: a gyro-only fault must leave the accel
+    /// channel untouched. Collapsing them made a gyro noise sweep inject the
+    /// same noise into accel, which the harness reads as attitude-estimate
+    /// error -- so "dual gyros" came out WORSE than one, for a reason that
+    /// had nothing to do with gyros.
+    #[test]
+    fn a_gyro_fault_does_not_leak_into_the_accel_channel() {
+        let f = ChannelFault { sigma: 5.0, bias: [1.0; 3], ..ChannelFault::none() };
+        let mut d = DualImu::new(DualImuConfig::independent(f), 11);
+        for _ in 0..2_000 {
+            let ((g, a), _) = d.read(G, A, DT);
+            assert_eq!(a, A, "accel must be untouched by a gyro-only fault");
+            assert!(g != G, "gyro should be corrupted");
+        }
     }
 
     #[test]
