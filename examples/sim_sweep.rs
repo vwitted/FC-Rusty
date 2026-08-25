@@ -29,42 +29,20 @@
 //   fail      diverged: attitude > 90 deg, crashed (alt <= 0), flew away
 //             (alt > 50 m), or went non-finite. Reported with the time.
 
-use fc_rusty::control::altitude::{AltitudeController, AltitudeGains};
-use fc_rusty::control::mixer::{ControlDemand, QUAD_X};
-use fc_rusty::control::mpc::AttitudeMpc;
-use fc_rusty::control::pid::{PidGains, PidLimits, RatePidController};
-use fc_rusty::sim::degrade::{ChannelFault, Degradation, Degrader};
-use fc_rusty::sim::dual_imu::{DualImu, DualImuConfig, ImuFault};
-use fc_rusty::imu_filter::{Biquad, ImuFilterParams};
-use fc_rusty::sim::{MotorForces, QuadParams, QuadSim};
-
-use core::f32::consts::PI;
-
-const DEG2RAD: f32 = PI / 180.0;
-const RAD2DEG: f32 = 180.0 / PI;
+// The cascade itself lives in src/sim/harness.rs so this sweep and the
+// tuner in ga_tune.rs drive ONE implementation. Two copies would drift, and
+// a tuner optimising a subtly different plant than the sweep reports on is
+// worse than no tuner.
+use fc_rusty::imu_filter::ImuFilterParams;
+use fc_rusty::sim::degrade::{ChannelFault, Degradation};
+use fc_rusty::sim::dual_imu::{DualImuConfig, ImuFault};
+use fc_rusty::sim::harness::{
+    run_case, FailCause, HarnessCfg, Rates, Tunables,
+};
+use fc_rusty::sim::QuadParams;
 
 const TOTAL_S: f32 = 10.0;
 
-/// Loop rates. The gains are rate-independent (the PID integrates
-/// `error * dt` and the D-term LPF is specified as a time constant), so
-/// comparing across rates measures discretisation and aliasing rather than
-/// an accidental retune.
-#[derive(Debug, Clone, Copy)]
-struct Rates {
-    dt: f32,
-    outer_div: usize,
-}
-
-impl Rates {
-    /// What actually flies: 8 kHz IMU/rate loop, 100 Hz MPC.
-    const FIRMWARE: Rates = Rates { dt: 125e-6, outer_div: 80 };
-    /// What examples/sim_mpc_hover.rs uses -- 200 Hz / 50 Hz, inherited from
-    /// the F405 days. Kept so old results remain reproducible.
-    const LEGACY: Rates = Rates { dt: 0.005, outer_div: 4 };
-
-    fn inner_hz(&self) -> f32 { 1.0 / self.dt }
-    fn outer_hz(&self) -> f32 { 1.0 / (self.dt * self.outer_div as f32) }
-}
 const TARGET_ALT: f32 = 5.0;
 
 /// Gyro noise floor used on the intermittency axis, deg/s RMS.
@@ -122,70 +100,6 @@ fn plant_params() -> QuadParams {
 /// 0 keeps the original instantaneous poke.
 fn disturb_ms() -> f32 {
     std::env::var("DISTURB_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0)
-}
-
-/// Why a run ended early. These are not interchangeable: a sink with the
-/// attitude still level says the mixer traded thrust away to hold attitude
-/// (airmode working as designed, and the altitude threshold is what caught
-/// it), whereas a divergence says the inner loop actually lost the aircraft.
-/// Collapsing them into one "failed" bool made those two indistinguishable
-/// in the table, which is how a mis-set threshold could pass for
-/// instability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FailCause {
-    /// Attitude past 90 deg -- control lost.
-    Diverged,
-    /// Reached the ground with attitude still in range.
-    Crashed,
-    /// Climbed past 50 m.
-    Flyaway,
-    /// NaN/inf in the state. Always a harness or solver defect, never a
-    /// flight outcome -- report it separately so it can never be read as one.
-    NonFinite,
-}
-
-impl FailCause {
-    const ALL: [FailCause; 4] = [FailCause::Diverged, FailCause::Crashed,
-                                 FailCause::Flyaway, FailCause::NonFinite];
-    fn idx(self) -> usize {
-        match self {
-            FailCause::Diverged => 0,
-            FailCause::Crashed => 1,
-            FailCause::Flyaway => 2,
-            FailCause::NonFinite => 3,
-        }
-    }
-    fn short(self) -> &'static str {
-        match self {
-            FailCause::Diverged => "div",
-            FailCause::Crashed => "crash",
-            FailCause::Flyaway => "away",
-            FailCause::NonFinite => "nan",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Metrics {
-    att_rms: f32,
-    att_max: f32,
-    alt_rms: f32,
-    air_frac: f32,
-    failed_at: Option<(f32, FailCause)>,
-}
-
-impl Metrics {
-    fn failed(t: f32, cause: FailCause) -> Self {
-        Self { att_rms: f32::NAN, att_max: f32::NAN, alt_rms: f32::NAN,
-               air_frac: f32::NAN, failed_at: Some((t, cause)) }
-    }
-}
-
-/// One flight. Same cascade as sim_mpc_hover, with degradation applied
-/// between truth and the controllers, and the same two disturbances so
-/// results are comparable to that example.
-fn run_case(cfg: Degradation, seed: u64, r: Rates, filter: bool, dual: bool) -> Metrics {
-    run_case_traced(cfg, seed, r, filter, false, dual)
 }
 
 /// Map a single-channel Degradation onto the two-sensor model.
@@ -258,206 +172,6 @@ fn to_dual(cfg: &Degradation) -> DualImuConfig {
     }
 }
 
-/// `trace` prints one row per outer tick. Added because the aggregate table
-/// cannot show WHEN a run leaves the envelope, only that it did -- and the
-/// first real finding here was that the undegraded baseline flies away, which
-/// no amount of staring at the summary would have revealed.
-fn run_case_traced(cfg: Degradation, seed: u64, r: Rates, filter: bool,
-                   trace: bool, dual: bool) -> Metrics {
-    let params = plant_params();
-    let hover_throttle = (params.mass * 9.81) / params.max_thrust;
-    let mut sim = QuadSim::new_hovering(params, TARGET_ALT);
-    let mut deg = Degrader::new(cfg, seed);
-    // Motors always come from `deg`; only the IMU path forks.
-    let mut dual_imu = DualImu::new(to_dual(&cfg), seed);
-
-    let mut alt_ctrl = AltitudeController::new(
-        AltitudeGains { kp: 0.15, kd: 0.1, ki: 0.05 },
-        hover_throttle,
-    );
-    let mut current_thrust = hover_throttle;
-
-    let mut mpc = AttitudeMpc::new();
-    mpc.set_reference([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
-
-    let rate_gains = PidGains { kp: 0.02, ki: 0.005, kd: 0.001 };
-    let yaw_gains = PidGains { kp: 0.03, ki: 0.005, kd: 0.0 };
-    let limits = PidLimits { integral_max: 0.3, output_max: 0.5, d_lpf_tau_s: 0.008 };
-    let mut rate_pid = RatePidController::new(rate_gains, rate_gains, yaw_gains, limits);
-
-    // The firmware runs a 150 Hz Butterworth on the gyro at 8 kHz before
-    // anything downstream sees it (imu_filter.rs, applied in the IMU read
-    // task). Omitting it does not model a worse quad -- it models a quad
-    // that does not exist, and vibration results without it are meaningless.
-    // GYRO_LPF_HZ overrides the cutoff, for diagnosis only: sweeping it
-    // separates "the filter's phase lag destabilises the loop" from "the
-    // Biquad is mis-parameterised". Default is the firmware's own value.
-    let fc = std::env::var("GYRO_LPF_HZ").ok().and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| ImuFilterParams::default().gyro_fc_hz);
-    let mut gyro_lpf = if filter {
-        [Biquad::new_lowpass_butterworth(fc, r.inner_hz()); 3]
-    } else {
-        [Biquad::identity(); 3]
-    };
-    let mut primed = false;
-
-    let steps = (TOTAL_S / r.dt) as usize;
-    let mut rate_sp_degs = [0.0f32; 3];
-
-    let mut att_sq = 0.0f64;
-    let mut alt_sq = 0.0f64;
-    let mut att_max = 0.0f32;
-    let mut air_steps = 0usize;
-    let mut trace_due = false;
-
-    for step in 0..steps {
-        let t = step as f32 * r.dt;
-
-        // Same disturbances as sim_mpc_hover, for comparability.
-        //
-        // These are direct state pokes: an instantaneous step in angular
-        // rate is infinite angular acceleration, with flat spectral content
-        // to Nyquist. Nothing physical can do that -- a real torque acts
-        // through inertia, so rate is continuous. DISTURB_MS spreads the
-        // same total momentum over a raised-cosine window instead, which is
-        // what a gust actually looks like, to test whether a result depends
-        // on the unphysical edge.
-        let dm = disturb_ms();
-        if dm <= 0.0 {
-            if step == (2.0 / r.dt) as usize {
-                sim.state.roll_rate += 10.0;
-            } else if step == (5.0 / r.dt) as usize {
-                sim.state.vz += 2.0;
-            }
-        } else {
-            let win = (dm * 1e-3 / r.dt).max(1.0) as usize;
-            // Raised cosine integrating to 1 over `win` steps.
-            let shape = |k: usize| {
-                let x = (k as f32 + 0.5) / win as f32;
-                (1.0 - libm::cosf(2.0 * PI * x)) / win as f32
-            };
-            let s2 = (2.0 / r.dt) as usize;
-            let s5 = (5.0 / r.dt) as usize;
-            if step >= s2 && step < s2 + win {
-                sim.state.roll_rate += 10.0 * shape(step - s2);
-            }
-            if step >= s5 && step < s5 + win {
-                sim.state.vz += 2.0 * shape(step - s5);
-            }
-        }
-
-        let truth = sim.read_imu();
-        let (gyro_raw, angle_err) = if dual {
-            dual_imu.read(truth.gyro, truth.accel, r.dt).0
-        } else {
-            deg.imu(truth.gyro, truth.accel, r.dt)
-        };
-
-        if !primed {
-            for i in 0..3 {
-                gyro_lpf[i].prime(gyro_raw[i]);
-            }
-            primed = true;
-        }
-        let gyro = [
-            gyro_lpf[0].apply(gyro_raw[0]),
-            gyro_lpf[1].apply(gyro_raw[1]),
-            gyro_lpf[2].apply(gyro_raw[2]),
-        ];
-
-        // The accel channel stands in for attitude-ESTIMATE error: this
-        // harness feeds truth angles (there is no estimator in the loop), so
-        // accel noise has nothing physical to propagate through. Treating it
-        // as angle error is the honest interpretation of that knob here.
-        let angle = [
-            truth.angle[0] + (angle_err[0] - truth.accel[0]),
-            truth.angle[1] + (angle_err[1] - truth.accel[1]),
-            truth.angle[2] + (angle_err[2] - truth.accel[2]),
-        ];
-
-        if step % r.outer_div == 0 {
-            let alt = -sim.state.z;
-            let vz_up = -sim.state.vz;
-            current_thrust = alt_ctrl.update(TARGET_ALT, alt, vz_up, r.dt * r.outer_div as f32);
-            trace_due = trace;
-
-            let angles_rad = [angle[0] * DEG2RAD, angle[1] * DEG2RAD, angle[2] * DEG2RAD];
-            let rates_rad = [gyro[0] * DEG2RAD, gyro[1] * DEG2RAD, gyro[2] * DEG2RAD];
-            let out = mpc.solve(angles_rad, rates_rad);
-            rate_sp_degs = [
-                out.rate_setpoints_rads[0] * RAD2DEG,
-                out.rate_setpoints_rads[1] * RAD2DEG,
-                out.rate_setpoints_rads[2] * RAD2DEG,
-            ];
-        }
-
-        let pid_output = rate_pid.update(rate_sp_degs, gyro, r.dt);
-        let demand = ControlDemand {
-            thrust: current_thrust,
-            roll: pid_output[0],
-            pitch: pid_output[1],
-            yaw: pid_output[2],
-        };
-        let mixed = QUAD_X.apply(&demand);
-        let motors = deg.motors(mixed.motors);
-
-        if trace_due {
-            trace_due = false;
-            let msum: f32 = motors.iter().sum();
-            println!("{:6.3} alt={:8.3} vz_up={:8.3} thr_dmd={:6.3} msum/4={:6.3} roll={:7.3} rollrate={:8.2} pid_roll={:7.3}",
-                     t, -sim.state.z, -sim.state.vz, current_thrust, msum / 4.0,
-                     sim.state.roll, sim.state.roll_rate, pid_output[0]);
-        }
-
-        // Post-airmode: a motor on a rail means the mixer had nothing left
-        // to give, and thrust has already been traded away to hold attitude.
-        if motors.iter().any(|&m| m <= 0.001 || m >= 0.999) {
-            air_steps += 1;
-        }
-
-        sim.step(&MotorForces { motors }, r.dt);
-
-        let roll = sim.state.roll;
-        let pitch = sim.state.pitch;
-        let alt = -sim.state.z;
-
-        // Order matters. NonFinite first: once a value is NaN every
-        // comparison below is false, so a later arm would silently absorb it.
-        // Divergence before Crashed because a tumble that then hits the
-        // ground is a divergence -- the ground contact is its consequence,
-        // and attributing it to altitude would hide the real cause.
-        let cause = if !roll.is_finite() || !pitch.is_finite() || !alt.is_finite() {
-            Some(FailCause::NonFinite)
-        } else if roll.abs() > 90.0 || pitch.abs() > 90.0 {
-            Some(FailCause::Diverged)
-        } else if alt <= 0.0 {
-            Some(FailCause::Crashed)
-        } else if alt > 50.0 {
-            Some(FailCause::Flyaway)
-        } else {
-            None
-        };
-        if let Some(c) = cause {
-            return Metrics::failed(t, c);
-        }
-
-        let att = (roll * roll + pitch * pitch).sqrt();
-        att_max = att_max.max(att);
-        att_sq += (att * att) as f64;
-        let ae = alt - TARGET_ALT;
-        alt_sq += (ae * ae) as f64;
-    }
-
-    let n = steps as f64;
-    Metrics {
-        att_rms: (att_sq / n).sqrt() as f32,
-        att_max,
-        alt_rms: (alt_sq / n).sqrt() as f32,
-        air_frac: air_steps as f32 / steps as f32,
-        failed_at: None,
-    }
-}
-
 /// Aggregate over seeds. Worst case is reported alongside the mean because a
 /// stack that survives on average and diverges one run in twenty is not one
 /// you want to fly.
@@ -474,12 +188,41 @@ struct Agg {
     causes: [usize; 4],
 }
 
-fn aggregate(cfg: Degradation, seeds: u64, r: Rates, filter: bool, dual: bool) -> Agg {
+/// Assemble the exam (plant, rates, disturbance shaping, dual-IMU mapping)
+/// and the answers (firmware tunables, with the cutoff overridable for the
+/// diagnostic cutoff sweep).
+fn harness_cfg(cfg: &Degradation, r: Rates, dual: bool) -> (HarnessCfg, Tunables) {
+    let h = HarnessCfg {
+        rates: r,
+        plant: plant_params(),
+        total_s: TOTAL_S,
+        target_alt: TARGET_ALT,
+        disturb_ms: disturb_ms(),
+        dual,
+        dual_cfg: to_dual(cfg),
+    };
+    (h, tunables())
+}
+
+/// The firmware's own values, with GYRO_LPF_HZ overriding the cutoff for
+/// diagnosis, and --nofilter removing the filter entirely.
+fn tunables() -> Tunables {
+    let mut t = Tunables::firmware();
+    t.gyro_fc_hz = std::env::var("GYRO_LPF_HZ").ok().and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| ImuFilterParams::default().gyro_fc_hz);
+    if std::env::args().any(|a| a == "--nofilter") {
+        t.gyro_fc_hz = 0.0;
+    }
+    t
+}
+
+fn aggregate(cfg: Degradation, seeds: u64, r: Rates, dual: bool) -> Agg {
+    let (h, tun) = harness_cfg(&cfg, r, dual);
     let mut a = Agg { att_rms: 0.0, att_max: 0.0, alt_rms: 0.0, air_frac: 0.0,
                       failures: 0, n: 0, first_fail_t: None, causes: [0; 4] };
     let mut ok = 0usize;
     for s in 0..seeds {
-        let m = run_case(cfg, s * 7919 + 1, r, filter, dual);
+        let m = run_case(&h, &tun, cfg, s * 7919 + 1, None);
         if let Some((t, cause)) = m.failed_at {
             a.failures += 1;
             a.causes[cause.idx()] += 1;
@@ -553,7 +296,16 @@ fn main() {
     // --trace: one undegraded run, one row per outer tick. Diagnostic entry
     // point for "why did this case fail", which the summary cannot answer.
     if std::env::args().any(|a| a == "--trace") {
-        let m = run_case_traced(Degradation::none(), 1, rates, filter, true, dual);
+        let cfg = Degradation::none();
+        let (h, tun) = harness_cfg(&cfg, rates, dual);
+        let mut show = |p: fc_rusty::sim::harness::TracePoint| {
+            println!(
+                "{:6.3} alt={:8.3} vz_up={:8.3} thr_dmd={:6.3} msum/4={:6.3} roll={:7.3} rollrate={:8.2} pid_roll={:7.3}",
+                p.t, p.alt, p.vz_up, p.thrust_demand, p.motor_mean,
+                p.roll, p.roll_rate, p.pid_roll
+            );
+        };
+        let m = run_case(&h, &tun, cfg, 1, Some(&mut show));
         println!("result: {:?}", m.failed_at);
         return;
     }
@@ -584,7 +336,7 @@ fn main() {
             gyro: ChannelFault { sigma: s, ..ChannelFault::none() },
             ..Degradation::none()
         };
-        let a = aggregate(cfg, seeds, rates, filter, dual);
+        let a = aggregate(cfg, seeds, rates, dual);
         if csv { csv_row("gyro_sigma_dps", s, a) } else { row(format!("{:.2}", s), a) }
     }
 
@@ -595,7 +347,7 @@ fn main() {
             gyro: ChannelFault { bias: [b, 0.0, 0.0], ..ChannelFault::none() },
             ..Degradation::none()
         };
-        let a = aggregate(cfg, seeds, rates, filter, dual);
+        let a = aggregate(cfg, seeds, rates, dual);
         if csv { csv_row("gyro_bias_dps", b, a) } else { row(format!("{:.2}", b), a) }
     }
 
@@ -607,7 +359,7 @@ fn main() {
                 gyro: ChannelFault { vib_amplitude: amp, vib_hz: f, ..ChannelFault::none() },
                 ..Degradation::none()
             };
-            let a = aggregate(cfg, seeds, rates, filter, dual);
+            let a = aggregate(cfg, seeds, rates, dual);
             if csv {
                 csv_row(&format!("vib_{:.0}hz_amp_dps", f), amp, a)
             } else {
@@ -630,7 +382,7 @@ fn main() {
             },
             ..Degradation::none()
         };
-        let a = aggregate(cfg, seeds, rates, filter, dual);
+        let a = aggregate(cfg, seeds, rates, dual);
         if csv { csv_row("gyro_p_online", p, a) } else { row(format!("{:.2}", p), a) }
     }
 
@@ -638,7 +390,7 @@ fn main() {
     if !csv { header("motor 3 thrust scale", "scale"); }
     for &m in &motor_scales {
         let cfg = Degradation { motor_scale: [1.0, 1.0, m, 1.0], ..Degradation::none() };
-        let a = aggregate(cfg, seeds, rates, filter, dual);
+        let a = aggregate(cfg, seeds, rates, dual);
         if csv { csv_row("motor3_scale", m, a) } else { row(format!("{:.2}", m), a) }
     }
 
@@ -657,7 +409,7 @@ fn main() {
                 gyro: ChannelFault { vib_amplitude: 5.0, vib_hz: f, ..ChannelFault::none() },
                 ..Degradation::none()
             };
-            let a = aggregate(cfg, seeds, r, filter, dual);
+            let a = aggregate(cfg, seeds, r, dual);
             if csv {
                 csv_row(&format!("resonance_{}_hz", name.replace(' ', "_")), f, a)
             } else {

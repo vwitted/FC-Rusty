@@ -27,7 +27,7 @@
 ///   - Kp first, until it oscillates, then back off ~30%
 ///   - Kd next, to dampen the oscillation
 ///   - Ki last, small, just enough to eliminate steady-state error
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PidGains {
     /// Proportional gain — response to current error
     pub kp: f32,
@@ -38,7 +38,7 @@ pub struct PidGains {
 }
 
 /// Configuration limits for the PID controller.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PidLimits {
     /// Maximum absolute value of the integral term.
     /// Prevents windup. A reasonable starting value might be

@@ -16,7 +16,7 @@
 //   Positive Z acceleration = downward (gravity is +9.81)
 
 /// Physical properties of the quadcopter.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QuadParams {
     /// Mass in kg
     pub mass: f32,

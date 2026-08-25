@@ -57,5 +57,7 @@ pub mod sim {
     pub mod degrade;
     #[path = "dual_imu.rs"]
     pub mod dual_imu;
+    #[path = "harness.rs"]
+    pub mod harness;
     pub use sim::*;
 }

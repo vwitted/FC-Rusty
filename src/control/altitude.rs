@@ -11,7 +11,7 @@
 // NED Z which is positive-down). Positive thrust correction = climb.
 
 /// Altitude controller gains.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AltitudeGains {
     /// Proportional gain on altitude error (m → thrust fraction)
     pub kp: f32,
