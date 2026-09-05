@@ -100,7 +100,7 @@ use control::arm_origin::ArmOriginSync;
 use control::cal_led::{led_on, CalLed};
 use control::mag_cal::{CalCommand, MagCalibrator, DECLINATION_DEG};
 use control::mixer::{AirmodeGate, ControlDemand, QUAD_X};
-use control::modes::{FlightMode, NavEvent, NavInputs, NavState, PosEstimate};
+use control::modes::{EntryState, FlightMode, ModeSelect, NavEvent, NavInputs, NavState, PosEstimate};
 use control::mpc::{AttitudeMpc, MPC_DT, MPC_PERIOD_US};
 use control::pid::{PidGains, PidLimits, RatePidController};
 use control::position::{PositionController, PositionGains};
@@ -120,8 +120,6 @@ use estimation::{geodetic_to_local_ned, PosKf};
 
 
 // ---- GPS rescue parameters ----
-/// Altitude to climb to during GPS rescue (metres, positive-up).
-const RESCUE_ALT_M: f32 = 50.0;
 
 // ---- Failsafe descent (no GPS home) ----
 
@@ -1899,14 +1897,13 @@ async fn navigation_task() {
 
     // ---- Flight mode state ----
     let mut flight_mode = FlightMode::Acro;
-    let mut prev_mode = FlightMode::Acro;
+    let mut entry = EntryState::new();
 
     // Arm-time re-origin gate + "have the current mode's targets been
     // captured yet" flag. Together they withhold altitude/position target
     // capture until the PosKF has zeroed for this arm, then capture exactly
     // once — even if the mode was entered during the arm/re-origin window.
     let mut arm_origin_sync = ArmOriginSync::new();
-    let mut targets_captured = false;
 
     // GPS-COG yaw gating: only trust course when genuinely flying forward.
     const V_MIN_COG: f32 = 2.0; // m/s
@@ -2053,29 +2050,14 @@ async fn navigation_task() {
         let altitude_ready = last_pos_est.map(|e| e.altitude_ready).unwrap_or(false);
         let home_latched = last_pos_est.map(|e| e.home_latched).unwrap_or(false);
 
-        if !armed {
-            flight_mode = FlightMode::Acro;
-        } else if arming.failsafe_active {
-            // Pick the best descent we can run with what's available.
-            flight_mode = if home_latched {
-                FlightMode::GpsRescue
-            } else if altitude_ready {
-                FlightMode::FailsafeLand
-            } else {
-                FlightMode::FailsafeBlind
-            };
-        } else if RcChannels::to_us(last_rc.channels[6]) > 1500 && home_latched {
-            flight_mode = FlightMode::GpsHome; // Return to home on switch
-        } else if RcChannels::to_us(last_rc.channels[5]) > 1600 && altitude_ready {
-            // PosHold: GPS home gives true position hold; without it,
-            // PosKF velocity-fusion damps DR drift and the controller
-            // does best-effort horizontal hold for tens of seconds.
-            flight_mode = FlightMode::PosHold;
-        } else if RcChannels::to_us(last_rc.channels[5]) > 1200 && altitude_ready {
-            flight_mode = FlightMode::AltHold;
-        } else {
-            flight_mode = FlightMode::Acro;
-        }
+        flight_mode = control::modes::select_mode(&ModeSelect {
+            armed,
+            failsafe_active: arming.failsafe_active,
+            altitude_ready,
+            home_latched,
+            rescue_switch_us: RcChannels::to_us(last_rc.channels[6]),
+            mode_switch_us: RcChannels::to_us(last_rc.channels[5]),
+        });
 
         // ---- Magnetometer cal trigger (AUX4 = channel index 7) ----
         // Disarmed-only. Rising edge starts; falling edge or a fresh arm
@@ -2109,10 +2091,8 @@ async fn navigation_task() {
         // capture below is gated separately on the PosKF re-origin, so a
         // mode entered during the arm/re-origin window still captures once
         // the zero lands rather than being missed.
-        if flight_mode != prev_mode {
-            defmt::info!("Flight mode: {} -> {}", prev_mode, flight_mode);
-            prev_mode = flight_mode;
-            targets_captured = false;
+        if let Some(was) = control::modes::note_mode_change(flight_mode, &mut entry) {
+            defmt::info!("Flight mode: {} -> {}", was, flight_mode);
         }
 
         // True once the PosKF has zeroed for the current arm. Must be called
@@ -2120,60 +2100,13 @@ async fn navigation_task() {
         let reoriginated = arm_origin_sync
             .reoriginated(armed, last_pos_est.map(|e| e.arm_origin_seq).unwrap_or(0));
 
-        if !targets_captured {
-            // AltHold + FailsafeLand need altitude; PosHold + GPS modes
-            // need NED. FailsafeBlind needs nothing (open loop).
-            let target_gate = match flight_mode {
-                FlightMode::AltHold | FlightMode::FailsafeLand => altitude_ready,
-                FlightMode::PosHold => altitude_ready, // best-effort horizontal w/o home
-                FlightMode::GpsRescue | FlightMode::GpsHome => home_latched,
-                FlightMode::Acro | FlightMode::FailsafeBlind => false,
-            };
-            // Wait for the arm-time re-origin before sampling the estimate:
-            // otherwise we'd latch a stale pre-zero altitude/position and
-            // lurch the instant the KF zeroes. Mid-flight mode switches see
-            // `reoriginated == true` already, so they capture immediately.
-            if let Some(est) = last_pos_est.filter(|_| target_gate && reoriginated) {
-                match flight_mode {
-                    FlightMode::AltHold => {
-                        nav.alt_target = est.altitude_up;
-                        nav.alt_ctrl.reset();
-                    }
-                    FlightMode::PosHold => {
-                        nav.alt_target = est.altitude_up;
-                        nav.pos_target = [est.position_ned[0], est.position_ned[1]];
-                        nav.alt_ctrl.reset();
-                    }
-                    FlightMode::GpsRescue => {
-                        // Hover in place (lock current position and altitude)
-                        nav.alt_target = est.altitude_up;
-                        nav.pos_target = [est.position_ned[0], est.position_ned[1]];
-                        nav.alt_ctrl.reset();
-                    }
-                    FlightMode::GpsHome => {
-                        // Climb to rescue alt or hold current if already higher.
-                        nav.alt_target = if est.altitude_up > RESCUE_ALT_M {
-                            est.altitude_up
-                        } else {
-                            RESCUE_ALT_M
-                        };
-                        nav.pos_target = [0.0, 0.0]; // home is NED origin
-                        nav.rescue_loiter_s = None;
-                        nav.rescue_landing = false;
-                        nav.alt_ctrl.reset();
-                    }
-                    FlightMode::FailsafeLand => {
-                        // Start descent from current altitude; the per-
-                        // tick handler ramps nav.alt_target down at
-                        // FAILSAFE_DESCENT_RATE_MPS.
-                        nav.alt_target = est.altitude_up;
-                        nav.alt_ctrl.reset();
-                    }
-                    FlightMode::Acro | FlightMode::FailsafeBlind => {}
-                }
-                targets_captured = true;
-            }
-        }
+        control::modes::capture_targets(
+            flight_mode,
+            last_pos_est,
+            reoriginated,
+            &mut entry,
+            &mut nav,
+        );
 
         // ---- 4. Control computation ----
         if armed {

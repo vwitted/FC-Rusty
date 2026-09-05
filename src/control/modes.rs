@@ -117,6 +117,156 @@ pub struct PosEstimate {
     pub arm_origin_seq: u32,
 }
 
+/// Altitude to climb to during GPS rescue (metres, positive-up).
+pub const RESCUE_ALT_M: f32 = 50.0;
+
+/// Switch thresholds, microseconds. Named because an unlabelled 1500 in a
+/// failsafe ladder is the kind of thing that gets "tidied".
+pub const RESCUE_SWITCH_ON_US: u16 = 1500;
+pub const MODE_SWITCH_POSHOLD_US: u16 = 1600;
+pub const MODE_SWITCH_ALTHOLD_US: u16 = 1200;
+
+/// Inputs to flight-mode selection.
+#[derive(Clone, Copy, Debug)]
+pub struct ModeSelect {
+    pub armed: bool,
+    /// Arming FSM's failsafe flag (RC link lost).
+    pub failsafe_active: bool,
+    /// Baro OR GPS anchored — gates altitude-aware modes.
+    pub altitude_ready: bool,
+    /// GPS home captured — gates NED-frame modes.
+    pub home_latched: bool,
+    /// AUX: return-to-home switch, microseconds.
+    pub rescue_switch_us: u16,
+    /// AUX: three-position mode switch, microseconds.
+    pub mode_switch_us: u16,
+}
+
+/// Choose the flight mode. Pure, and the failsafe half of it is the ladder
+/// that decides what happens when the link drops -- which is precisely the
+/// code you cannot afford to test by flying.
+pub fn select_mode(s: &ModeSelect) -> FlightMode {
+    if !s.armed {
+        FlightMode::Acro
+    } else if s.failsafe_active {
+        // Pick the best descent we can run with what's available.
+        if s.home_latched {
+            FlightMode::GpsRescue
+        } else if s.altitude_ready {
+            FlightMode::FailsafeLand
+        } else {
+            FlightMode::FailsafeBlind
+        }
+    } else if s.rescue_switch_us > RESCUE_SWITCH_ON_US && s.home_latched {
+        FlightMode::GpsHome
+    } else if s.mode_switch_us > MODE_SWITCH_POSHOLD_US && s.altitude_ready {
+        // PosHold: GPS home gives true position hold; without it, PosKF
+        // velocity-fusion damps DR drift and the controller does
+        // best-effort horizontal hold for tens of seconds.
+        FlightMode::PosHold
+    } else if s.mode_switch_us > MODE_SWITCH_ALTHOLD_US && s.altitude_ready {
+        FlightMode::AltHold
+    } else {
+        FlightMode::Acro
+    }
+}
+
+/// State for mode-entry target capture.
+#[derive(Clone, Copy, Debug)]
+pub struct EntryState {
+    pub prev_mode: FlightMode,
+    pub targets_captured: bool,
+}
+
+impl EntryState {
+    pub fn new() -> Self {
+        Self { prev_mode: FlightMode::Acro, targets_captured: false }
+    }
+}
+
+impl Default for EntryState {
+    fn default() -> Self { Self::new() }
+}
+
+/// Note a mode change. Returns the previous mode when it changed, so the
+/// caller can log the transition; resets the capture flag.
+pub fn note_mode_change(mode: FlightMode, es: &mut EntryState) -> Option<FlightMode> {
+    if mode != es.prev_mode {
+        let was = es.prev_mode;
+        es.prev_mode = mode;
+        es.targets_captured = false;
+        Some(was)
+    } else {
+        None
+    }
+}
+
+/// Capture altitude/position targets on entering a mode.
+///
+/// Gated on `reoriginated`: sampling the estimate before the arm-time
+/// re-origin has landed would latch stale pre-zero values and lurch the
+/// instant the KF zeroes. Mid-flight switches see it already true.
+pub fn capture_targets(
+    mode: FlightMode,
+    pos_est: Option<PosEstimate>,
+    reoriginated: bool,
+    es: &mut EntryState,
+    nav: &mut NavState,
+) {
+    if es.targets_captured {
+        return;
+    }
+    let altitude_ready = pos_est.map(|e| e.altitude_ready).unwrap_or(false);
+    let home_latched = pos_est.map(|e| e.home_latched).unwrap_or(false);
+    // AltHold + FailsafeLand need altitude; PosHold + GPS modes need NED.
+    // FailsafeBlind needs nothing (open loop).
+    let target_gate = match mode {
+        FlightMode::AltHold | FlightMode::FailsafeLand => altitude_ready,
+        FlightMode::PosHold => altitude_ready, // best-effort horizontal w/o home
+        FlightMode::GpsRescue | FlightMode::GpsHome => home_latched,
+        FlightMode::Acro | FlightMode::FailsafeBlind => false,
+    };
+    if let Some(est) = pos_est.filter(|_| target_gate && reoriginated) {
+        match mode {
+            FlightMode::AltHold => {
+                nav.alt_target = est.altitude_up;
+                nav.alt_ctrl.reset();
+            }
+            FlightMode::PosHold => {
+                nav.alt_target = est.altitude_up;
+                nav.pos_target = [est.position_ned[0], est.position_ned[1]];
+                nav.alt_ctrl.reset();
+            }
+            FlightMode::GpsRescue => {
+                // Hover in place (lock current position and altitude)
+                nav.alt_target = est.altitude_up;
+                nav.pos_target = [est.position_ned[0], est.position_ned[1]];
+                nav.alt_ctrl.reset();
+            }
+            FlightMode::GpsHome => {
+                // Climb to rescue alt or hold current if already higher.
+                nav.alt_target = if est.altitude_up > RESCUE_ALT_M {
+                    est.altitude_up
+                } else {
+                    RESCUE_ALT_M
+                };
+                nav.pos_target = [0.0, 0.0]; // home is NED origin
+                nav.rescue_loiter_s = None;
+                nav.rescue_landing = false;
+                nav.alt_ctrl.reset();
+            }
+            FlightMode::FailsafeLand => {
+                // Start descent from current altitude; nav_step ramps
+                // alt_target down at FAILSAFE_DESCENT_RATE_MPS.
+                nav.alt_target = est.altitude_up;
+                nav.alt_ctrl.reset();
+            }
+            FlightMode::Acro | FlightMode::FailsafeBlind => {}
+        }
+        es.targets_captured = true;
+    }
+}
+
 /// Everything the mode logic reads. All borrowed or Copy; nothing here is
 /// mutated.
 #[derive(Clone, Copy, Debug)]
@@ -249,11 +399,16 @@ pub fn nav_step(inp: &NavInputs, st: &mut NavState) -> NavOutputs {
             if libm::fabsf(inp.roll_input) > ALT_HOLD_DEADBAND
                 || libm::fabsf(inp.pitch_input) > ALT_HOLD_DEADBAND
             {
+                // Body -> world is R(yaw); this used to be R(yaw) TRANSPOSED,
+                // i.e. the world->body form that position.rs uses correctly
+                // for its own rotation, copied into a place needing the
+                // inverse. The effect was that yawing reversed which way the
+                // sticks moved the position target.
                 let cos_yaw = libm::cosf(inp.yaw_rad);
                 let sin_yaw = libm::sinf(inp.yaw_rad);
-                let vn = (cos_yaw * inp.pitch_input + sin_yaw * inp.roll_input)
+                let vn = (cos_yaw * inp.pitch_input - sin_yaw * inp.roll_input)
                     * POS_HOLD_MAX_VEL_MPS;
-                let ve = (-sin_yaw * inp.pitch_input + cos_yaw * inp.roll_input)
+                let ve = (sin_yaw * inp.pitch_input + cos_yaw * inp.roll_input)
                     * POS_HOLD_MAX_VEL_MPS;
                 st.pos_target[0] += vn * dt;
                 st.pos_target[1] += ve * dt;
@@ -490,26 +645,15 @@ mod tests {
 
     // ---- PosHold ----
 
-    /// KNOWN FAILING — a second, separate sign bug, found by this test.
-    ///
     /// Stick demands are body-frame and must be rotated into the world by
-    /// R(yaw). nav_step uses R(yaw) TRANSPOSED:
-    ///
-    ///     vn = ( cos*pitch + sin*roll)      correct: cos*pitch - sin*roll
-    ///     ve = (-sin*pitch + cos*roll)      correct: sin*pitch + cos*roll
-    ///
-    /// which is the world->body transform — the same expression
-    /// position.rs uses correctly for ITS rotation, copied into a place
-    /// that needs the inverse. The effect is that yawing reverses which way
-    /// the sticks move the position target.
+    /// R(yaw). This caught the transpose fixed alongside it.
     ///
     /// Deliberately stated without reference to what a positive pitch stick
     /// MEANS, so it holds whatever that convention turns out to be: whatever
     /// direction a given stick moves the target at yaw=0, at yaw=+90 deg it
-    /// must move it 90 deg clockwise (north -> east). Transposed, it goes
-    /// counter-clockwise instead.
+    /// must move it 90 deg clockwise (north -> east). Transposed, it went
+    /// counter-clockwise.
     #[test]
-    #[ignore = "known bug: PosHold stick rotation is transposed; see doc comment"]
     fn poshold_stick_rotation_follows_yaw() {
         let mut north = state();
         let mut inp = inputs(FlightMode::PosHold);
@@ -679,5 +823,186 @@ mod tests {
         assert_eq!(out.yaw_rate_dps, 0.0);
         assert!((out.thrust - HOVER * FAILSAFE_BLIND_THROTTLE_FRAC).abs() < 1e-6);
         assert!(!out.disarm, "no altitude reference means no stop condition");
+    }
+
+    // ---- Mode selection: the failsafe ladder ----
+
+    fn sel() -> ModeSelect {
+        ModeSelect {
+            armed: true,
+            failsafe_active: false,
+            altitude_ready: true,
+            home_latched: true,
+            rescue_switch_us: 1000,
+            mode_switch_us: 1000,
+        }
+    }
+
+    #[test]
+    fn disarmed_is_always_acro_whatever_the_switches_say() {
+        let s = ModeSelect {
+            armed: false,
+            failsafe_active: true,
+            rescue_switch_us: 2000,
+            mode_switch_us: 2000,
+            ..sel()
+        };
+        assert_eq!(select_mode(&s), FlightMode::Acro);
+    }
+
+    /// The ladder that runs when the link drops. Each rung degrades to the
+    /// best descent the remaining sensors allow.
+    #[test]
+    fn failsafe_degrades_through_the_ladder_as_sensors_are_lost() {
+        let base = ModeSelect { failsafe_active: true, ..sel() };
+        assert_eq!(
+            select_mode(&base),
+            FlightMode::GpsRescue,
+            "home latched: hover at home"
+        );
+        assert_eq!(
+            select_mode(&ModeSelect { home_latched: false, ..base }),
+            FlightMode::FailsafeLand,
+            "no home but altitude: closed-loop descent"
+        );
+        assert_eq!(
+            select_mode(&ModeSelect { home_latched: false, altitude_ready: false, ..base }),
+            FlightMode::FailsafeBlind,
+            "nothing left: open-loop blind descent"
+        );
+    }
+
+    /// Failsafe outranks every pilot switch. If this ever stopped holding,
+    /// a stuck switch could keep the aircraft out of its descent.
+    #[test]
+    fn failsafe_overrides_the_pilot_switches() {
+        let s = ModeSelect {
+            failsafe_active: true,
+            rescue_switch_us: 2000,
+            mode_switch_us: 2000,
+            ..sel()
+        };
+        assert_eq!(select_mode(&s), FlightMode::GpsRescue);
+    }
+
+    #[test]
+    fn switches_select_gps_home_poshold_althold_acro_in_priority_order() {
+        assert_eq!(
+            select_mode(&ModeSelect { rescue_switch_us: 1900, mode_switch_us: 1900, ..sel() }),
+            FlightMode::GpsHome,
+            "rescue switch outranks the mode switch"
+        );
+        assert_eq!(
+            select_mode(&ModeSelect { mode_switch_us: 1700, ..sel() }),
+            FlightMode::PosHold
+        );
+        assert_eq!(
+            select_mode(&ModeSelect { mode_switch_us: 1300, ..sel() }),
+            FlightMode::AltHold
+        );
+        assert_eq!(select_mode(&sel()), FlightMode::Acro);
+    }
+
+    /// Modes that need a sensor must not be selectable without it. This is
+    /// the guard that stops AltHold engaging with no altitude reference.
+    #[test]
+    fn modes_requiring_sensors_fall_back_when_those_sensors_are_absent() {
+        let no_alt = ModeSelect { altitude_ready: false, ..sel() };
+        assert_eq!(
+            select_mode(&ModeSelect { mode_switch_us: 1700, ..no_alt }),
+            FlightMode::Acro,
+            "PosHold needs altitude"
+        );
+        assert_eq!(
+            select_mode(&ModeSelect { mode_switch_us: 1300, ..no_alt }),
+            FlightMode::Acro,
+            "AltHold needs altitude"
+        );
+        assert_eq!(
+            select_mode(&ModeSelect { rescue_switch_us: 1900, home_latched: false, ..sel() }),
+            FlightMode::Acro,
+            "GpsHome needs home"
+        );
+    }
+
+    // ---- Mode entry / target capture ----
+
+    #[test]
+    fn entering_althold_captures_the_current_altitude_as_target() {
+        let (mut es, mut nav) = (EntryState::new(), state());
+        let e = PosEstimate { altitude_up: 12.5, ..est() };
+        note_mode_change(FlightMode::AltHold, &mut es);
+        capture_targets(FlightMode::AltHold, Some(e), true, &mut es, &mut nav);
+        assert!((nav.alt_target - 12.5).abs() < 1e-6);
+        assert!(es.targets_captured);
+    }
+
+    /// The arm-into-altitude-mode lurch: capturing before the PosKF has
+    /// re-origined latches a stale pre-zero altitude, and the aircraft
+    /// jumps the instant the KF zeroes.
+    #[test]
+    fn capture_waits_for_the_arm_time_reorigin() {
+        let (mut es, mut nav) = (EntryState::new(), state());
+        let e = PosEstimate { altitude_up: 12.5, ..est() };
+        note_mode_change(FlightMode::AltHold, &mut es);
+        capture_targets(FlightMode::AltHold, Some(e), false, &mut es, &mut nav);
+        assert!(!es.targets_captured, "must not capture before re-origin");
+        assert_eq!(nav.alt_target, 0.0);
+
+        capture_targets(FlightMode::AltHold, Some(e), true, &mut es, &mut nav);
+        assert!(es.targets_captured, "captures once the zero lands");
+        assert!((nav.alt_target - 12.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn capture_happens_once_per_mode_entry() {
+        let (mut es, mut nav) = (EntryState::new(), state());
+        note_mode_change(FlightMode::AltHold, &mut es);
+        capture_targets(FlightMode::AltHold, Some(PosEstimate { altitude_up: 10.0, ..est() }),
+                        true, &mut es, &mut nav);
+        capture_targets(FlightMode::AltHold, Some(PosEstimate { altitude_up: 99.0, ..est() }),
+                        true, &mut es, &mut nav);
+        assert!((nav.alt_target - 10.0).abs() < 1e-6, "second call must not re-capture");
+    }
+
+    /// GpsHome climbs to the rescue altitude, or holds current if already
+    /// higher -- never descends to reach it.
+    #[test]
+    fn entering_gps_home_climbs_to_rescue_altitude_but_never_descends() {
+        let (mut es, mut nav) = (EntryState::new(), state());
+        note_mode_change(FlightMode::GpsHome, &mut es);
+        capture_targets(FlightMode::GpsHome, Some(PosEstimate { altitude_up: 10.0, ..est() }),
+                        true, &mut es, &mut nav);
+        assert!((nav.alt_target - RESCUE_ALT_M).abs() < 1e-6, "below: climb to rescue alt");
+        assert_eq!(nav.pos_target, [0.0, 0.0], "home is the NED origin");
+
+        let (mut es, mut nav) = (EntryState::new(), state());
+        note_mode_change(FlightMode::GpsHome, &mut es);
+        capture_targets(FlightMode::GpsHome,
+                        Some(PosEstimate { altitude_up: RESCUE_ALT_M + 20.0, ..est() }),
+                        true, &mut es, &mut nav);
+        assert!((nav.alt_target - (RESCUE_ALT_M + 20.0)).abs() < 1e-6, "above: hold current");
+    }
+
+    /// Re-entering GpsHome must clear a previous rescue's landing state,
+    /// or the second rescue starts already descending.
+    #[test]
+    fn entering_gps_home_clears_stale_rescue_state() {
+        let (mut es, mut nav) = (EntryState::new(), state());
+        nav.rescue_landing = true;
+        nav.rescue_loiter_s = Some(12.0);
+        note_mode_change(FlightMode::GpsHome, &mut es);
+        capture_targets(FlightMode::GpsHome, Some(est()), true, &mut es, &mut nav);
+        assert!(!nav.rescue_landing);
+        assert_eq!(nav.rescue_loiter_s, None);
+    }
+
+    #[test]
+    fn mode_change_is_reported_once_and_resets_the_capture_flag() {
+        let mut es = EntryState::new();
+        es.targets_captured = true;
+        assert_eq!(note_mode_change(FlightMode::AltHold, &mut es), Some(FlightMode::Acro));
+        assert!(!es.targets_captured);
+        assert_eq!(note_mode_change(FlightMode::AltHold, &mut es), None, "no re-fire");
     }
 }
