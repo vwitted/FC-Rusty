@@ -220,7 +220,9 @@ fn harness_cfg(cfg: &Degradation, r: Rates, dual: bool) -> (HarnessCfg, Tunables
         // estimate instead of truth. Off by default so committed results
         // stay reproducible.
         use_estimator: std::env::args().any(|a| a == "--estimator"),
-        compensate_accel: std::env::args().any(|a| a == "--compensate"),
+        compensate_accel: std::env::args().any(|a| a == "--compensate")
+            || std::env::args().any(|a| a == "--compensate-circular"),
+        compensate_from_estimate: std::env::args().any(|a| a == "--compensate-circular"),
     };
     (h, tunables())
 }

@@ -297,6 +297,9 @@ pub struct HarnessCfg {
     /// The sim supplies exact acceleration, so this is the upper bound on
     /// the benefit, not what a GPS-derived estimate would actually deliver.
     pub compensate_accel: bool,
+    /// Derive the compensation from the ESTIMATOR's own attitude rather
+    /// than from an independent source. Demonstrates why that cannot work.
+    pub compensate_from_estimate: bool,
 }
 
 impl HarnessCfg {
@@ -316,6 +319,7 @@ impl HarnessCfg {
             skip_rescue_levelling: false,
             use_estimator: false,
             compensate_accel: false,
+            compensate_from_estimate: false,
         }
     }
 }
@@ -488,7 +492,19 @@ pub fn run_case(
             if step % r.outer_div == 0 {
                 let g = 9.81;
                 let mut f = [angle_err[0], angle_err[1], angle_err[2]];
-                if h.compensate_accel {
+                if h.compensate_accel && h.compensate_from_estimate {
+                    // THE TRAP. Reconstruct a_world the way main.rs does --
+                    // from the estimator's OWN attitude -- and subtract it.
+                    // Algebraically this is f - R^T(R f + g) = -R^T g, which
+                    // is exactly the predicted gravity, so the innovation is
+                    // identically zero and the update silently stops working.
+                    let e = m.euler();
+                    let rq = nalgebra::UnitQuaternion::from_euler_angles(e[0], e[1], e[2]);
+                    let fb = nalgebra::Vector3::new(f[0], f[1], f[2]);
+                    let aw = rq * fb + nalgebra::Vector3::new(0.0, 0.0, 9.81);
+                    let ab = rq.inverse() * aw;
+                    f = [f[0] - ab.x, f[1] - ab.y, f[2] - ab.z];
+                } else if h.compensate_accel {
                     // f = a - g, so removing a leaves -g. The sim's
                     // kinematic acceleration is exact; a real system would
                     // use a GPS-derived estimate and do worse.
