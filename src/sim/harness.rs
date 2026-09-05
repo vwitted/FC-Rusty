@@ -126,6 +126,24 @@ impl Metrics {
     }
 }
 
+/// Which controller turns attitude error into rate setpoints.
+///
+/// The point of having two is to ask whether the MPC earns its compute.
+/// It is the expensive part of the stack -- an ADMM solve every 10 ms on
+/// an H7 -- and nothing here has ever compared it against the thing every
+/// other flight controller does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AttitudeMode {
+    /// The firmware's cascaded MPC (control::mpc).
+    Mpc,
+    /// Classic angle mode: rate_sp = kp * angle_error, clamped. Pure
+    /// proportional, which is what Betaflight and friends actually run --
+    /// damping comes from the rate loop underneath, not from a D term
+    /// here. Deliberately the standard version rather than a souped-up one,
+    /// because the question is whether MPC beats the ORDINARY alternative.
+    AnglePid { kp: f32, max_rate_dps: f32 },
+}
+
 /// Everything a tuner is allowed to change.
 ///
 /// Deliberately narrow. The plant, the disturbances and the degradation are
@@ -138,6 +156,8 @@ pub struct Tunables {
     pub limits: PidLimits,
     /// Gyro low-pass cutoff, Hz. 0 disables the filter.
     pub gyro_fc_hz: f32,
+    /// Which attitude controller to run.
+    pub attitude: AttitudeMode,
     pub alt: AltitudeGains,
 }
 
@@ -149,6 +169,7 @@ impl Tunables {
             yaw: PidGains { kp: 0.03, ki: 0.005, kd: 0.0 },
             limits: PidLimits { integral_max: 0.3, output_max: 0.5, d_lpf_tau_s: 0.008 },
             gyro_fc_hz: 150.0,
+            attitude: AttitudeMode::Mpc,
             alt: AltitudeGains { kp: 0.15, kd: 0.1, ki: 0.05 },
         }
     }
@@ -407,14 +428,34 @@ pub fn run_case(
             }
             trace_due = trace.is_some();
 
-            let angles_rad = [angle[0] * DEG2RAD, angle[1] * DEG2RAD, angle[2] * DEG2RAD];
-            let rates_rad = [gyro[0] * DEG2RAD, gyro[1] * DEG2RAD, gyro[2] * DEG2RAD];
-            let out = mpc.solve(angles_rad, rates_rad);
-            rate_sp_degs = [
-                out.rate_setpoints_rads[0] * RAD2DEG,
-                out.rate_setpoints_rads[1] * RAD2DEG,
-                out.rate_setpoints_rads[2] * RAD2DEG,
-            ];
+            rate_sp_degs = match tun.attitude {
+                AttitudeMode::Mpc => {
+                    let angles_rad =
+                        [angle[0] * DEG2RAD, angle[1] * DEG2RAD, angle[2] * DEG2RAD];
+                    let rates_rad =
+                        [gyro[0] * DEG2RAD, gyro[1] * DEG2RAD, gyro[2] * DEG2RAD];
+                    let out = mpc.solve(angles_rad, rates_rad);
+                    [
+                        out.rate_setpoints_rads[0] * RAD2DEG,
+                        out.rate_setpoints_rads[1] * RAD2DEG,
+                        out.rate_setpoints_rads[2] * RAD2DEG,
+                    ]
+                }
+                AttitudeMode::AnglePid { kp, max_rate_dps } => {
+                    // Same reference and same feedback as the MPC gets, so
+                    // the only difference is the control law itself.
+                    let e = [
+                        ref_deg[0] - angle[0],
+                        ref_deg[1] - angle[1],
+                        0.0 - angle[2],
+                    ];
+                    [
+                        (kp * e[0]).clamp(-max_rate_dps, max_rate_dps),
+                        (kp * e[1]).clamp(-max_rate_dps, max_rate_dps),
+                        (kp * e[2]).clamp(-max_rate_dps, max_rate_dps),
+                    ]
+                }
+            };
         }
 
         let pid_output = rate_pid.update(rate_sp_degs, gyro, r.dt);

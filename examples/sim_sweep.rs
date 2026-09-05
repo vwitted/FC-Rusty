@@ -37,7 +37,7 @@ use fc_rusty::imu_filter::ImuFilterParams;
 use fc_rusty::sim::degrade::{ChannelFault, Degradation};
 use fc_rusty::sim::dual_imu::{DualImuConfig, ImuFault};
 use fc_rusty::sim::harness::{
-    run_case, FailCause, HarnessCfg, Rates, Tunables,
+    run_case, AttitudeMode, FailCause, HarnessCfg, Rates, Tunables,
 };
 use fc_rusty::sim::QuadParams;
 
@@ -226,6 +226,17 @@ fn tunables() -> Tunables {
         .unwrap_or_else(|| ImuFilterParams::default().gyro_fc_hz);
     if std::env::args().any(|a| a == "--nofilter") {
         t.gyro_fc_hz = 0.0;
+    }
+    // --pid swaps the attitude MPC for classic angle mode, to ask whether
+    // the MPC earns its compute. ANGLE_KP / ANGLE_MAX_DPS tune it, because
+    // comparing a tuned MPC against an untuned PID would prove nothing.
+    if std::env::args().any(|a| a == "--pid") {
+        t.attitude = AttitudeMode::AnglePid {
+            kp: std::env::var("ANGLE_KP").ok().and_then(|v| v.parse().ok())
+                .unwrap_or(6.0),
+            max_rate_dps: std::env::var("ANGLE_MAX_DPS").ok()
+                .and_then(|v| v.parse().ok()).unwrap_or(400.0),
+        };
     }
     t
 }
@@ -464,10 +475,21 @@ fn main() {
             } else {
                 "never".to_string()
             };
-            println!("{:>10}   recovered in {:>7}, height lost {:>6.1} m   {}",
-                     format!("{:.0}", roll0), rec, lost_max,
-                     if a.failures == 0 { "-".to_string() }
-                     else { format!("{}/{} fail", a.failures, a.n) });
+            // Height lost is only meaningful for runs that finished --
+            // a failed run returns NaN, so print a dash rather than a
+            // zero that reads like a measurement.
+            let lost = if ok > 0 { format!("{lost_max:.1} m") } else { "-".to_string() };
+            let fail = if a.failures == 0 {
+                "-".to_string()
+            } else {
+                let mix: Vec<String> = FailCause::ALL.iter()
+                    .filter(|c| a.causes[c.idx()] > 0)
+                    .map(|c| format!("{}{}", a.causes[c.idx()], c.short()))
+                    .collect();
+                format!("{}/{} {}", a.failures, a.n, mix.join("+"))
+            };
+            println!("{:>10}   recovered in {:>7}, height lost {:>8}   {}",
+                     format!("{:.0}", roll0), rec, lost, fail);
         }
     }
 
