@@ -172,6 +172,38 @@ pub struct Tunables {
     /// Position controller's max tilt, degrees. Bounds horizontal
     /// acceleration to g*tan(tilt), and hence cruise and wind-holding
     /// speed to sqrt(m*a/drag_k).
+    ///
+    /// The firmware ships 15 deg, whose own comment calls it "conservative
+    /// (GPS rescue)" -- and which caps rescue at ~15.6 m/s of wind, i.e.
+    /// conservative in calm air and the reason it cannot get home in a gale.
+    /// The justification for keeping it low was estimator degradation under
+    /// sustained lateral acceleration, and that justification is largely
+    /// spent once the accel update is compensated.
+    ///
+    /// Station-keeping with the MEKF in the loop, att_rms / pos_rms:
+    ///
+    ///   UNCOMPENSATED           15 deg        30 deg        45 deg
+    ///     20 m/s              8/8 drift    12.5 / 9.0    14.7 / 5.6
+    ///     25 m/s              8/8 drift    25.1 / 57     29.3 / 14.5
+    ///     33 m/s              8/8 drift    8/8 drift     8/8 CRASH
+    ///
+    ///   GPS-COMPENSATED         15 deg        30 deg        45 deg
+    ///     20 m/s          3.3 / 51 (5/8)   4.7 / 5.3     5.3 / 5.3
+    ///     25 m/s              8/8 drift    5.3 / 28      8.5 / 8.3
+    ///     33 m/s              8/8 drift    8/8 drift    13.4 / 44 (1/8)
+    ///
+    /// Compensation removes the CRASH at high tilt entirely and cuts
+    /// attitude error at 45 deg by about two thirds. So the cost that
+    /// justified 15 deg is mostly gone, and raising the limit becomes
+    /// defensible -- but only WHILE COMPENSATION IS LIVE, since it depends
+    /// on GPS. gps_accel::GpsAccelEstimator::is_fresh is the natural gate:
+    /// high tilt when the acceleration reference is available, 15 deg when
+    /// it is not, with the existing fade smoothing the transition.
+    ///
+    /// A duration budget ("30 deg for 3 s") was considered and rejected for
+    /// the sustained case: holding against wind needs high tilt
+    /// indefinitely, so a budget is the low limit with extra steps, and it
+    /// can limit-cycle -- expire, drift, recover, fight, expire.
     pub pos_max_tilt_deg: f32,
     pub alt: AltitudeGains,
 }
