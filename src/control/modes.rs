@@ -367,6 +367,13 @@ pub struct NavState {
     pub rescue_loiter_s: Option<f32>,
     /// True once the GPS-home auto-land has begun.
     pub rescue_landing: bool,
+    /// Latched heading to hold, radians, when the pilot is not commanding
+    /// yaw. `None` until the first tick latches the current heading.
+    ///
+    /// Yaw is the one axis with no natural "return to level": there is no
+    /// privileged heading. Holding a fixed 0 means holding NORTH, which is
+    /// what this used to do.
+    pub yaw_target_rad: Option<f32>,
     /// Last commanded thrust. Genuinely state, not just an output: AltHold
     /// leaves it untouched when no altitude estimate is available, so the
     /// previous value carries.
@@ -383,6 +390,7 @@ impl NavState {
             pos_target: [0.0, 0.0],
             rescue_loiter_s: None,
             rescue_landing: false,
+            yaw_target_rad: None,
             current_thrust: hover_throttle,
             alt_ctrl,
             pos_ctrl,
@@ -425,9 +433,40 @@ pub struct NavOutputs {
 /// Transcribed from the match block that lived in `navigation_task`. The
 /// only intended behaviour change is the loiter timer (see the module
 /// header); everything else is the same arithmetic in the same order.
+/// Shortest signed difference between two angles, radians.
+fn wrap_pi(a: f32) -> f32 {
+    const TAU: f32 = 2.0 * core::f32::consts::PI;
+    let mut x = a;
+    while x > core::f32::consts::PI {
+        x -= TAU;
+    }
+    while x < -core::f32::consts::PI {
+        x += TAU;
+    }
+    x
+}
+
 pub fn nav_step(inp: &NavInputs, st: &mut NavState) -> NavOutputs {
     const DEG2RAD: f32 = core::f32::consts::PI / 180.0;
     let dt = inp.dt;
+
+    // ---- Heading hold ----
+    //
+    // While the pilot commands yaw the target tracks the current heading,
+    // so releasing the stick holds wherever they stopped. Every mode used
+    // to pass desired_yaw_rad = 0, which is not "hold heading" -- it is
+    // "point NORTH", and the MPC weights yaw at 2.0, so it really did steer
+    // back (about -42 deg/s from a heading of east).
+    //
+    // The reference is expressed as current heading plus the SHORTEST arc
+    // to the target. Handing the MPC an absolute angle would give it a ~2pi
+    // error at the wrap point and send it the long way round.
+    let piloting_yaw = libm::fabsf(inp.yaw_input) > ALT_HOLD_DEADBAND;
+    if piloting_yaw || st.yaw_target_rad.is_none() {
+        st.yaw_target_rad = Some(inp.yaw_rad);
+    }
+    let yaw_ref = inp.yaw_rad
+        + wrap_pi(st.yaw_target_rad.unwrap_or(inp.yaw_rad) - inp.yaw_rad);
 
     // Declared without initialisers: every arm assigns all four, and a
     // placeholder would let a future arm silently forget one.
@@ -445,7 +484,7 @@ pub fn nav_step(inp: &NavInputs, st: &mut NavState) -> NavOutputs {
             // is a positive channel value and must pitch the aircraft DOWN,
             // and nose-down is NEGATIVE pitch in 3-2-1 Tait-Bryan.
             desired_pitch_rad = -inp.pitch_input * inp.max_angle_deg * DEG2RAD;
-            desired_yaw_rad = 0.0;
+            desired_yaw_rad = yaw_ref;
             yaw_rate_dps = inp.yaw_input * 200.0;
             // Direct throttle pass-through
             st.current_thrust = inp.throttle_raw.clamp(0.0, 1.0);
@@ -454,7 +493,7 @@ pub fn nav_step(inp: &NavInputs, st: &mut NavState) -> NavOutputs {
             desired_roll_rad = inp.roll_input * inp.max_angle_deg * DEG2RAD;
             // Negated, as in Acro -- see STICK CONVENTION in the header.
             desired_pitch_rad = -inp.pitch_input * inp.max_angle_deg * DEG2RAD;
-            desired_yaw_rad = 0.0;
+            desired_yaw_rad = yaw_ref;
             yaw_rate_dps = inp.yaw_input * 200.0;
             // Throttle stick -> climb/descend rate -> alt target adjustment
             let thr_centered = inp.throttle_raw - 0.5; // -0.5..+0.5
@@ -508,12 +547,12 @@ pub fn nav_step(inp: &NavInputs, st: &mut NavState) -> NavOutputs {
                 desired_pitch_rad = 0.0;
                 st.current_thrust = inp.hover_throttle;
             }
-            desired_yaw_rad = 0.0;
+            desired_yaw_rad = yaw_ref;
         }
         FlightMode::GpsRescue => {
             // Failsafe: just hover in place
             yaw_rate_dps = 0.0;
-            desired_yaw_rad = 0.0;
+            desired_yaw_rad = yaw_ref;
             if let Some(est) = inp.pos_est.filter(|e| e.home_latched) {
                 let pos_out = st.pos_ctrl.update(
                     [est.position_ned[0], est.position_ned[1]],
@@ -534,7 +573,7 @@ pub fn nav_step(inp: &NavInputs, st: &mut NavState) -> NavOutputs {
         FlightMode::GpsHome => {
             // Return to home
             yaw_rate_dps = 0.0;
-            desired_yaw_rad = 0.0;
+            desired_yaw_rad = yaw_ref;
             if let Some(est) = inp.pos_est.filter(|e| e.home_latched) {
                 let dist_home = libm::sqrtf(
                     est.position_ned[0] * est.position_ned[0]
@@ -584,7 +623,7 @@ pub fn nav_step(inp: &NavInputs, st: &mut NavState) -> NavOutputs {
             // descent. Disarm when altitude crosses the floor. No timeout --
             // altitude-floor is the sole stop condition.
             yaw_rate_dps = 0.0;
-            desired_yaw_rad = 0.0;
+            desired_yaw_rad = yaw_ref;
             desired_roll_rad = 0.0;
             desired_pitch_rad = 0.0;
             st.alt_target -= FAILSAFE_DESCENT_RATE_MPS * dt;
@@ -606,7 +645,7 @@ pub fn nav_step(inp: &NavInputs, st: &mut NavState) -> NavOutputs {
             // below hover, level attitude. No auto-disarm -- without altitude
             // we cannot tell when to stop.
             yaw_rate_dps = 0.0;
-            desired_yaw_rad = 0.0;
+            desired_yaw_rad = yaw_ref;
             desired_roll_rad = 0.0;
             desired_pitch_rad = 0.0;
             st.current_thrust = inp.hover_throttle * FAILSAFE_BLIND_THROTTLE_FRAC;
@@ -631,6 +670,7 @@ mod tests {
     use crate::control::position::PositionGains;
 
     const DT: f32 = 0.01; // 100 Hz outer loop
+    const D2R_T: f32 = core::f32::consts::PI / 180.0;
     const HOVER: f32 = 0.294;
 
     fn state() -> NavState {
@@ -1082,5 +1122,78 @@ mod tests {
         assert_eq!(note_mode_change(FlightMode::AltHold, &mut es), Some(FlightMode::Acro));
         assert!(!es.targets_captured);
         assert_eq!(note_mode_change(FlightMode::AltHold, &mut es), None, "no re-fire");
+    }
+
+    // ---- Heading hold ----
+
+    /// The bug this replaced: every mode passed desired_yaw_rad = 0, which
+    /// is "point north", not "hold heading". With centred sticks at 90 deg
+    /// the MPC commanded about -42 deg/s back toward north.
+    #[test]
+    fn centred_yaw_stick_holds_the_current_heading_not_north() {
+        let mut st = state();
+        let mut inp = inputs(FlightMode::Acro);
+        inp.yaw_rad = 90.0 * D2R_T; // pointing east
+        let out = nav_step(&inp, &mut st);
+        assert!(
+            (out.desired_yaw_rad - inp.yaw_rad).abs() < 1e-5,
+            "reference should be the current heading, got {} for heading {}",
+            out.desired_yaw_rad, inp.yaw_rad
+        );
+        assert_eq!(out.yaw_rate_dps, 0.0, "no stick, no commanded rate");
+    }
+
+    /// While the stick is deflected the target follows, so releasing it
+    /// holds wherever the pilot stopped rather than snapping back.
+    #[test]
+    fn yaw_target_follows_the_stick_then_latches_on_release() {
+        let mut st = state();
+        let mut inp = inputs(FlightMode::Acro);
+        inp.yaw_input = 0.8;
+        inp.yaw_rad = 0.0;
+        nav_step(&inp, &mut st);
+        // Pilot yaws round to 120 deg, still holding the stick.
+        inp.yaw_rad = 120.0 * D2R_T;
+        nav_step(&inp, &mut st);
+        assert!((st.yaw_target_rad.unwrap() - 120.0 * D2R_T).abs() < 1e-5);
+        // Stick released: the target stays where they stopped.
+        inp.yaw_input = 0.0;
+        inp.yaw_rad = 121.0 * D2R_T;
+        let out = nav_step(&inp, &mut st);
+        assert!((st.yaw_target_rad.unwrap() - 120.0 * D2R_T).abs() < 1e-5, "latched");
+        assert!(out.desired_yaw_rad < inp.yaw_rad, "should turn back the 1 deg");
+    }
+
+    /// The wrap case. Holding 179 deg while drifting to -179 deg is a 2 deg
+    /// error, not 358 deg. An absolute reference would send the MPC the
+    /// long way round at full commanded rate.
+    #[test]
+    fn heading_hold_takes_the_short_way_round_at_the_wrap_point() {
+        let mut st = state();
+        let mut inp = inputs(FlightMode::Acro);
+        st.yaw_target_rad = Some(179.0 * D2R_T);
+        inp.yaw_rad = -179.0 * D2R_T; // just across the wrap
+        let out = nav_step(&inp, &mut st);
+        // Short arc from -179 to +179 is -2 deg (left, back through 180),
+        // NOT +358. Getting the sign right matters as much as the size:
+        // an absolute reference would command a full turn the other way.
+        let err_deg = (out.desired_yaw_rad - inp.yaw_rad) / D2R_T;
+        assert!(
+            (err_deg + 2.0).abs() < 0.01,
+            "expected -2 deg (short way through 180), got {err_deg} deg"
+        );
+    }
+
+    /// Failsafe modes have no pilot input, so they must hold heading too --
+    /// not spin to north while descending.
+    #[test]
+    fn failsafe_descent_holds_heading() {
+        let mut st = state();
+        let mut inp = inputs(FlightMode::FailsafeLand);
+        inp.pos_est = Some(est());
+        inp.yaw_rad = -60.0 * D2R_T;
+        let out = nav_step(&inp, &mut st);
+        assert!((out.desired_yaw_rad - inp.yaw_rad).abs() < 1e-5);
+        assert_eq!(out.yaw_rate_dps, 0.0);
     }
 }
