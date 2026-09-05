@@ -276,6 +276,32 @@ fn tournament(pop: &[([f32; N_GENES], f64)], rng: &mut Rng, k: usize) -> [f32; N
     pop[best].0
 }
 
+/// Score one explicit candidate instead of searching.
+///
+/// The point of the tool is not only to produce gains but to grade them, and
+/// a hand-built compromise (take the genes a search agrees on, keep the
+/// firmware's where it does not) is exactly the sort of thing that must be
+/// measured rather than assumed -- it is a set the GA itself never evaluated.
+fn eval_mode(h: &HarnessCfg, train: &[Case], hold: &[Case]) {
+    let mut t = Tunables::firmware();
+    let g = |k: &str, d: f32| env_f32(k, d);
+    t.rate.kp = g("EVAL_KP", t.rate.kp);
+    t.rate.ki = g("EVAL_KI", t.rate.ki);
+    t.rate.kd = g("EVAL_KD", t.rate.kd);
+    t.yaw.kp = g("EVAL_YAW_KP", t.yaw.kp);
+    t.yaw.ki = g("EVAL_YAW_KI", t.yaw.ki);
+    t.gyro_fc_hz = g("EVAL_FC", t.gyro_fc_hz);
+    t.limits.d_lpf_tau_s = g("EVAL_DTAU", t.limits.d_lpf_tau_s);
+
+    println!("candidate: kp {:.6} ki {:.6} kd {:.6} yaw_kp {:.6} yaw_ki {:.6} fc {:.1} d_tau {:.5}",
+             t.rate.kp, t.rate.ki, t.rate.kd, t.yaw.kp, t.yaw.ki,
+             t.gyro_fc_hz, t.limits.d_lpf_tau_s);
+    println!("  train   {:8.2}  ({}/{} survive)",
+             evaluate(h, &t, train), survived(h, &t, train), train.len());
+    println!("  holdout {:8.2}  ({}/{} survive)",
+             evaluate(h, &t, hold), survived(h, &t, hold), hold.len());
+}
+
 fn main() {
     let pop_size = env_usize("GA_POP", 32);
     let generations = env_usize("GA_GENS", 25);
@@ -284,9 +310,21 @@ fn main() {
     let mut rng = Rng::new(env_usize("GA_SEED", 12345) as u64);
     let mut_sigma = env_f32("GA_MUT", 0.08);
 
+    // PLANT_THRUST/PLANT_INERTIA: check a candidate against a plant that is
+    // wrong in the direction the real one probably is. The default 20 N is
+    // 3:1 thrust-to-weight; a real 5in racer is 6-10:1, i.e. MORE control
+    // authority and so more loop gain. Gains that only work at 3:1 would not
+    // transfer, and that is the whole risk of tuning in sim.
+    let mut plant = QuadParams::default();
+    if let Some(v) = std::env::var("PLANT_THRUST").ok().and_then(|v| v.parse().ok()) {
+        plant.max_thrust = v;
+    }
+    if let Some(v) = std::env::var("PLANT_INERTIA").ok().and_then(|v| v.parse().ok()) {
+        plant.inertia = [v, v, v * 2.0];
+    }
     let h = HarnessCfg {
         rates: Rates::FIRMWARE,
-        plant: QuadParams::default(),
+        plant,
         total_s: FLIGHT_S,
         target_alt: 5.0,
         // A raised-cosine gust rather than a state poke: the search should
@@ -299,6 +337,11 @@ fn main() {
 
     let train = training_set();
     let hold = holdout_set();
+
+    if std::env::args().any(|a| a == "--eval") {
+        eval_mode(&h, &train, &hold);
+        return;
+    }
 
     let base = Tunables::firmware();
     let base_train = evaluate(&h, &base, &train);
