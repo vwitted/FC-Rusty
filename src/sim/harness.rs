@@ -279,6 +279,18 @@ pub struct HarnessCfg {
     /// estimator identically -- and the sim already computes the correct
     /// specific force, so this needs plumbing rather than sensor models.
     pub use_estimator: bool,
+    /// Subtract known kinematic acceleration from the accel update before
+    /// giving it to the MEKF, leaving (approximately) pure gravity.
+    ///
+    /// Stands in for what a tightly-coupled INS/GNSS does: differentiate
+    /// GPS velocity to get acceleration, subtract it, and what remains
+    /// points down. The firmware ALREADY computes this number -- main.rs
+    /// builds a_world to feed the position KF -- and never gives it to the
+    /// attitude estimator. This measures what that would be worth.
+    ///
+    /// The sim supplies exact acceleration, so this is the upper bound on
+    /// the benefit, not what a GPS-derived estimate would actually deliver.
+    pub compensate_accel: bool,
 }
 
 impl HarnessCfg {
@@ -297,6 +309,7 @@ impl HarnessCfg {
             firmware_mode: None,
             skip_rescue_levelling: false,
             use_estimator: false,
+            compensate_accel: false,
         }
     }
 }
@@ -468,11 +481,22 @@ pub fn run_case(
             );
             if step % r.outer_div == 0 {
                 let g = 9.81;
-                m.update_accel([
-                    angle_err[0] / g,
-                    angle_err[1] / g,
-                    angle_err[2] / g,
-                ]);
+                let mut f = [angle_err[0], angle_err[1], angle_err[2]];
+                if h.compensate_accel {
+                    // f = a - g, so removing a leaves -g. The sim's
+                    // kinematic acceleration is exact; a real system would
+                    // use a GPS-derived estimate and do worse.
+                    let aw = sim.last_accel_world;
+                    let rot = nalgebra::UnitQuaternion::from_quaternion(
+                        nalgebra::Quaternion::new(
+                            sim.state.q[0], sim.state.q[1],
+                            sim.state.q[2], sim.state.q[3],
+                        ),
+                    );
+                    let ab = rot.inverse() * nalgebra::Vector3::new(aw[0], aw[1], aw[2]);
+                    f = [f[0] - ab.x, f[1] - ab.y, f[2] - ab.z];
+                }
+                m.update_accel([f[0] / g, f[1] / g, f[2] / g]);
             }
             let e = m.euler();
             [e[0] * RAD2DEG, e[1] * RAD2DEG, e[2] * RAD2DEG]
