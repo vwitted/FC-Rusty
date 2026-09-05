@@ -23,6 +23,12 @@
 //   Stick UP  ->  INCREASING channel value  ->  positive `pitch_input`
 //   Stick UP  ->  aircraft pitches DOWN     ->  NEGATIVE `desired_pitch_rad`
 //
+// "UP" means up the face of the transmitter, i.e. AWAY from the pilot --
+// the same gesture as pushing an aircraft stick forward, just on a control
+// surface rotated 90 deg because you are holding a box rather than sitting
+// behind a column. Spelt out because "up" is exactly the sort of
+// orientation-relative word this whole class of bug hides in.
+//
 // (nose-down is negative pitch in 3-2-1 Tait-Bryan; see src/conventions.rs.)
 //
 // So positive pitch_input means "fly forward", and the attitude path must
