@@ -41,7 +41,13 @@ use fc_rusty::sim::harness::{
 };
 use fc_rusty::sim::QuadParams;
 
-const TOTAL_S: f32 = 10.0;
+/// Flight length. TOTAL_S overrides it, which matters for the wind axis:
+/// the position PD's natural frequency is about sqrt(kp) = 0.9 rad/s, a ~7 s
+/// period, so a 10 s flight measures its first transient rather than any
+/// steady-state station-keeping.
+fn total_s() -> f32 {
+    std::env::var("TOTAL_S").ok().and_then(|v| v.parse().ok()).unwrap_or(10.0)
+}
 
 const TARGET_ALT: f32 = 5.0;
 
@@ -180,6 +186,7 @@ fn to_dual(cfg: &Degradation) -> DualImuConfig {
 /// you want to fly.
 #[derive(Debug, Clone, Copy)]
 struct Agg {
+    pos_rms: f32,
     att_rms: f32,
     att_max: f32,
     alt_rms: f32,
@@ -188,7 +195,7 @@ struct Agg {
     n: usize,
     first_fail_t: Option<f32>,
     /// Per-cause tally, indexed by FailCause::idx.
-    causes: [usize; 4],
+    causes: [usize; 5],
 }
 
 /// Assemble the exam (plant, rates, disturbance shaping, dual-IMU mapping)
@@ -198,13 +205,14 @@ fn harness_cfg(cfg: &Degradation, r: Rates, dual: bool) -> (HarnessCfg, Tunables
     let h = HarnessCfg {
         rates: r,
         plant: plant_params(),
-        total_s: TOTAL_S,
+        total_s: total_s(),
         target_alt: TARGET_ALT,
         disturb_ms: disturb_ms(),
         dual,
         dual_cfg: to_dual(cfg),
         // The sweep measures regulation about level, as before.
         cmd: fc_rusty::sim::harness::AttitudeStep::NONE,
+        pos_hold: false,
     };
     (h, tunables())
 }
@@ -223,8 +231,9 @@ fn tunables() -> Tunables {
 
 fn aggregate(cfg: Degradation, seeds: u64, r: Rates, dual: bool) -> Agg {
     let (h, tun) = harness_cfg(&cfg, r, dual);
-    let mut a = Agg { att_rms: 0.0, att_max: 0.0, alt_rms: 0.0, air_frac: 0.0,
-                      failures: 0, n: 0, first_fail_t: None, causes: [0; 4] };
+    let mut a = Agg { pos_rms: 0.0, att_rms: 0.0, att_max: 0.0, alt_rms: 0.0,
+                      air_frac: 0.0, failures: 0, n: 0, first_fail_t: None,
+                      causes: [0; 5] };
     let mut ok = 0usize;
     for s in 0..seeds {
         let m = run_case(&h, &tun, cfg, s * 7919 + 1, None);
@@ -236,6 +245,7 @@ fn aggregate(cfg: Degradation, seeds: u64, r: Rates, dual: bool) -> Agg {
         }
         a.att_rms += m.att_rms;
         a.alt_rms += m.alt_rms;
+        a.pos_rms += m.pos_rms;
         a.air_frac += m.air_frac;
         a.att_max = a.att_max.max(m.att_max);
         ok += 1;
@@ -244,6 +254,7 @@ fn aggregate(cfg: Degradation, seeds: u64, r: Rates, dual: bool) -> Agg {
     if ok > 0 {
         a.att_rms /= ok as f32;
         a.alt_rms /= ok as f32;
+        a.pos_rms /= ok as f32;
         a.air_frac /= ok as f32;
     }
     a
@@ -252,9 +263,9 @@ fn aggregate(cfg: Degradation, seeds: u64, r: Rates, dual: bool) -> Agg {
 fn header(title: &str, knob: &str) {
     println!();
     println!("== {}", title);
-    println!("{:>10} {:>9} {:>9} {:>9} {:>7} {:>22}",
-             knob, "att_rms", "att_max", "alt_rms", "air%", "fail");
-    println!("{}", "-".repeat(72));
+    println!("{:>10} {:>9} {:>9} {:>9} {:>9} {:>7} {:>22}",
+             knob, "att_rms", "att_max", "alt_rms", "pos_rms", "air%", "fail");
+    println!("{}", "-".repeat(82));
 }
 
 fn row(label: String, a: Agg) {
@@ -272,10 +283,12 @@ fn row(label: String, a: Agg) {
                 a.first_fail_t.unwrap_or(f32::NAN))
     };
     if a.failures == a.n {
-        println!("{:>10} {:>9} {:>9} {:>9} {:>7} {:>22}", label, "-", "-", "-", "-", fail);
+        println!("{:>10} {:>9} {:>9} {:>9} {:>9} {:>7} {:>22}",
+                 label, "-", "-", "-", "-", "-", fail);
     } else {
-        println!("{:>10} {:>9.3} {:>9.3} {:>9.3} {:>6.1}% {:>22}",
-                 label, a.att_rms, a.att_max, a.alt_rms, a.air_frac * 100.0, fail);
+        println!("{:>10} {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>6.1}% {:>22}",
+                 label, a.att_rms, a.att_max, a.alt_rms, a.pos_rms,
+                 a.air_frac * 100.0, fail);
     }
 }
 
@@ -285,6 +298,7 @@ fn csv_row(axis: &str, value: f32, a: Agg) {
              a.failures, a.n,
              a.causes[FailCause::Diverged.idx()], a.causes[FailCause::Crashed.idx()],
              a.causes[FailCause::Flyaway.idx()], a.causes[FailCause::NonFinite.idx()]);
+    let _ = FailCause::Drifted;
 }
 
 fn main() {
@@ -330,7 +344,7 @@ fn main() {
     } else {
         println!("=== control degradation sweep ===");
         println!("{} s flights, {} seeds per case, {:.0} Hz inner / {:.0} Hz outer{}",
-                 TOTAL_S, seeds, rates.inner_hz(), rates.outer_hz(),
+                 total_s(), seeds, rates.inner_hz(), rates.outer_hz(),
                  if legacy { "  (LEGACY example rates)" } else { "  (firmware rates)" });
         println!("gyro LPF: {}",
                  if filter { "150 Hz Butterworth (as firmware)" } else { "DISABLED (--nofilter)" });
@@ -396,25 +410,25 @@ fn main() {
 
     // --- wind ---
     //
-    // READ THIS BEFORE READING THE TABLE. It is flat, all the way to
-    // hurricane force, and that is not a result -- it is the harness
-    // reporting on a question it cannot ask. There is no POSITION loop
-    // here: the cascade is altitude -> attitude MPC (reference level) ->
-    // rate PID. Steady wind applies no aerodynamic moment in this model, so
-    // the aircraft holds attitude perfectly and simply translates downwind,
-    // and nothing in att_rms/alt_rms measures translation.
+    // Runs with the firmware's own PositionController holding the origin,
+    // so pos_rms is the number that matters here. Without that loop this
+    // axis was flat to hurricane force -- not robustness, just a harness
+    // measuring attitude while the aircraft quietly translated away.
     //
-    // So this axis currently proves only that wind does not upset ATTITUDE
-    // hold. Making it mean what it looks like it means needs src/control's
-    // position PD in the loop and a position-error metric alongside the
-    // others. Until then, do not quote it as robustness to wind.
-    if !csv { header("steady wind (m/s) -- attitude hold only, see note", "wind"); }
+    // The limit is the tilt clamp, and it checks out analytically: 15 deg
+    // caps horizontal accel at g*tan(15) = 2.63 m/s^2, while holding
+    // against 20 m/s needs drag_k*v^2/m = 4.33. So station-keeping should
+    // fail between 14 and 20 m/s, and it does.
+    if !csv { header("steady wind (m/s), position hold on", "wind"); }
     for &wind in &[0.0f32, 2.0, 5.0, 10.0, 14.0, 20.0, 25.0, 33.0] {
         let mut hw = harness_cfg(&Degradation::none(), rates, dual).0;
         hw.plant.wind_ned = [wind, 0.0, 0.0];
+        // The whole point of the axis: hold station against the wind.
+        hw.pos_hold = true;
         let tun = tunables();
-        let mut a = Agg { att_rms: 0.0, att_max: 0.0, alt_rms: 0.0, air_frac: 0.0,
-                          failures: 0, n: 0, first_fail_t: None, causes: [0; 4] };
+        let mut a = Agg { pos_rms: 0.0, att_rms: 0.0, att_max: 0.0, alt_rms: 0.0,
+                          air_frac: 0.0, failures: 0, n: 0, first_fail_t: None,
+                          causes: [0; 5] };
         let mut ok = 0usize;
         for sd in 0..seeds {
             let m = run_case(&hw, &tun, Degradation::none(), sd * 7919 + 1, None);
@@ -425,12 +439,14 @@ fn main() {
                 continue;
             }
             a.att_rms += m.att_rms; a.alt_rms += m.alt_rms; a.air_frac += m.air_frac;
+            a.pos_rms += m.pos_rms;
             a.att_max = a.att_max.max(m.att_max);
             ok += 1;
         }
         a.n = seeds as usize;
         if ok > 0 {
             a.att_rms /= ok as f32; a.alt_rms /= ok as f32; a.air_frac /= ok as f32;
+            a.pos_rms /= ok as f32;
         }
         if csv { csv_row("wind_ms", wind, a) } else { row(format!("{:.0}", wind), a) }
     }

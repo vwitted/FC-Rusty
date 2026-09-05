@@ -10,6 +10,7 @@
 use crate::control::altitude::{AltitudeController, AltitudeGains};
 use crate::control::mixer::{ControlDemand, QUAD_X};
 use crate::control::mpc::AttitudeMpc;
+use crate::control::position::{PositionController, PositionGains};
 use crate::control::pid::{PidGains, PidLimits, RatePidController};
 use crate::imu_filter::Biquad;
 use crate::sim::degrade::{Degradation, Degrader};
@@ -48,21 +49,26 @@ pub enum FailCause {
     Diverged,
     Crashed,
     Flyaway,
+    /// Horizontal position lost. Only reachable with position hold on --
+    /// without it the aircraft is SUPPOSED to translate freely, and calling
+    /// that a failure would be scoring it against a job it was not given.
+    Drifted,
     /// NaN/inf. Always a harness or solver defect, never a flight outcome.
     NonFinite,
 }
 
 impl FailCause {
-    pub const ALL: [FailCause; 4] = [
+    pub const ALL: [FailCause; 5] = [
         FailCause::Diverged, FailCause::Crashed,
-        FailCause::Flyaway, FailCause::NonFinite,
+        FailCause::Flyaway, FailCause::Drifted, FailCause::NonFinite,
     ];
     pub fn idx(self) -> usize {
         match self {
             FailCause::Diverged => 0,
             FailCause::Crashed => 1,
             FailCause::Flyaway => 2,
-            FailCause::NonFinite => 3,
+            FailCause::Drifted => 3,
+            FailCause::NonFinite => 4,
         }
     }
     pub fn short(self) -> &'static str {
@@ -70,6 +76,7 @@ impl FailCause {
             FailCause::Diverged => "div",
             FailCause::Crashed => "crash",
             FailCause::Flyaway => "away",
+            FailCause::Drifted => "drift",
             FailCause::NonFinite => "nan",
         }
     }
@@ -80,6 +87,12 @@ pub struct Metrics {
     pub att_rms: f32,
     pub att_max: f32,
     pub alt_rms: f32,
+    /// Horizontal distance from the position target, RMS and worst-case.
+    /// Meaningless unless HarnessCfg::pos_hold is set -- with no position
+    /// loop the aircraft simply translates, which is correct behaviour and
+    /// not an error.
+    pub pos_rms: f32,
+    pub pos_max: f32,
     pub air_frac: f32,
     pub failed_at: Option<(f32, FailCause)>,
 }
@@ -88,6 +101,7 @@ impl Metrics {
     pub fn failed(t: f32, cause: FailCause) -> Self {
         Self {
             att_rms: f32::NAN, att_max: f32::NAN, alt_rms: f32::NAN,
+            pos_rms: f32::NAN, pos_max: f32::NAN,
             air_frac: f32::NAN, failed_at: Some((t, cause)),
         }
     }
@@ -167,6 +181,12 @@ pub struct HarnessCfg {
     /// Commanded attitude step. `AttitudeStep::NONE` keeps the old
     /// regulate-about-level behaviour exactly.
     pub cmd: AttitudeStep,
+    /// Close the position loop: the firmware's own PositionController holds
+    /// the origin, and its tilt output becomes the MPC reference -- exactly
+    /// the cascade main.rs runs. Without this the harness cannot ask any
+    /// question about position, which is why its wind column was flat.
+    /// Mutually exclusive with `cmd`: both drive the MPC reference.
+    pub pos_hold: bool,
 }
 
 impl HarnessCfg {
@@ -180,6 +200,7 @@ impl HarnessCfg {
             dual: false,
             dual_cfg: DualImuConfig::none(),
             cmd: AttitudeStep::NONE,
+            pos_hold: false,
         }
     }
 }
@@ -221,6 +242,11 @@ pub fn run_case(
     mpc.set_reference([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
     let mut ref_deg = [0.0f32; 2];
     let mut commanded = false;
+    // Runs at the outer rate, which is what main.rs does: pos_ctrl.update
+    // sits inside the MPC_PERIOD_US ticker, i.e. 100 Hz.
+    let pos_ctrl = PositionController::new(PositionGains::default());
+    let mut pos_sq = 0.0f64;
+    let mut pos_max = 0.0f32;
 
     let mut rate_pid =
         RatePidController::new(tun.rate, tun.rate, tun.yaw, tun.limits);
@@ -300,7 +326,10 @@ pub fn run_case(
         ];
 
         // Two edges: out to the commanded attitude, then back to level.
-        let want = if t >= h.cmd.return_at_s {
+        // Skipped entirely under position hold, which owns the reference.
+        let want = if h.pos_hold {
+            ref_deg
+        } else if t >= h.cmd.return_at_s {
             [0.0, 0.0]
         } else if t >= h.cmd.at_s {
             [h.cmd.roll_deg, h.cmd.pitch_deg]
@@ -321,6 +350,19 @@ pub fn run_case(
             let vz_up = -sim.state.vz;
             current_thrust =
                 alt_ctrl.update(h.target_alt, alt, vz_up, r.dt * r.outer_div as f32);
+
+            // Position PD -> tilt reference -> MPC. The firmware's own
+            // cascade, with the origin as the target.
+            if h.pos_hold {
+                let out = pos_ctrl.update(
+                    [sim.state.x, sim.state.y],
+                    [sim.state.vx, sim.state.vy],
+                    [0.0, 0.0],
+                    sim.state.yaw * DEG2RAD,
+                );
+                ref_deg = [out.roll_rad * RAD2DEG, out.pitch_rad * RAD2DEG];
+                mpc.set_reference([out.roll_rad, out.pitch_rad, 0.0], [0.0, 0.0, 0.0]);
+            }
             trace_due = trace.is_some();
 
             let angles_rad = [angle[0] * DEG2RAD, angle[1] * DEG2RAD, angle[2] * DEG2RAD];
@@ -384,6 +426,10 @@ pub fn run_case(
             Some(FailCause::Crashed)
         } else if alt > 50.0 {
             Some(FailCause::Flyaway)
+        } else if h.pos_hold
+            && libm::sqrtf(sim.state.x * sim.state.x + sim.state.y * sim.state.y) > 100.0
+        {
+            Some(FailCause::Drifted)
         } else {
             None
         };
@@ -397,6 +443,9 @@ pub fn run_case(
         att_sq += (att * att) as f64;
         let ae = alt - h.target_alt;
         alt_sq += (ae * ae) as f64;
+        let pe = libm::sqrtf(sim.state.x * sim.state.x + sim.state.y * sim.state.y);
+        pos_sq += (pe * pe) as f64;
+        pos_max = pos_max.max(pe);
     }
 
     let n = steps as f64;
@@ -404,6 +453,8 @@ pub fn run_case(
         att_rms: libm::sqrt(att_sq / n) as f32,
         att_max,
         alt_rms: libm::sqrt(alt_sq / n) as f32,
+        pos_rms: libm::sqrt(pos_sq / n) as f32,
+        pos_max,
         air_frac: air_steps as f32 / steps as f32,
         failed_at: None,
     }
