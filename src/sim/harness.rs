@@ -10,6 +10,9 @@
 use crate::control::altitude::{AltitudeController, AltitudeGains};
 use crate::control::mixer::{ControlDemand, QUAD_X};
 use crate::control::mpc::AttitudeMpc;
+use crate::control::modes::{
+    nav_step, FlightMode, NavInputs, NavState, PosEstimate,
+};
 use crate::control::position::{PositionController, PositionGains};
 use crate::control::pid::{PidGains, PidLimits, RatePidController};
 use crate::imu_filter::Biquad;
@@ -236,6 +239,25 @@ pub struct HarnessCfg {
     /// question about position, which is why its wind column was flat.
     /// Mutually exclusive with `cmd`: both drive the MPC reference.
     pub pos_hold: bool,
+    /// Run the FIRMWARE's mode logic (control::modes::nav_step) instead of
+    /// the harness's own altitude/position handling.
+    ///
+    /// Until this existed the sweep reimplemented a simplified cascade, so
+    /// it was testing a control path the firmware does not have: no mode
+    /// logic, no rescue staging, no heading hold. Two implementations of
+    /// one thing, drifting apart -- which is the exact failure this session
+    /// kept finding elsewhere. It is also why the harness never caught the
+    /// pitch-stick or yaw-reference bugs: it never ran the code containing
+    /// them.
+    ///
+    /// `None` keeps the original behaviour so committed results stay
+    /// reproducible.
+    pub firmware_mode: Option<FlightMode>,
+    /// Start a rescue already in the Navigate stage, i.e. WITHOUT levelling
+    /// first. Exists to A/B the staging rather than argue about it: the
+    /// position controller is tilt-clamped to 15 deg, so the claim that
+    /// levelling protects the recovery needs evidence.
+    pub skip_rescue_levelling: bool,
 }
 
 impl HarnessCfg {
@@ -251,6 +273,8 @@ impl HarnessCfg {
             cmd: AttitudeStep::NONE,
             initial_attitude_deg: [0.0; 3],
             pos_hold: false,
+            firmware_mode: None,
+            skip_rescue_levelling: false,
         }
     }
 }
@@ -308,6 +332,20 @@ pub fn run_case(
     // Runs at the outer rate, which is what main.rs does: pos_ctrl.update
     // sits inside the MPC_PERIOD_US ticker, i.e. 100 Hz.
     let pos_ctrl = PositionController::new(PositionGains::default());
+    // Firmware mode logic, when driving it. Its own alt/pos controllers
+    // live inside, so the harness's are unused in that path.
+    let mut nav_state = h.firmware_mode.map(|_| {
+        let mut ns = NavState::new(
+            AltitudeController::new(tun.alt, hover_throttle),
+            PositionController::new(PositionGains::default()),
+            hover_throttle,
+        );
+        ns.alt_target = h.target_alt;
+        if h.skip_rescue_levelling {
+            ns.rescue_stage = crate::control::modes::RescueStage::Navigate;
+        }
+        ns
+    });
     let mut pos_sq = 0.0f64;
     let mut pos_max = 0.0f32;
 
@@ -389,8 +427,11 @@ pub fn run_case(
         ];
 
         // Two edges: out to the commanded attitude, then back to level.
-        // Skipped entirely under position hold, which owns the reference.
-        let want = if h.pos_hold {
+        // Skipped under position hold or firmware mode, which own the
+        // reference.
+        let want = if h.firmware_mode.is_some() {
+            ref_deg
+        } else if h.pos_hold {
             ref_deg
         } else if t >= h.cmd.return_at_s {
             [0.0, 0.0]
@@ -411,8 +452,49 @@ pub fn run_case(
         if step % r.outer_div == 0 {
             let alt = -sim.state.z;
             let vz_up = -sim.state.vz;
-            current_thrust =
-                alt_ctrl.update(h.target_alt, alt, vz_up, r.dt * r.outer_div as f32);
+            let dt_outer = r.dt * r.outer_div as f32;
+
+            if let Some(mode) = h.firmware_mode {
+                // Drive the FIRMWARE's mode logic. The estimate is built
+                // from truth: this exercises the control path, not the
+                // estimator, and a degraded estimator is a separate axis.
+                let est = PosEstimate {
+                    position_ned: [sim.state.x, sim.state.y, sim.state.z],
+                    velocity_ned: [sim.state.vx, sim.state.vy, sim.state.vz],
+                    altitude_up: alt,
+                    vz_up,
+                    altitude_ready: true,
+                    home_latched: true,
+                    ..PosEstimate::default()
+                };
+                let out = nav_step(
+                    &NavInputs {
+                        mode,
+                        roll_input: 0.0,
+                        pitch_input: 0.0,
+                        yaw_input: 0.0,
+                        throttle_raw: 0.5,
+                        max_angle_deg: 30.0,
+                        yaw_rad: sim.state.yaw * DEG2RAD,
+                        roll_rad: angle[0] * DEG2RAD,
+                        pitch_rad: angle[1] * DEG2RAD,
+                        pos_est: Some(est),
+                        dt: dt_outer,
+                        hover_throttle,
+                    },
+                    nav_state.as_mut().unwrap(),
+                );
+                current_thrust = out.thrust;
+                ref_deg = [
+                    out.desired_roll_rad * RAD2DEG,
+                    out.desired_pitch_rad * RAD2DEG,
+                ];
+                mpc.set_reference(
+                    [out.desired_roll_rad, out.desired_pitch_rad, out.desired_yaw_rad],
+                    [0.0, 0.0, out.yaw_rate_dps * DEG2RAD],
+                );
+            } else {
+            current_thrust = alt_ctrl.update(h.target_alt, alt, vz_up, dt_outer);
 
             // Position PD -> tilt reference -> MPC. The firmware's own
             // cascade, with the origin as the target.
@@ -425,6 +507,7 @@ pub fn run_case(
                 );
                 ref_deg = [out.roll_rad * RAD2DEG, out.pitch_rad * RAD2DEG];
                 mpc.set_reference([out.roll_rad, out.pitch_rad, 0.0], [0.0, 0.0, 0.0]);
+            }
             }
             trace_due = trace.is_some();
 

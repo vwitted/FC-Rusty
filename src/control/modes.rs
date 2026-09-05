@@ -165,6 +165,32 @@ pub const V_MIN_COG: f32 = 2.0;
 /// trusted as heading.
 pub const FWD_STICK_MIN: f32 = 0.3;
 
+/// Tilt below which a rescue skips levelling entirely and navigates
+/// straight away.
+///
+/// MEASURED, not assumed. Levelling disables the position loop, and the
+/// A/B in sim_sweep says that trade is bad at moderate upsets and free at
+/// extreme ones:
+///
+///     initial roll   staged drift/recov   unstaged drift/recov
+///        30 deg        7.8 m / 0.55 s       3.6 m / 0.93 s
+///        70 deg       52.1 m / 1.52 s      44.3 m / 1.90 s
+///       120 deg      147.5 m / 2.38 s     147.4 m / 2.74 s
+///       170 deg      105.6 m / 3.05 s     105.5 m / 3.35 s
+///
+/// Levelling is ~0.3 s faster to recover throughout, but costs up to 2x
+/// the drift below 90 deg -- drifting further from home, during a
+/// procedure whose whole point is getting home. Past 90 deg the drift
+/// penalty vanishes (the aircraft is ballistic either way) and the 0.3 s
+/// is free, and that is also where the position controller's small-angle
+/// model stops meaning anything.
+///
+/// So: level first only when past 90 deg. The original always-level design
+/// was wrong, and wrong for an instructive reason -- it assumed the two
+/// loops compete for authority, when PositionController is tilt-clamped to
+/// 15 deg and cannot meaningfully contest a 70 deg recovery.
+pub const RESCUE_LEVEL_MIN_TILT_DEG: f32 = 90.0;
+
 /// Tilt below which the levelling stage of a GPS rescue exits early.
 /// Tight on purpose: the stage AIMS at 0 deg, and this is only "close
 /// enough that waiting longer buys nothing".
@@ -520,6 +546,11 @@ fn rescue_levelling(inp: &NavInputs, st: &mut NavState) -> (bool, Option<NavEven
         return (false, None);
     }
     let tilt = tilt_deg(inp);
+    if st.rescue_level_deadline_s.is_none() && tilt < RESCUE_LEVEL_MIN_TILT_DEG {
+        // Not upset enough to be worth surrendering position control.
+        st.rescue_stage = RescueStage::Navigate;
+        return (false, None);
+    }
     let deadline = *st.rescue_level_deadline_s.get_or_insert_with(|| {
         RESCUE_LEVEL_FLOOR_S + RESCUE_LEVEL_S_PER_DEG * tilt
     });
@@ -1331,7 +1362,7 @@ mod tests {
     #[test]
     fn rescue_levels_before_it_navigates() {
         let mut st = state();
-        let out = nav_step(&upset_home(70.0), &mut st);
+        let out = nav_step(&upset_home(120.0), &mut st);
         assert_eq!(st.rescue_stage, RescueStage::Level);
         assert_eq!(out.desired_roll_rad, 0.0, "must command LEVEL, not tilt home");
         assert_eq!(out.desired_pitch_rad, 0.0);
@@ -1342,7 +1373,7 @@ mod tests {
     #[test]
     fn rescue_navigates_once_attitude_is_recovered() {
         let mut st = state();
-        nav_step(&upset_home(70.0), &mut st);
+        nav_step(&upset_home(120.0), &mut st);
         assert_eq!(st.rescue_stage, RescueStage::Level);
 
         // Now level.
@@ -1361,7 +1392,7 @@ mod tests {
     #[test]
     fn rescue_gives_up_levelling_on_time_and_proceeds() {
         let mut st = state();
-        let inp = upset_home(18.0); // never reaches the 5 deg exit
+        let inp = upset_home(100.0); // past the gate, never reaches 5 deg
         let mut timed_out = false;
         // Deadline for 18 deg is well under a second; run a generous window.
         for _ in 0..500 {
@@ -1370,7 +1401,7 @@ mod tests {
                 break;
             }
         }
-        assert!(timed_out, "must give up rather than hang at 18 deg");
+        assert!(timed_out, "must give up rather than hang at 100 deg");
         assert_eq!(st.rescue_stage, RescueStage::Navigate);
         let out = nav_step(&inp, &mut st);
         assert!(out.desired_pitch_rad != 0.0, "and then actually navigate");
@@ -1381,14 +1412,14 @@ mod tests {
     #[test]
     fn levelling_deadline_scales_with_initial_tilt() {
         let mut gentle = state();
-        nav_step(&upset_home(30.0), &mut gentle);
+        nav_step(&upset_home(100.0), &mut gentle);
         let mut inverted = state();
         nav_step(&upset_home(170.0), &mut inverted);
         let (g, i) = (
             gentle.rescue_level_deadline_s.unwrap(),
             inverted.rescue_level_deadline_s.unwrap(),
         );
-        assert!(i > g * 2.5, "inverted deadline {i}s should dwarf 30 deg's {g}s");
+        assert!(i > g * 1.4, "inverted deadline {i}s should exceed 100 deg's {g}s");
         assert!(g > RESCUE_LEVEL_FLOOR_S, "and never below the floor");
     }
 
@@ -1412,7 +1443,7 @@ mod tests {
     fn altitude_is_still_controlled_while_levelling() {
         let mut st = state();
         st.alt_target = 40.0;
-        let mut inp = upset_home(70.0);
+        let mut inp = upset_home(120.0);
         inp.pos_est = Some(PosEstimate {
             position_ned: [-50.0, 0.0, 0.0],
             altitude_up: 10.0,
@@ -1421,5 +1452,37 @@ mod tests {
         let out = nav_step(&inp, &mut st);
         assert_eq!(st.rescue_stage, RescueStage::Level);
         assert!(out.thrust > HOVER, "30 m below target: must climb, got {}", out.thrust);
+    }
+
+    /// The gate. Below 90 deg a rescue navigates immediately rather than
+    /// surrendering the position loop -- measured to cost up to 2x the
+    /// drift for ~0.3 s of recovery time that a moderate upset does not
+    /// need. See RESCUE_LEVEL_MIN_TILT_DEG for the numbers.
+    #[test]
+    fn moderate_upsets_navigate_immediately_without_levelling() {
+        for roll in [10.0f32, 45.0, 85.0] {
+            let mut st = state();
+            let out = nav_step(&upset_home(roll), &mut st);
+            assert_eq!(
+                st.rescue_stage, RescueStage::Navigate,
+                "{roll} deg is under the gate: navigate, do not level"
+            );
+            assert!(
+                out.desired_pitch_rad < 0.0,
+                "and actually fly home (nose down, 50 m south): {roll} deg gave {}",
+                out.desired_pitch_rad
+            );
+        }
+    }
+
+    /// Past the gate it still levels first.
+    #[test]
+    fn severe_upsets_still_level_first() {
+        for roll in [95.0f32, 140.0, 175.0] {
+            let mut st = state();
+            let out = nav_step(&upset_home(roll), &mut st);
+            assert_eq!(st.rescue_stage, RescueStage::Level, "{roll} deg must level");
+            assert_eq!(out.desired_roll_rad, 0.0);
+        }
     }
 }

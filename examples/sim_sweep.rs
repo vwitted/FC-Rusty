@@ -214,6 +214,8 @@ fn harness_cfg(cfg: &Degradation, r: Rates, dual: bool) -> (HarnessCfg, Tunables
         cmd: fc_rusty::sim::harness::AttitudeStep::NONE,
         initial_attitude_deg: [0.0; 3],
         pos_hold: false,
+        firmware_mode: None,
+        skip_rescue_levelling: false,
     };
     (h, tunables())
 }
@@ -490,6 +492,47 @@ fn main() {
             };
             println!("{:>10}   recovered in {:>7}, height lost {:>8}   {}",
                      format!("{:.0}", roll0), rec, lost, fail);
+        }
+    }
+
+    // --- GPS rescue from an upset: staged vs unstaged ---
+    //
+    // Runs the FIRMWARE's mode logic (control::modes::nav_step), not the
+    // harness's own cascade. Home is the origin, which is also where the
+    // run starts, so pos_max is exactly how far it wanders while sorting
+    // itself out.
+    //
+    // The question: does levelling before navigating actually help? The
+    // position controller is tilt-clamped to 15 deg, so it cannot compete
+    // for authority against a 70 deg recovery, and disabling it guarantees
+    // drift. Measured rather than argued.
+    if !csv {
+        println!();
+        println!("== GPS rescue from upset (firmware nav_step), home at origin");
+        println!("{:>8} {:>22} {:>22}", "roll", "staged: drift/recov", "unstaged: drift/recov");
+        println!("{}", "-".repeat(56));
+    }
+    for &roll0 in &[30.0f32, 70.0, 120.0, 170.0] {
+        let mut cells = Vec::new();
+        for staged in [true, false] {
+            let mut hr = harness_cfg(&Degradation::none(), rates, dual).0;
+            hr.initial_attitude_deg = [roll0, 0.0, 0.0];
+            hr.target_alt = 100.0;
+            hr.total_s = 20.0;
+            hr.firmware_mode = Some(fc_rusty::control::modes::FlightMode::GpsHome);
+            hr.skip_rescue_levelling = !staged;
+            let tun = tunables();
+            let m = run_case(&hr, &tun, Degradation::none(), 1, None);
+            cells.push(match m.failed_at {
+                Some((t, c)) => format!("{} @{:.1}s", c.short(), t),
+                None => format!("{:.1} m / {}", m.pos_max,
+                    m.recovered_at.map(|t| format!("{t:.2}s"))
+                        .unwrap_or_else(|| "never".into())),
+            });
+        }
+        if !csv {
+            println!("{:>8} {:>22} {:>22}",
+                     format!("{roll0:.0}"), cells[0], cells[1]);
         }
     }
 
