@@ -81,6 +81,9 @@ fn plant_params() -> QuadParams {
     if let Some(v) = std::env::var("PLANT_INERTIA").ok().and_then(|v| v.parse().ok()) {
         p.inertia = [v, v, v * 2.0];
     }
+    if let Some(v) = std::env::var("PLANT_WIND").ok().and_then(|v| v.parse().ok()) {
+        p.wind_ned = [v, 0.0, 0.0];
+    }
     // Trap worth guarding: AltitudeController clamps to min_thrust = 0.1, so
     // once max_thrust is high enough that hover sits below that floor, the
     // controller CANNOT command hover and the aircraft climbs no matter how
@@ -389,6 +392,47 @@ fn main() {
         };
         let a = aggregate(cfg, seeds, rates, dual);
         if csv { csv_row("gyro_p_online", p, a) } else { row(format!("{:.2}", p), a) }
+    }
+
+    // --- wind ---
+    //
+    // READ THIS BEFORE READING THE TABLE. It is flat, all the way to
+    // hurricane force, and that is not a result -- it is the harness
+    // reporting on a question it cannot ask. There is no POSITION loop
+    // here: the cascade is altitude -> attitude MPC (reference level) ->
+    // rate PID. Steady wind applies no aerodynamic moment in this model, so
+    // the aircraft holds attitude perfectly and simply translates downwind,
+    // and nothing in att_rms/alt_rms measures translation.
+    //
+    // So this axis currently proves only that wind does not upset ATTITUDE
+    // hold. Making it mean what it looks like it means needs src/control's
+    // position PD in the loop and a position-error metric alongside the
+    // others. Until then, do not quote it as robustness to wind.
+    if !csv { header("steady wind (m/s) -- attitude hold only, see note", "wind"); }
+    for &wind in &[0.0f32, 2.0, 5.0, 10.0, 14.0, 20.0, 25.0, 33.0] {
+        let mut hw = harness_cfg(&Degradation::none(), rates, dual).0;
+        hw.plant.wind_ned = [wind, 0.0, 0.0];
+        let tun = tunables();
+        let mut a = Agg { att_rms: 0.0, att_max: 0.0, alt_rms: 0.0, air_frac: 0.0,
+                          failures: 0, n: 0, first_fail_t: None, causes: [0; 4] };
+        let mut ok = 0usize;
+        for sd in 0..seeds {
+            let m = run_case(&hw, &tun, Degradation::none(), sd * 7919 + 1, None);
+            if let Some((t, c)) = m.failed_at {
+                a.failures += 1;
+                a.causes[c.idx()] += 1;
+                a.first_fail_t = Some(a.first_fail_t.map_or(t, |q: f32| q.min(t)));
+                continue;
+            }
+            a.att_rms += m.att_rms; a.alt_rms += m.alt_rms; a.air_frac += m.air_frac;
+            a.att_max = a.att_max.max(m.att_max);
+            ok += 1;
+        }
+        a.n = seeds as usize;
+        if ok > 0 {
+            a.att_rms /= ok as f32; a.alt_rms /= ok as f32; a.air_frac /= ok as f32;
+        }
+        if csv { csv_row("wind_ms", wind, a) } else { row(format!("{:.0}", wind), a) }
     }
 
     // --- asymmetric airframe: one motor down ---
