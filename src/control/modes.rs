@@ -28,8 +28,22 @@
 // So positive pitch_input means "fly forward", and the attitude path must
 // NEGATE it while PosHold and the COG gate must not. Acro and AltHold did
 // not negate, which inverted the pitch stick in the two modes you take off
-// in. Roll is unaffected: stick right is a positive value AND positive roll
-// is right-wing-down, so those already agree.
+// in.
+//
+// WHY ONLY PITCH. Not because RC and aviation disagree -- a yoke, a
+// sidestick and an RC gimbal all move the way you want the nose to move.
+// The clash is between the stick DISPLACEMENT and the ANGLE's sign, and it
+// falls out of body axes being FRD (X fwd, Y RIGHT, Z DOWN):
+//
+//   +roll  about X: Y(right) -> Z(down)  =>  right wing DOWN
+//   +pitch about Y: Z(down)  -> X(fwd)   =>  nose UP
+//
+// Positive roll moves a wing down; positive pitch moves the nose up. That
+// asymmetry is the whole reason exactly one axis needs the negation, and
+// stick-right happens to land on the agreeing one.
+//
+// It is a consequence of Z-down, not something inherent: in FLU (X fwd,
+// Y left, Z up) both axes agree and neither needs negating.
 //
 // One deliberate behaviour change, called out rather than hidden: the GPS
 // loiter timer used `Instant::now()` / `.elapsed()`. It now accumulates
