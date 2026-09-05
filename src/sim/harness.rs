@@ -94,15 +94,34 @@ pub struct Metrics {
     pub pos_rms: f32,
     pub pos_max: f32,
     pub air_frac: f32,
+    /// Time at which attitude first came back inside RECOVERY_LEVEL_DEG.
+    /// Only meaningful when `initial_attitude_deg` is non-zero.
+    pub recovered_at: Option<f32>,
+    /// Lowest altitude reached, metres. For an upset run this is the number
+    /// that matters: recovery TIME is academic, height LOST tells you the
+    /// altitude below which the upset is unsurvivable.
+    pub alt_min: f32,
     pub failed_at: Option<(f32, FailCause)>,
 }
+
+/// How far above the altitude target counts as a flyaway, metres.
+///
+/// Relative, not absolute: it used to be a hard 50 m, which silently made
+/// every run starting above that altitude an instant failure. At the
+/// default 5 m target this is still exactly 50 m, so existing results are
+/// unchanged.
+pub const FLYAWAY_MARGIN_M: f32 = 45.0;
+
+/// Attitude below which an upset counts as recovered, degrees.
+pub const RECOVERY_LEVEL_DEG: f32 = 15.0;
 
 impl Metrics {
     pub fn failed(t: f32, cause: FailCause) -> Self {
         Self {
             att_rms: f32::NAN, att_max: f32::NAN, alt_rms: f32::NAN,
             pos_rms: f32::NAN, pos_max: f32::NAN,
-            air_frac: f32::NAN, failed_at: Some((t, cause)),
+            air_frac: f32::NAN, recovered_at: None, alt_min: f32::NAN,
+            failed_at: Some((t, cause)),
         }
     }
 }
@@ -181,6 +200,15 @@ pub struct HarnessCfg {
     /// Commanded attitude step. `AttitudeStep::NONE` keeps the old
     /// regulate-about-level behaviour exactly.
     pub cmd: AttitudeStep,
+    /// Start the aircraft at this attitude, degrees [roll, pitch, yaw].
+    ///
+    /// For recovery-from-upset testing. Non-zero values disarm the
+    /// "attitude > 90 deg means diverged" check UNTIL the aircraft has
+    /// recovered once -- a run that starts inverted is diverged by
+    /// construction, and scoring that as failure would make the test
+    /// vacuous. After the first recovery the check re-arms, so losing it
+    /// again still counts.
+    pub initial_attitude_deg: [f32; 3],
     /// Close the position loop: the firmware's own PositionController holds
     /// the origin, and its tilt output becomes the MPC reference -- exactly
     /// the cascade main.rs runs. Without this the harness cannot ask any
@@ -200,6 +228,7 @@ impl HarnessCfg {
             dual: false,
             dual_cfg: DualImuConfig::none(),
             cmd: AttitudeStep::NONE,
+            initial_attitude_deg: [0.0; 3],
             pos_hold: false,
         }
     }
@@ -231,6 +260,19 @@ pub fn run_case(
     let r = h.rates;
     let hover_throttle = (h.plant.mass * 9.81) / h.plant.max_thrust;
     let mut sim = QuadSim::new_hovering(h.plant, h.target_alt);
+    let upset = h.initial_attitude_deg != [0.0; 3];
+    if upset {
+        sim.set_attitude_deg(
+            h.initial_attitude_deg[0],
+            h.initial_attitude_deg[1],
+            h.initial_attitude_deg[2],
+        );
+    }
+    // Starts armed unless the run begins upset, in which case it arms on
+    // the first recovery.
+    let mut divergence_armed = !upset;
+    let mut recovered_at = None;
+    let mut alt_min = f32::INFINITY;
     let mut deg = Degrader::new(cfg, seed);
     // Motors always come from `deg`; only the IMU path forks.
     let mut dual_imu = DualImu::new(h.dual_cfg, seed);
@@ -420,11 +462,11 @@ pub fn run_case(
         // ground is a divergence; the ground contact is its consequence.
         let cause = if !roll.is_finite() || !pitch.is_finite() || !alt.is_finite() {
             Some(FailCause::NonFinite)
-        } else if roll.abs() > 90.0 || pitch.abs() > 90.0 {
+        } else if divergence_armed && (roll.abs() > 90.0 || pitch.abs() > 90.0) {
             Some(FailCause::Diverged)
         } else if alt <= 0.0 {
             Some(FailCause::Crashed)
-        } else if alt > 50.0 {
+        } else if alt > h.target_alt + FLYAWAY_MARGIN_M {
             Some(FailCause::Flyaway)
         } else if h.pos_hold
             && libm::sqrtf(sim.state.x * sim.state.x + sim.state.y * sim.state.y) > 100.0
@@ -439,6 +481,11 @@ pub fn run_case(
 
         let (re, pe) = (roll - ref_deg[0], pitch - ref_deg[1]);
         let att = libm::sqrtf(re * re + pe * pe);
+        alt_min = alt_min.min(alt);
+        if recovered_at.is_none() && att < RECOVERY_LEVEL_DEG {
+            recovered_at = Some(t);
+            divergence_armed = true; // losing it again now counts
+        }
         att_max = att_max.max(att);
         att_sq += (att * att) as f64;
         let ae = alt - h.target_alt;
@@ -456,6 +503,8 @@ pub fn run_case(
         pos_rms: libm::sqrt(pos_sq / n) as f32,
         pos_max,
         air_frac: air_steps as f32 / steps as f32,
+        recovered_at,
+        alt_min,
         failed_at: None,
     }
 }

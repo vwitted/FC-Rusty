@@ -212,6 +212,7 @@ fn harness_cfg(cfg: &Degradation, r: Rates, dual: bool) -> (HarnessCfg, Tunables
         dual_cfg: to_dual(cfg),
         // The sweep measures regulation about level, as before.
         cmd: fc_rusty::sim::harness::AttitudeStep::NONE,
+        initial_attitude_deg: [0.0; 3],
         pos_hold: false,
     };
     (h, tunables())
@@ -406,6 +407,68 @@ fn main() {
         };
         let a = aggregate(cfg, seeds, rates, dual);
         if csv { csv_row("gyro_p_online", p, a) } else { row(format!("{:.2}", p), a) }
+    }
+
+    // --- recovery from upset ---
+    //
+    // Start inverted-ish at altitude and see whether the stack gets back to
+    // level before it reaches the ground. Only representable at all since
+    // the attitude state became a quaternion: Euler angles are singular at
+    // 90 deg pitch, and the model used to clamp through it.
+    //
+    // The divergence check is disarmed until the first recovery, because a
+    // run that STARTS past 90 deg is diverged by construction. It re-arms
+    // afterwards, so losing it a second time still counts.
+    if !csv {
+        println!();
+        println!("== recovery from upset (initial roll)");
+        println!("{}", "-".repeat(72));
+    }
+    for &roll0 in &[0.0f32, 30.0, 60.0, 90.0, 120.0, 150.0, 179.0] {
+        let mut hu = harness_cfg(&Degradation::none(), rates, dual).0;
+        hu.initial_attitude_deg = [roll0, 0.0, 0.0];
+        hu.target_alt = 100.0; // room to fall while recovering
+        let tun = tunables();
+        let mut a = Agg { pos_rms: 0.0, att_rms: 0.0, att_max: 0.0, alt_rms: 0.0,
+                          air_frac: 0.0, failures: 0, n: 0, first_fail_t: None,
+                          causes: [0; 5] };
+        let (mut ok, mut rec_sum, mut rec_n) = (0usize, 0.0f32, 0usize);
+        let mut lost_max = 0.0f32;
+        for sd in 0..seeds {
+            let m = run_case(&hu, &tun, Degradation::none(), sd * 7919 + 1, None);
+            if let Some(t) = m.recovered_at { rec_sum += t; rec_n += 1; }
+            if m.alt_min.is_finite() {
+                lost_max = lost_max.max(hu.target_alt - m.alt_min);
+            }
+            if let Some((t, c)) = m.failed_at {
+                a.failures += 1;
+                a.causes[c.idx()] += 1;
+                a.first_fail_t = Some(a.first_fail_t.map_or(t, |q: f32| q.min(t)));
+                continue;
+            }
+            a.att_rms += m.att_rms; a.alt_rms += m.alt_rms; a.air_frac += m.air_frac;
+            a.pos_rms += m.pos_rms;
+            a.att_max = a.att_max.max(m.att_max);
+            ok += 1;
+        }
+        a.n = seeds as usize;
+        if ok > 0 {
+            a.att_rms /= ok as f32; a.alt_rms /= ok as f32;
+            a.air_frac /= ok as f32; a.pos_rms /= ok as f32;
+        }
+        if csv {
+            csv_row("upset_roll_deg", roll0, a)
+        } else {
+            let rec = if rec_n > 0 {
+                format!("{:.2}s", rec_sum / rec_n as f32)
+            } else {
+                "never".to_string()
+            };
+            println!("{:>10}   recovered in {:>7}, height lost {:>6.1} m   {}",
+                     format!("{:.0}", roll0), rec, lost_max,
+                     if a.failures == 0 { "-".to_string() }
+                     else { format!("{}/{} fail", a.failures, a.n) });
+        }
     }
 
     // --- wind ---
