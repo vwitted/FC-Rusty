@@ -18,6 +18,19 @@
 // them assertable — previously you could not test that "arrived at home"
 // fired.
 //
+// STICK CONVENTION, stated once because three places depend on it:
+//
+//   Stick UP  ->  INCREASING channel value  ->  positive `pitch_input`
+//   Stick UP  ->  aircraft pitches DOWN     ->  NEGATIVE `desired_pitch_rad`
+//
+// (nose-down is negative pitch in 3-2-1 Tait-Bryan; see src/conventions.rs.)
+//
+// So positive pitch_input means "fly forward", and the attitude path must
+// NEGATE it while PosHold and the COG gate must not. Acro and AltHold did
+// not negate, which inverted the pitch stick in the two modes you take off
+// in. Roll is unaffected: stick right is a positive value AND positive roll
+// is right-wing-down, so those already agree.
+//
 // One deliberate behaviour change, called out rather than hidden: the GPS
 // loiter timer used `Instant::now()` / `.elapsed()`. It now accumulates
 // `dt`. On the fixed 100 Hz ticker these agree, and it removes a hidden
@@ -150,12 +163,10 @@ pub struct CogGate {
 /// where course-over-ground is ~180 deg from heading -- i.e. it injects a
 /// half-turn of yaw error straight into the MEKF.
 ///
-/// !! THE FORWARD-STICK SIGN IS UNRESOLVED. See
-/// `cog_gate_and_attitude_path_agree_on_what_forward_means` in
-/// src/conventions.rs. This function preserves main.rs's behaviour
-/// (positive pitch_input treated as forward); the attitude path treats
-/// positive pitch_input as NOSE UP, which is backwards. One of the two is
-/// wrong and it cannot be settled from the RC convention alone.
+/// Positive `pitch_input` is stick-up, which is forward flight -- see
+/// STICK CONVENTION in this module's header. This gate was always right
+/// about that; it was the attitude path in Acro/AltHold that disagreed,
+/// which is what the contradiction test caught.
 pub fn should_fuse_cog(g: &CogGate) -> bool {
     g.armed
         && g.has_3d_fix
@@ -410,7 +421,10 @@ pub fn nav_step(inp: &NavInputs, st: &mut NavState) -> NavOutputs {
     match inp.mode {
         FlightMode::Acro => {
             desired_roll_rad = inp.roll_input * inp.max_angle_deg * DEG2RAD;
-            desired_pitch_rad = inp.pitch_input * inp.max_angle_deg * DEG2RAD;
+            // Negated: see STICK CONVENTION in the module header. Stick up
+            // is a positive channel value and must pitch the aircraft DOWN,
+            // and nose-down is NEGATIVE pitch in 3-2-1 Tait-Bryan.
+            desired_pitch_rad = -inp.pitch_input * inp.max_angle_deg * DEG2RAD;
             desired_yaw_rad = 0.0;
             yaw_rate_dps = inp.yaw_input * 200.0;
             // Direct throttle pass-through
@@ -418,7 +432,8 @@ pub fn nav_step(inp: &NavInputs, st: &mut NavState) -> NavOutputs {
         }
         FlightMode::AltHold => {
             desired_roll_rad = inp.roll_input * inp.max_angle_deg * DEG2RAD;
-            desired_pitch_rad = inp.pitch_input * inp.max_angle_deg * DEG2RAD;
+            // Negated, as in Acro -- see STICK CONVENTION in the header.
+            desired_pitch_rad = -inp.pitch_input * inp.max_angle_deg * DEG2RAD;
             desired_yaw_rad = 0.0;
             yaw_rate_dps = inp.yaw_input * 200.0;
             // Throttle stick -> climb/descend rate -> alt target adjustment
@@ -639,12 +654,16 @@ mod tests {
     fn acro_passes_sticks_through_and_throttle_direct() {
         let mut st = state();
         let mut inp = inputs(FlightMode::Acro);
-        inp.roll_input = 0.5;
-        inp.pitch_input = -0.5;
+        inp.roll_input = 0.5;   // right
+        inp.pitch_input = 0.5;  // stick UP
         inp.throttle_raw = 0.7;
         let out = nav_step(&inp, &mut st);
+        // Stick right -> roll right -> positive roll.
         assert!((out.desired_roll_rad - 15.0_f32.to_radians()).abs() < 1e-5);
-        assert!((out.desired_pitch_rad + 15.0_f32.to_radians()).abs() < 1e-5);
+        // Stick UP -> nose DOWN -> NEGATIVE pitch. This is the assertion
+        // that was inverted, in the test as well as in the code.
+        assert!((out.desired_pitch_rad + 15.0_f32.to_radians()).abs() < 1e-5,
+                "stick up must pitch nose-down, got {}", out.desired_pitch_rad);
         assert!((out.thrust - 0.7).abs() < 1e-6, "direct throttle");
     }
 

@@ -279,42 +279,30 @@ mod tests {
 
     // ---- Stage 6: the RC stick convention ----
 
-    /// KNOWN CONTRADICTION — two places read the SAME RC channel and
-    /// disagree about what its sign means. This is derivable from the code
-    /// alone; it needs no knowledge of the transmitter.
+    /// The RC stick convention, stated by the aircraft's owner and now
+    /// enforced:
     ///
-    ///   main.rs:2116  channels[1] -> pitch_input -> nav_step, where
-    ///                 desired_pitch_rad = pitch_input * max_angle.
-    ///                 Positive pitch is NOSE UP (pinned by the tests
-    ///                 above), and nose up accelerates SOUTH -- backwards.
+    ///   Stick UP -> INCREASING channel value -> positive `pitch_input`
+    ///   Stick UP -> aircraft pitches DOWN    -> negative commanded pitch
     ///
-    ///   main.rs:2081  the same channels[1] -> should_fuse_cog, gated
-    ///                 `pitch_input > FWD_STICK_MIN` to mean "deliberately
-    ///                 flying FORWARD".
-    ///
-    /// Positive cannot mean both "nose up, therefore backwards" and
-    /// "forward". Whichever way the transmitter is wired, one of the two is
-    /// wrong:
-    ///
-    ///   forward stick positive -> Acro pitches nose-UP on forward stick
-    ///   forward stick negative -> the COG gate fires flying BACKWARDS
-    ///
-    /// The second is the dangerous one: course-over-ground is ~180 deg from
-    /// heading when moving backwards, so the gate would feed a half-turn of
-    /// yaw error into the MEKF exactly when it is most confident.
-    ///
-    /// Ignored rather than resolved, because fixing it means choosing which
-    /// of the two is authoritative, and that is a decision about the
-    /// aircraft, not about the code. The comment at main.rs:2079 already
-    /// asks this question; this test makes it fail loudly instead of
-    /// sitting in a comment.
+    /// Three places read that channel, and they used to disagree. The COG
+    /// gate and PosHold both treated positive as "forward"; Acro and
+    /// AltHold treated it as nose-UP, which is backwards. This test crosses
+    /// the two readings so they can never drift apart again: the same stick
+    /// deflection the COG gate calls "flying forward" must produce a
+    /// nose-DOWN attitude command.
     #[test]
-    #[ignore = "unresolved: pitch-stick sign means opposite things in two places"]
     fn cog_gate_and_attitude_path_agree_on_what_forward_means() {
-        use crate::control::modes::{should_fuse_cog, CogGate, FWD_STICK_MIN};
+        use crate::control::modes::{
+            nav_step, should_fuse_cog, CogGate, FlightMode, NavInputs, NavState,
+            FWD_STICK_MIN,
+        };
+        use crate::control::altitude::{AltitudeController, AltitudeGains};
+        use crate::control::position::{PositionController, PositionGains};
 
-        // Take a stick deflection the COG gate accepts as "flying forward".
         let fwd = FWD_STICK_MIN + 0.2;
+
+        // The COG gate accepts this as deliberate forward flight.
         assert!(should_fuse_cog(&CogGate {
             armed: true,
             has_3d_fix: true,
@@ -322,12 +310,31 @@ mod tests {
             pitch_input: fwd,
         }));
 
-        // The attitude path must then agree that this stick flies FORWARD,
-        // i.e. commands nose-DOWN (negative pitch).
-        let commanded_pitch_rad = fwd * 30.0 * D2R; // as nav_step computes it
+        // The attitude path must agree: nose DOWN, which flies forward.
+        let mut st = NavState::new(
+            AltitudeController::new(AltitudeGains { kp: 0.15, kd: 0.1, ki: 0.05 }, 0.294),
+            PositionController::new(PositionGains::default()),
+            0.294,
+        );
+        let out = nav_step(
+            &NavInputs {
+                mode: FlightMode::Acro,
+                roll_input: 0.0,
+                pitch_input: fwd,
+                yaw_input: 0.0,
+                throttle_raw: 0.5,
+                max_angle_deg: 30.0,
+                yaw_rad: 0.0,
+                pos_est: None,
+                dt: 0.01,
+                hover_throttle: 0.294,
+            },
+            &mut st,
+        );
         assert!(
-            commanded_pitch_rad < 0.0,
-            "the COG gate calls {fwd} 'forward', but the attitude path turns it into {commanded_pitch_rad} rad of pitch, which is nose-UP and flies backwards"
+            out.desired_pitch_rad < 0.0,
+            "the COG gate calls {fwd} 'forward', so the attitude path must command nose-DOWN; got {} rad",
+            out.desired_pitch_rad
         );
     }
 }
