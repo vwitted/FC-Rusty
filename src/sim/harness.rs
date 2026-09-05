@@ -18,6 +18,7 @@ use crate::control::position::{PositionController, PositionGains};
 use crate::control::pid::{PidGains, PidLimits, RatePidController};
 use crate::imu_filter::Biquad;
 use crate::sim::degrade::{Degradation, Degrader};
+use crate::sim::sensors::GpsSim;
 use crate::sim::dual_imu::{DualImu, DualImuConfig};
 use crate::sim::{MotorForces, QuadParams, QuadSim};
 
@@ -305,6 +306,18 @@ pub struct HarnessCfg {
     /// Derive the compensation from the ESTIMATOR's own attitude rather
     /// than from an independent source. Demonstrates why that cannot work.
     pub compensate_from_estimate: bool,
+    /// Derive the compensation from a simulated GPS receiver -- Doppler
+    /// velocity, differentiated and low-pass filtered -- instead of the
+    /// sim's exact acceleration. This is what the firmware could actually
+    /// build, since main.rs already computes (vn, ve) from ground speed and
+    /// course and fuses them into the PosKF.
+    ///
+    /// The raw SNR looks bad: 0.05 m/s of Doppler noise at 10 Hz
+    /// differentiates to ~0.7 m/s2, against the ~2.6 m/s2 being removed.
+    /// It works anyway because the corruption is QUASI-STATIC -- a sustained
+    /// tilt against steady wind -- so the estimate can be filtered hard and
+    /// the resulting lag costs nothing.
+    pub compensate_from_gps: bool,
 }
 
 impl HarnessCfg {
@@ -326,6 +339,7 @@ impl HarnessCfg {
             use_estimator: false,
             compensate_accel: false,
             compensate_from_estimate: false,
+            compensate_from_gps: false,
         }
     }
 }
@@ -374,6 +388,13 @@ pub fn run_case(
     let mut divergence_armed = !upset;
     let mut recovered_at = None;
     let mut alt_min = f32::INFINITY;
+
+    // Simulated receiver for GPS-derived acceleration, plus the
+    // differentiator's state and its low-pass.
+    let mut gps = h.compensate_from_gps.then(|| GpsSim::new(10.0, 2.0, 5.0, seed ^ 0x6750_5300));
+    let mut last_gps_vel: Option<[f32; 3]> = None;
+    let mut gps_accel_filt = [0.0f32; 3];
+    let mut since_fix = 0.0f32;
     let mut deg = Degrader::new(cfg, seed);
     // Motors always come from `deg`; only the IMU path forks.
     let mut dual_imu = DualImu::new(h.dual_cfg, seed);
@@ -472,6 +493,34 @@ pub fn run_case(
             }
         }
 
+        // Tick the receiver before the IMU read so a fresh fix is
+        // available to this step's accel update.
+        if let Some(g) = gps.as_mut() {
+            since_fix += r.dt;
+            if let Some(fix) = g.tick_full(
+                r.dt,
+                [sim.state.x, sim.state.y, sim.state.z],
+                [sim.state.vx, sim.state.vy, sim.state.vz],
+            ) {
+                if let Some(prev) = last_gps_vel {
+                    if since_fix > 1e-6 {
+                        // Low-pass the differentiated velocity. tau = 0.5 s
+                        // averages ~5 fixes, cutting the ~0.7 m/s2
+                        // differentiation noise by about half, at a lag
+                        // that a quasi-static error does not care about.
+                        const TAU_S: f32 = 0.5;
+                        let alpha = (since_fix / TAU_S).clamp(0.0, 1.0);
+                        for k in 0..3 {
+                            let a = (fix.velocity_ned[k] - prev[k]) / since_fix;
+                            gps_accel_filt[k] += (a - gps_accel_filt[k]) * alpha;
+                        }
+                    }
+                }
+                last_gps_vel = Some(fix.velocity_ned);
+                since_fix = 0.0;
+            }
+        }
+
         let truth = sim.read_imu();
         let (gyro_raw, angle_err) = if h.dual {
             dual_imu.read(truth.gyro, truth.accel, r.dt).0
@@ -514,6 +563,20 @@ pub fn run_case(
                     let fb = nalgebra::Vector3::new(f[0], f[1], f[2]);
                     let aw = rq * fb + nalgebra::Vector3::new(0.0, 0.0, 9.81);
                     let ab = rq.inverse() * aw;
+                    f = [f[0] - ab.x, f[1] - ab.y, f[2] - ab.z];
+                } else if h.compensate_from_gps {
+                    // Independent of the MEKF's attitude by construction:
+                    // this came from the receiver, not from the IMU.
+                    let rot = nalgebra::UnitQuaternion::from_quaternion(
+                        nalgebra::Quaternion::new(
+                            sim.state.q[0], sim.state.q[1],
+                            sim.state.q[2], sim.state.q[3],
+                        ),
+                    );
+                    let ab = rot.inverse()
+                        * nalgebra::Vector3::new(
+                            gps_accel_filt[0], gps_accel_filt[1], gps_accel_filt[2],
+                        );
                     f = [f[0] - ab.x, f[1] - ab.y, f[2] - ab.z];
                 } else if h.compensate_accel {
                     // f = a - g, so removing a leaves -g. The sim's

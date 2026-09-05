@@ -222,8 +222,10 @@ fn harness_cfg(cfg: &Degradation, r: Rates, dual: bool) -> (HarnessCfg, Tunables
         // stay reproducible.
         use_estimator: std::env::args().any(|a| a == "--estimator"),
         compensate_accel: std::env::args().any(|a| a == "--compensate")
-            || std::env::args().any(|a| a == "--compensate-circular"),
+            || std::env::args().any(|a| a == "--compensate-circular")
+            || std::env::args().any(|a| a == "--compensate-gps"),
         compensate_from_estimate: std::env::args().any(|a| a == "--compensate-circular"),
+        compensate_from_gps: std::env::args().any(|a| a == "--compensate-gps"),
     };
     (h, tunables())
 }
