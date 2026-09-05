@@ -2149,6 +2149,8 @@ async fn navigation_task() {
                         throttle_raw,
                         max_angle_deg: max_angle,
                         yaw_rad,
+                        roll_rad: angles_rad[0],
+                        pitch_rad: angles_rad[1],
                         pos_est: last_pos_est,
                         dt: dt_outer,
                         hover_throttle,
@@ -2168,6 +2170,12 @@ async fn navigation_task() {
                         }
                         NavEvent::FailsafeFloorReached => {
                             defmt::info!("FailsafeLand: altitude floor reached, disarming")
+                        }
+                        NavEvent::RescueLevelled => {
+                            defmt::info!("Rescue: attitude recovered, navigating")
+                        }
+                        NavEvent::RescueLevelTimeout => {
+                            defmt::warn!("Rescue: levelling timed out, navigating best-effort")
                         }
                     }
                 }

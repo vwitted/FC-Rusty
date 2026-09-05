@@ -165,6 +165,43 @@ pub const V_MIN_COG: f32 = 2.0;
 /// trusted as heading.
 pub const FWD_STICK_MIN: f32 = 0.3;
 
+/// Tilt below which the levelling stage of a GPS rescue exits early.
+/// Tight on purpose: the stage AIMS at 0 deg, and this is only "close
+/// enough that waiting longer buys nothing".
+pub const RESCUE_LEVEL_EXIT_DEG: f32 = 5.0;
+/// Floor on the levelling stage's give-up timeout, seconds.
+pub const RESCUE_LEVEL_FLOOR_S: f32 = 0.5;
+/// Give-up timeout per degree of initial tilt, seconds.
+///
+/// Sized from measured recovery times (sim_sweep's upset axis, MPC at its
+/// 40 deg/s command limit): 0.0175-0.0215 s/deg across 30-179 deg, so
+/// 0.0215 worst case with a 1.6x margin. That gives ~1.5 s from 30 deg and
+/// ~6.7 s from inverted.
+///
+/// A timeout rather than "wait until level" on purpose. If wind holds the
+/// aircraft at 18 deg it will never satisfy a tilt gate, and hanging in the
+/// levelling stage forever is worse than flying home at 18 deg of bank.
+/// Best-effort beats waiting for a condition that may never arrive.
+pub const RESCUE_LEVEL_S_PER_DEG: f32 = 0.0344;
+
+/// Stage of a GPS rescue.
+///
+/// Rescue used to go straight to commanding tilt toward home, with no
+/// attitude precondition. That is backwards for the situation that
+/// triggers it: link loss during an aggressive manoeuvre can enter rescue
+/// banked hard or inverted, and the first thing the old code did was
+/// command MORE tilt. Recover first, then navigate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "firmware", derive(defmt::Format))]
+pub enum RescueStage {
+    /// Levelling. Attitude reference is level, the position loop is OFF, so
+    /// the aircraft drifts rather than splitting authority between
+    /// recovering and chasing a waypoint. Altitude control stays on.
+    Level,
+    /// Attitude recovered, or the give-up timeout expired: fly home.
+    Navigate,
+}
+
 /// Inputs to the GPS course-over-ground yaw gate.
 #[derive(Clone, Copy, Debug)]
 pub struct CogGate {
@@ -310,6 +347,9 @@ pub fn capture_targets(
                 nav.alt_target = est.altitude_up;
                 nav.pos_target = [est.position_ned[0], est.position_ned[1]];
                 nav.alt_ctrl.reset();
+                nav.rescue_stage = RescueStage::Level;
+                nav.rescue_level_s = 0.0;
+                nav.rescue_level_deadline_s = None;
             }
             FlightMode::GpsHome => {
                 // Climb to rescue alt or hold current if already higher.
@@ -322,6 +362,9 @@ pub fn capture_targets(
                 nav.rescue_loiter_s = None;
                 nav.rescue_landing = false;
                 nav.alt_ctrl.reset();
+                nav.rescue_stage = RescueStage::Level;
+                nav.rescue_level_s = 0.0;
+                nav.rescue_level_deadline_s = None;
             }
             FlightMode::FailsafeLand => {
                 // Start descent from current altitude; nav_step ramps
@@ -350,6 +393,10 @@ pub struct NavInputs {
     /// Current heading, radians. Used to rotate stick and position demands
     /// into the body frame.
     pub yaw_rad: f32,
+    /// Current roll and pitch, radians. Needed to know whether a rescue has
+    /// recovered attitude yet.
+    pub roll_rad: f32,
+    pub pitch_rad: f32,
     /// Latest fused estimate, if the KF has published one.
     pub pos_est: Option<PosEstimate>,
     /// Outer-loop period, seconds.
@@ -374,6 +421,13 @@ pub struct NavState {
     /// privileged heading. Holding a fixed 0 means holding NORTH, which is
     /// what this used to do.
     pub yaw_target_rad: Option<f32>,
+    /// Which stage of a GPS rescue we are in.
+    pub rescue_stage: RescueStage,
+    /// Seconds spent in the levelling stage.
+    pub rescue_level_s: f32,
+    /// Give-up deadline for levelling, computed from the tilt observed on
+    /// the first tick of the stage. `None` until then.
+    pub rescue_level_deadline_s: Option<f32>,
     /// Last commanded thrust. Genuinely state, not just an output: AltHold
     /// leaves it untouched when no altitude estimate is available, so the
     /// previous value carries.
@@ -391,6 +445,9 @@ impl NavState {
             rescue_loiter_s: None,
             rescue_landing: false,
             yaw_target_rad: None,
+            rescue_stage: RescueStage::Level,
+            rescue_level_s: 0.0,
+            rescue_level_deadline_s: None,
             current_thrust: hover_throttle,
             alt_ctrl,
             pos_ctrl,
@@ -404,6 +461,10 @@ impl NavState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "firmware", derive(defmt::Format))]
 pub enum NavEvent {
+    /// Rescue levelling finished: attitude recovered.
+    RescueLevelled,
+    /// Rescue levelling gave up on time and is proceeding best-effort.
+    RescueLevelTimeout,
     /// GPS-home auto-land reached the disarm floor.
     AutoLandComplete,
     /// Entered the arrival radius; loiter timer started.
@@ -444,6 +505,37 @@ fn wrap_pi(a: f32) -> f32 {
         x += TAU;
     }
     x
+}
+
+/// Current tilt from level, degrees.
+fn tilt_deg(inp: &NavInputs) -> f32 {
+    const R2D: f32 = 180.0 / core::f32::consts::PI;
+    libm::sqrtf(inp.roll_rad * inp.roll_rad + inp.pitch_rad * inp.pitch_rad) * R2D
+}
+
+/// Advance the rescue levelling stage. Returns true while still levelling,
+/// i.e. while the caller must NOT engage the position loop.
+fn rescue_levelling(inp: &NavInputs, st: &mut NavState) -> (bool, Option<NavEvent>) {
+    if st.rescue_stage == RescueStage::Navigate {
+        return (false, None);
+    }
+    let tilt = tilt_deg(inp);
+    let deadline = *st.rescue_level_deadline_s.get_or_insert_with(|| {
+        RESCUE_LEVEL_FLOOR_S + RESCUE_LEVEL_S_PER_DEG * tilt
+    });
+    st.rescue_level_s += inp.dt;
+
+    if tilt < RESCUE_LEVEL_EXIT_DEG {
+        st.rescue_stage = RescueStage::Navigate;
+        (false, Some(NavEvent::RescueLevelled))
+    } else if st.rescue_level_s >= deadline {
+        // Best effort: flying home at 18 deg of bank beats hanging here
+        // waiting for a condition the wind may never allow.
+        st.rescue_stage = RescueStage::Navigate;
+        (false, Some(NavEvent::RescueLevelTimeout))
+    } else {
+        (true, None)
+    }
 }
 
 pub fn nav_step(inp: &NavInputs, st: &mut NavState) -> NavOutputs {
@@ -550,10 +642,24 @@ pub fn nav_step(inp: &NavInputs, st: &mut NavState) -> NavOutputs {
             desired_yaw_rad = yaw_ref;
         }
         FlightMode::GpsRescue => {
-            // Failsafe: just hover in place
+            // Failsafe: level first, then hover in place.
             yaw_rate_dps = 0.0;
             desired_yaw_rad = yaw_ref;
-            if let Some(est) = inp.pos_est.filter(|e| e.home_latched) {
+            let (levelling, ev) = rescue_levelling(inp, st);
+            if ev.is_some() {
+                event = ev;
+            }
+            if levelling {
+                // Position loop OFF: all attitude authority goes to
+                // recovery. The aircraft drifts meanwhile, which is the
+                // deliberate trade.
+                desired_roll_rad = 0.0;
+                desired_pitch_rad = 0.0;
+                if let Some(est) = inp.pos_est.filter(|e| e.altitude_ready) {
+                    st.current_thrust =
+                        st.alt_ctrl.update(st.alt_target, est.altitude_up, est.vz_up, dt);
+                }
+            } else if let Some(est) = inp.pos_est.filter(|e| e.home_latched) {
                 let pos_out = st.pos_ctrl.update(
                     [est.position_ned[0], est.position_ned[1]],
                     [est.velocity_ned[0], est.velocity_ned[1]],
@@ -571,10 +677,21 @@ pub fn nav_step(inp: &NavInputs, st: &mut NavState) -> NavOutputs {
             }
         }
         FlightMode::GpsHome => {
-            // Return to home
+            // Level first, then return to home.
             yaw_rate_dps = 0.0;
             desired_yaw_rad = yaw_ref;
-            if let Some(est) = inp.pos_est.filter(|e| e.home_latched) {
+            let (levelling, ev) = rescue_levelling(inp, st);
+            if ev.is_some() {
+                event = ev;
+            }
+            if levelling {
+                desired_roll_rad = 0.0;
+                desired_pitch_rad = 0.0;
+                if let Some(est) = inp.pos_est.filter(|e| e.altitude_ready) {
+                    st.current_thrust =
+                        st.alt_ctrl.update(st.alt_target, est.altitude_up, est.vz_up, dt);
+                }
+            } else if let Some(est) = inp.pos_est.filter(|e| e.home_latched) {
                 let dist_home = libm::sqrtf(
                     est.position_ned[0] * est.position_ned[0]
                         + est.position_ned[1] * est.position_ned[1],
@@ -693,6 +810,8 @@ mod tests {
             throttle_raw: 0.5,
             max_angle_deg: 30.0,
             yaw_rad: 0.0,
+            roll_rad: 0.0,
+            pitch_rad: 0.0,
             pos_est: None,
             dt: DT,
             hover_throttle: HOVER,
@@ -1195,5 +1314,112 @@ mod tests {
         let out = nav_step(&inp, &mut st);
         assert!((out.desired_yaw_rad - inp.yaw_rad).abs() < 1e-5);
         assert_eq!(out.yaw_rate_dps, 0.0);
+    }
+
+    // ---- Staged GPS rescue ----
+
+    fn upset_home(roll_deg: f32) -> NavInputs {
+        let mut inp = inputs(FlightMode::GpsHome);
+        inp.pos_est = Some(PosEstimate { position_ned: [-50.0, 0.0, 0.0], ..est() });
+        inp.roll_rad = roll_deg * D2R_T;
+        inp
+    }
+
+    /// THE point of the staging. Entering rescue banked hard, the first
+    /// thing the aircraft must do is level -- NOT command more tilt toward
+    /// home, which is what it used to do.
+    #[test]
+    fn rescue_levels_before_it_navigates() {
+        let mut st = state();
+        let out = nav_step(&upset_home(70.0), &mut st);
+        assert_eq!(st.rescue_stage, RescueStage::Level);
+        assert_eq!(out.desired_roll_rad, 0.0, "must command LEVEL, not tilt home");
+        assert_eq!(out.desired_pitch_rad, 0.0);
+    }
+
+    /// Once level, the position loop engages and it flies home. 50 m north
+    /// of the target means a nose-down command.
+    #[test]
+    fn rescue_navigates_once_attitude_is_recovered() {
+        let mut st = state();
+        nav_step(&upset_home(70.0), &mut st);
+        assert_eq!(st.rescue_stage, RescueStage::Level);
+
+        // Now level.
+        let mut inp = upset_home(1.0);
+        let out = nav_step(&inp, &mut st);
+        assert_eq!(st.rescue_stage, RescueStage::Navigate);
+        assert_eq!(out.event, Some(NavEvent::RescueLevelled));
+
+        inp.roll_rad = 0.0;
+        let out = nav_step(&inp, &mut st);
+        assert!(out.desired_pitch_rad < 0.0, "50 m south of home: nose down to fly north");
+    }
+
+    /// The give-up path. Wind holding it at 18 deg must not hang the
+    /// rescue: it proceeds best-effort once the deadline passes.
+    #[test]
+    fn rescue_gives_up_levelling_on_time_and_proceeds() {
+        let mut st = state();
+        let inp = upset_home(18.0); // never reaches the 5 deg exit
+        let mut timed_out = false;
+        // Deadline for 18 deg is well under a second; run a generous window.
+        for _ in 0..500 {
+            if nav_step(&inp, &mut st).event == Some(NavEvent::RescueLevelTimeout) {
+                timed_out = true;
+                break;
+            }
+        }
+        assert!(timed_out, "must give up rather than hang at 18 deg");
+        assert_eq!(st.rescue_stage, RescueStage::Navigate);
+        let out = nav_step(&inp, &mut st);
+        assert!(out.desired_pitch_rad != 0.0, "and then actually navigate");
+    }
+
+    /// The deadline scales with how far over it started -- inverted gets
+    /// far longer than a gentle bank.
+    #[test]
+    fn levelling_deadline_scales_with_initial_tilt() {
+        let mut gentle = state();
+        nav_step(&upset_home(30.0), &mut gentle);
+        let mut inverted = state();
+        nav_step(&upset_home(170.0), &mut inverted);
+        let (g, i) = (
+            gentle.rescue_level_deadline_s.unwrap(),
+            inverted.rescue_level_deadline_s.unwrap(),
+        );
+        assert!(i > g * 2.5, "inverted deadline {i}s should dwarf 30 deg's {g}s");
+        assert!(g > RESCUE_LEVEL_FLOOR_S, "and never below the floor");
+    }
+
+    /// Re-entering rescue restarts the stage, or a second rescue would skip
+    /// levelling entirely because the first one left it in Navigate.
+    #[test]
+    fn re_entering_rescue_restarts_the_levelling_stage() {
+        let (mut es, mut nav) = (EntryState::new(), state());
+        nav.rescue_stage = RescueStage::Navigate;
+        nav.rescue_level_s = 9.0;
+        note_mode_change(FlightMode::GpsHome, &mut es);
+        capture_targets(FlightMode::GpsHome, Some(est()), true, &mut es, &mut nav);
+        assert_eq!(nav.rescue_stage, RescueStage::Level);
+        assert_eq!(nav.rescue_level_s, 0.0);
+        assert_eq!(nav.rescue_level_deadline_s, None);
+    }
+
+    /// Altitude control keeps running while levelling -- authority is taken
+    /// from the POSITION loop, not from holding height.
+    #[test]
+    fn altitude_is_still_controlled_while_levelling() {
+        let mut st = state();
+        st.alt_target = 40.0;
+        let mut inp = upset_home(70.0);
+        inp.pos_est = Some(PosEstimate {
+            position_ned: [-50.0, 0.0, 0.0],
+            altitude_up: 10.0,
+            ..est()
+        });
+        let out = nav_step(&inp, &mut st);
+        assert_eq!(st.rescue_stage, RescueStage::Level);
+        assert!(out.thrust > HOVER, "30 m below target: must climb, got {}", out.thrust);
     }
 }

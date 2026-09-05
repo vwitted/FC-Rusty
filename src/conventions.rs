@@ -325,6 +325,8 @@ mod tests {
                 throttle_raw: 0.5,
                 max_angle_deg: 30.0,
                 yaw_rad: 0.0,
+                roll_rad: 0.0,
+                pitch_rad: 0.0,
                 pos_est: None,
                 dt: 0.01,
                 hover_throttle: 0.294,
