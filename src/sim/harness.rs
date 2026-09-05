@@ -245,6 +245,11 @@ pub struct HarnessCfg {
     /// vacuous. After the first recovery the check re-arms, so losing it
     /// again still counts.
     pub initial_attitude_deg: [f32; 3],
+    /// Start with these body rates, deg/s [p, q, r]. Needed to exercise
+    /// gyroscopic coupling (omega x I*omega), which is zero unless more
+    /// than one axis is turning -- so an upset that starts merely TILTED
+    /// does not test it.
+    pub initial_rates_dps: [f32; 3],
     /// Close the position loop: the firmware's own PositionController holds
     /// the origin, and its tilt output becomes the MPC reference -- exactly
     /// the cascade main.rs runs. Without this the harness cannot ask any
@@ -314,6 +319,7 @@ impl HarnessCfg {
             dual_cfg: DualImuConfig::none(),
             cmd: AttitudeStep::NONE,
             initial_attitude_deg: [0.0; 3],
+            initial_rates_dps: [0.0; 3],
             pos_hold: false,
             firmware_mode: None,
             skip_rescue_levelling: false,
@@ -350,7 +356,12 @@ pub fn run_case(
     let r = h.rates;
     let hover_throttle = (h.plant.mass * 9.81) / h.plant.max_thrust;
     let mut sim = QuadSim::new_hovering(h.plant, h.target_alt);
-    let upset = h.initial_attitude_deg != [0.0; 3];
+    let upset = h.initial_attitude_deg != [0.0; 3] || h.initial_rates_dps != [0.0; 3];
+    if h.initial_rates_dps != [0.0; 3] {
+        sim.state.roll_rate = h.initial_rates_dps[0];
+        sim.state.pitch_rate = h.initial_rates_dps[1];
+        sim.state.yaw_rate = h.initial_rates_dps[2];
+    }
     if upset {
         sim.set_attitude_deg(
             h.initial_attitude_deg[0],

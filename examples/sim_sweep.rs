@@ -213,6 +213,7 @@ fn harness_cfg(cfg: &Degradation, r: Rates, dual: bool) -> (HarnessCfg, Tunables
         // The sweep measures regulation about level, as before.
         cmd: fc_rusty::sim::harness::AttitudeStep::NONE,
         initial_attitude_deg: [0.0; 3],
+        initial_rates_dps: [0.0; 3],
         pos_hold: false,
         firmware_mode: None,
         skip_rescue_levelling: false,
@@ -502,6 +503,52 @@ fn main() {
             };
             println!("{:>10}   recovered in {:>7}, height lost {:>8}   {}",
                      format!("{:.0}", roll0), rec, lost, fail);
+        }
+    }
+
+    // --- multi-axis upset: where MPC should actually have an edge ---
+    //
+    // Every other upset here is single-axis roll against a constant
+    // reference, which is precisely the case a per-axis PID handles as well
+    // as anything. MPC's claimed advantages are cross-axis coupling (it
+    // carries an A/B model; the PID is three independent loops) and
+    // constraint anticipation. Tumbling on all three axes at once, with
+    // gyroscopic coupling active, is the test that should separate them.
+    if !csv {
+        println!();
+        println!("== multi-axis upset (roll+pitch+yaw rate), MPC vs angle PID");
+        println!("{:>16} {:>20} {:>20}", "initial", "MPC", "angle PID 40deg/s");
+        println!("{}", "-".repeat(60));
+    }
+    for &(r0, p0, spin) in &[
+        (40.0f32, 40.0f32, 0.0f32),
+        (70.0, 70.0, 0.0),
+        (40.0, 40.0, 300.0),
+        (70.0, 70.0, 300.0),
+        (110.0, 60.0, 200.0),
+    ] {
+        let mut cells = Vec::new();
+        for pid in [false, true] {
+            let mut hu = harness_cfg(&Degradation::none(), rates, dual).0;
+            hu.initial_attitude_deg = [r0, p0, 0.0];
+            hu.initial_rates_dps = [spin, spin * 0.6, spin];
+            hu.target_alt = 150.0;
+            hu.total_s = 15.0;
+            let mut tun = tunables();
+            if pid {
+                tun.attitude = AttitudeMode::AnglePid { kp: 6.0, max_rate_dps: 40.0 };
+            }
+            let m = run_case(&hu, &tun, Degradation::none(), 1, None);
+            cells.push(match m.failed_at {
+                Some((t, c)) => format!("{} @{:.1}s", c.short(), t),
+                None => format!("{} / {:.1} m lost",
+                    m.recovered_at.map(|t| format!("{t:.2}s")).unwrap_or_else(|| "never".into()),
+                    hu.target_alt - m.alt_min),
+            });
+        }
+        if !csv {
+            println!("{:>16} {:>20} {:>20}",
+                     format!("{r0:.0}/{p0:.0}, spin {spin:.0}"), cells[0], cells[1]);
         }
     }
 
