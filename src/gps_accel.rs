@@ -40,6 +40,21 @@ pub const STALE_AFTER_S: f32 = 1.0;
 /// disturbance this whole mechanism exists to avoid.
 pub const DECAY_S: f32 = 1.0;
 
+/// Largest horizontal acceleration treated as physically real, m/s².
+///
+/// Bounds the one failure mode that losing GPS does not have. A lost
+/// receiver fades the estimate out and leaves the aircraft exactly where it
+/// was before this existed -- bounded, and no worse than the prior status
+/// quo. A receiver that is WRONG has no such property: a multipath glitch
+/// of 10 m/s across one 10 Hz fix differentiates to 100 m/s², over 10 g,
+/// and would be handed to the attitude estimator as truth.
+///
+/// 20 m/s² is about 2 g, comfortably above anything the airframe can
+/// produce horizontally (at 45 deg of tilt it is g·tan45 = 9.8) and far
+/// below the numbers a bad fix generates. The gate upstream only checks
+/// fix_mode and satellite count, which a corrupted fix passes.
+pub const MAX_PLAUSIBLE_ACCEL_MS2: f32 = 20.0;
+
 /// Horizontal acceleration estimated by differentiating GPS velocity.
 #[derive(Debug, Clone, Copy)]
 pub struct GpsAccelEstimator {
@@ -78,7 +93,11 @@ impl GpsAccelEstimator {
             if dt_s > 1e-3 {
                 let alpha = (dt_s / self.tau_s).clamp(0.0, 1.0);
                 for k in 0..2 {
-                    let raw = (v[k] - prev[k]) / dt_s;
+                    // Clamp before filtering, not after: an unclamped
+                    // outlier would otherwise contaminate the filter state
+                    // and take several fixes to wash out.
+                    let raw = ((v[k] - prev[k]) / dt_s)
+                        .clamp(-MAX_PLAUSIBLE_ACCEL_MS2, MAX_PLAUSIBLE_ACCEL_MS2);
                     self.filtered[k] += (raw - self.filtered[k]) * alpha;
                 }
             }
@@ -211,5 +230,60 @@ mod tests {
             filt < raw_rms * 0.5,
             "filtered {filt} should be well under raw noise {raw_rms}"
         );
+    }
+
+    /// A bad fix is the failure mode losing GPS does not have: fading out
+    /// leaves the aircraft at the prior status quo, whereas a wrong
+    /// velocity actively misleads the attitude estimator. Bound it.
+    #[test]
+    fn an_implausible_velocity_jump_is_clamped() {
+        let mut e = GpsAccelEstimator::default();
+        e.update(0.0, 0.0, DT);
+        // 10 m/s in one 10 Hz fix -> 100 m/s^2, over 10 g. No quad does
+        // this; a multipath glitch does.
+        e.update(10.0, 10.0, DT);
+        for k in 0..2 {
+            assert!(
+                e.accel_ned()[k].abs() <= MAX_PLAUSIBLE_ACCEL_MS2,
+                "axis {k} unclamped: {}",
+                e.accel_ned()[k]
+            );
+        }
+    }
+
+    /// And the clamp must not corrupt the filter for long afterwards --
+    /// clamping happens before filtering precisely so one outlier does not
+    /// linger in the state.
+    #[test]
+    fn the_filter_recovers_quickly_after_a_glitch() {
+        let mut e = GpsAccelEstimator::default();
+        let mut v = 0.0f32;
+        for _ in 0..50 {
+            e.update(v, 0.0, DT); // stationary
+        }
+        e.update(10.0, 0.0, DT); // glitch
+        v = 0.0;
+        for _ in 0..40 {
+            e.update(v, 0.0, DT); // back to stationary
+        }
+        assert!(
+            e.accel_ned()[0].abs() < 0.2,
+            "should have washed out, got {}",
+            e.accel_ned()[0]
+        );
+    }
+
+    /// A real manoeuvre must still pass. The bound is above anything the
+    /// airframe can do, not a limit on normal flight.
+    #[test]
+    fn a_hard_but_real_manoeuvre_is_not_clamped() {
+        let mut e = GpsAccelEstimator::default();
+        let want = 8.0f32; // ~0.8 g, a genuinely aggressive quad
+        let mut v = 0.0f32;
+        for _ in 0..100 {
+            v += want * DT;
+            e.update(v, 0.0, DT);
+        }
+        assert!((e.accel_ned()[0] - want).abs() < 0.2, "got {}", e.accel_ned()[0]);
     }
 }
