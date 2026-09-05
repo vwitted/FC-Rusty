@@ -323,4 +323,67 @@ mod tests {
             exact + 0.06,
         );
     }
+
+    /// DOCUMENTS A DESIGN QUESTION, does not endorse it.
+    ///
+    /// Q weights yaw ANGLE at 2.0, and every flight mode in
+    /// control::modes sets `desired_yaw_rad = 0`, which main.rs passes
+    /// straight to set_reference. So the yaw reference is not "hold your
+    /// current heading" -- it is "point NORTH", and the MPC commands rate
+    /// to get there whenever the pilot's yaw stick is centred:
+    ///
+    ///     heading  30 deg -> -24.1 deg/s
+    ///     heading  90 deg -> -41.9 deg/s
+    ///     heading 180 deg -> -44.7 deg/s
+    ///
+    /// A quad is normally either heading-hold (reference latched to
+    /// wherever you stopped) or rate-only. North-seeking is neither, and
+    /// on a real aircraft it would read as the machine slowly weathervaning
+    /// whenever you release the stick.
+    ///
+    /// Pinned rather than fixed because the fix is a decision about
+    /// intended behaviour: latch the yaw reference on stick release, or
+    /// zero Q[2] and drive yaw purely on rate. Both are defensible; picking
+    /// one is not the test's job.
+    #[test]
+    fn heading_offset_alone_commands_yaw_toward_north() {
+        let mut mpc = AttitudeMpc::new();
+        mpc.set_reference([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
+        let deg = core::f32::consts::PI / 180.0;
+
+        let level = mpc.solve([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
+        assert!(
+            level.rate_setpoints_rads[2].abs() < 1e-3,
+            "pointing north, no yaw command"
+        );
+
+        let east = mpc.solve([0.0, 0.0, 90.0 * deg], [0.0, 0.0, 0.0]);
+        assert!(
+            east.rate_setpoints_rads[2] < -10.0 * deg,
+            "heading east with centred sticks commands yaw back toward north: {} deg/s",
+            east.rate_setpoints_rads[2] / deg
+        );
+    }
+
+    /// The solver can return a command OUTSIDE its own constraint.
+    ///
+    /// MAX_CMD_RAD is +/-40 deg/s, but a 180 deg heading error produces
+    /// -44.7. ADMM is capped at max_iter = 10 and a partially converged
+    /// iterate is not guaranteed feasible. The cap's comment argues partial
+    /// convergence is fine because "attitude tracking is well below the
+    /// loop bandwidth" -- true for TRACKING, but a constraint is a
+    /// different kind of promise, and this one is sized to keep the inner
+    /// PID in its linear regime.
+    #[test]
+    fn solver_output_can_exceed_its_own_command_constraint() {
+        let mut mpc = AttitudeMpc::new();
+        mpc.set_reference([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
+        let deg = core::f32::consts::PI / 180.0;
+        let out = mpc.solve([0.0, 0.0, 180.0 * deg], [0.0, 0.0, 0.0]);
+        let cmd_dps = out.rate_setpoints_rads[2].abs() / deg;
+        assert!(
+            cmd_dps > 40.0,
+            "expected the documented overshoot past the 40 deg/s bound, got {cmd_dps}"
+        );
+    }
 }
