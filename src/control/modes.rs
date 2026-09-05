@@ -361,8 +361,10 @@ pub fn nav_step(inp: &NavInputs, st: &mut NavState) -> NavOutputs {
     const DEG2RAD: f32 = core::f32::consts::PI / 180.0;
     let dt = inp.dt;
 
-    let mut desired_roll_rad = 0.0f32;
-    let mut desired_pitch_rad = 0.0f32;
+    // Declared without initialisers: every arm assigns all four, and a
+    // placeholder would let a future arm silently forget one.
+    let desired_roll_rad;
+    let desired_pitch_rad;
     let desired_yaw_rad;
     let yaw_rate_dps;
     let mut disarm = false;

@@ -62,6 +62,7 @@ mod drivers {
     pub mod icm42688;
     pub mod ism6hg256x;
     pub mod lis2mdl;
+    pub mod orientation;
     pub mod nmea;
     pub mod ubx;
     pub mod wt901b;

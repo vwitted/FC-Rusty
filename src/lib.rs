@@ -40,6 +40,7 @@ pub mod drivers {
     pub mod dshot_bb_decode;
     pub mod dshot_bb_frame;
     pub mod dshot_frame;
+    pub mod orientation;
     pub mod nmea;
 }
 

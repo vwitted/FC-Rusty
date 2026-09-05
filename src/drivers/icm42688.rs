@@ -67,36 +67,12 @@ pub const GYRO_LSB_PER_DPS: f32 = 16.384;
 pub const ACCEL_LSB_PER_G: f32 = 2048.0;
 
 // ---- Board orientation ----
-
-/// How the ICM-42688P chip is mounted relative to the FC body frame.
-///
-/// The DAKEFPVH743 has two IMUs with different physical rotations.
-/// ArduPilot hwdef specifies:
-///   IMU1 (SPI1): ROTATION_ROLL_180  → sign vector [1, -1, -1]
-///   IMU2 (SPI4): ROTATION_PITCH_180 → sign vector [-1, 1, -1]
-///
-/// The `Identity` variant (sign [1, 1, 1]) is used for pre-averaged
-/// samples that are already in body-frame NED.
-#[derive(Clone, Copy, Debug, defmt::Format)]
-pub enum Orientation {
-    /// IMU1: ROTATION_ROLL_180. Sensor X → +X, Y → −Y, Z → −Z.
-    Roll180,
-    /// IMU2: ROTATION_PITCH_180. Sensor X → −X, Y → +Y, Z → −Z.
-    Pitch180,
-    /// Pre-averaged / already in body frame. No axis flips.
-    Identity,
-}
-
-impl Orientation {
-    /// Applies the rotation to map sensor-native axes to FC body frame (NED).
-    pub const fn apply(self, v: [f32; 3]) -> [f32; 3] {
-        match self {
-            Self::Roll180  => [ v[0], -v[1], -v[2]],
-            Self::Pitch180 => [-v[0],  v[1], -v[2]],
-            Self::Identity => [ v[0],  v[1],  v[2]],
-        }
-    }
-}
+//
+// Lives in `drivers::orientation` so it can be tested on the host: this
+// module needs embassy-stm32 and so is firmware-only, and a mounting sign
+// vector is exactly the kind of thing that must be checked (a determinant
+// of -1 is a reflection, not a rotation, and mirrors the aircraft).
+pub use super::orientation::Orientation;
 
 #[derive(Clone, Copy, Debug, defmt::Format)]
 pub struct RawImu {

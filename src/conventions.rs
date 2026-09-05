@@ -198,4 +198,82 @@ mod tests {
             out.roll_rad
         );
     }
+
+    // ---- Stage 0: sensor mounting ----
+
+    /// A board-orientation sign vector must be a PROPER rotation
+    /// (determinant +1). A determinant of -1 is a reflection: it mirrors
+    /// the aircraft, looks entirely plausible as a sign triple, and would
+    /// invert one axis of everything downstream. [1,1,-1] and [-1,-1,-1]
+    /// are both reflections and both look like reasonable typos.
+    #[test]
+    fn board_orientations_are_rotations_not_reflections() {
+        use crate::drivers::orientation::Orientation;
+        for o in [Orientation::Roll180, Orientation::Pitch180, Orientation::Identity] {
+            let x = o.apply([1.0, 0.0, 0.0]);
+            let y = o.apply([0.0, 1.0, 0.0]);
+            let z = o.apply([0.0, 0.0, 1.0]);
+            // These are all diagonal, so det is just the product of the
+            // diagonal, but compute it properly in case one stops being.
+            let det = x[0] * (y[1] * z[2] - y[2] * z[1])
+                - x[1] * (y[0] * z[2] - y[2] * z[0])
+                + x[2] * (y[0] * z[1] - y[1] * z[0]);
+            assert!((det - 1.0).abs() < 1e-6, "{o:?} has det {det}, must be +1");
+        }
+    }
+
+    /// Both IMUs are mounted differently and their readings are AVERAGED.
+    /// If their corrections disagreed, averaging would cancel signal rather
+    /// than noise. Verifies the algebra round-trips; it cannot verify the
+    /// physical mounting, which needs the bench.
+    #[test]
+    fn both_imu_orientations_agree_after_correction() {
+        use crate::drivers::orientation::Orientation;
+        let body = [0.3f32, -0.7, 1.1];
+        // A 180-degree rotation is its own inverse, so the sensor-native
+        // reading for a given body vector is the same map applied once.
+        let imu1_native = Orientation::Roll180.apply(body);
+        let imu2_native = Orientation::Pitch180.apply(body);
+        let imu1_corrected = Orientation::Roll180.apply(imu1_native);
+        let imu2_corrected = Orientation::Pitch180.apply(imu2_native);
+        for k in 0..3 {
+            assert!((imu1_corrected[k] - body[k]).abs() < 1e-6, "IMU1 axis {k}");
+            assert!((imu2_corrected[k] - body[k]).abs() < 1e-6, "IMU2 axis {k}");
+        }
+    }
+
+    // ---- Yaw, which nothing above exercises ----
+
+    /// +yaw demand must spin the aircraft NOSE-RIGHT. Crosses the mixer and
+    /// the rigid body: the mixer lifts the CCW props (M2 FR, M3 RL), whose
+    /// reaction torque on the frame is clockwise seen from above.
+    #[test]
+    fn positive_yaw_demand_yaws_nose_right() {
+        let p = QuadParams::default();
+        let mut sim = QuadSim::new(p, QuadState::hovering(50.0));
+        let motors = QUAD_X.apply_no_airmode(&level_demand(0.0, 0.0, 0.2)).motors;
+        // CCW pair up, CW pair down.
+        assert!(motors[1] + motors[2] > motors[0] + motors[3], "+yaw lifts the CCW pair");
+        for _ in 0..400 {
+            sim.step(&MotorForces { motors }, 1.0 / 1000.0);
+        }
+        assert!(sim.state.yaw > 0.0, "+yaw demand must increase yaw, got {}", sim.state.yaw);
+    }
+
+    /// The gyro-to-attitude sign inside the estimator: a positive body roll
+    /// rate must integrate into increasing roll. Nothing else here tests
+    /// the MEKF's propagation convention -- the accel tests only pin its
+    /// static response.
+    #[test]
+    fn mekf_integrates_positive_body_rates_into_positive_angles() {
+        let rate = 20.0 * D2R; // rad/s
+        let mut roll_mekf = AttitudeMekf::new(MekfParams::default());
+        let mut yaw_mekf = AttitudeMekf::new(MekfParams::default());
+        for _ in 0..100 {
+            roll_mekf.predict([rate, 0.0, 0.0], 1.0 / 100.0);
+            yaw_mekf.predict([0.0, 0.0, rate], 1.0 / 100.0);
+        }
+        assert!(roll_mekf.euler()[0] > 0.0, "roll {}", roll_mekf.euler()[0]);
+        assert!(yaw_mekf.euler()[2] > 0.0, "yaw {}", yaw_mekf.euler()[2]);
+    }
 }
