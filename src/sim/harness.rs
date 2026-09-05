@@ -317,6 +317,38 @@ pub struct HarnessCfg {
     /// It works anyway because the corruption is QUASI-STATIC -- a sustained
     /// tilt against steady wind -- so the estimate can be filtered hard and
     /// the resulting lag costs nothing.
+    ///
+    /// MEASURED, and it settles two design questions.
+    ///
+    /// Station-keeping in wind, att_rms: 2.775 deg with no compensation,
+    /// 0.546 GPS-derived, 0.287 with exact acceleration. So the realistic
+    /// path closes ~90% of the gap to the oracle.
+    ///
+    /// Upset recovery, which is the TRANSIENT case where a 0.5 s lag was
+    /// expected to hurt:
+    ///
+    ///     upset    none            GPS-derived     exact
+    ///     60 deg   8/8 DIVERGED    2.12s / 1.6m    1.70s / 1.1m
+    ///     90 deg   8/8 DIVERGED    3.28s / 29.8m   2.35s / 6.8m
+    ///    120 deg   6.08s / 96.9m   3.54s / 50.6m   3.10s / 36.0m
+    ///
+    /// Without compensation the aircraft cannot recover from SIXTY degrees
+    /// -- during an upset it is accelerating hard, so the accel update is
+    /// worst exactly when the estimator matters most. Lagged, noisy
+    /// compensation turns divergence into a 2.1 s recovery.
+    ///
+    /// So: build the FIXED-filter version. No adaptive tau, no fading
+    /// weight, no gate. Those solve a problem the measurement says does not
+    /// exist, and add three mechanisms to get wrong. If a gate is ever
+    /// wanted, inflate the accel update's R rather than switching the
+    /// compensation off: a discontinuous input to a Kalman filter is its
+    /// own transient.
+    ///
+    /// This also revises the conclusion in 68d8350 that upset recovery is
+    /// AUTHORITY-limited. That was measured against truth attitude. With a
+    /// real estimator it is ESTIMATOR-limited by a wide margin: at fixed
+    /// authority, compensation alone is the difference between recovering
+    /// from 60 deg and diverging at it.
     pub compensate_from_gps: bool,
 }
 
