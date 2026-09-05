@@ -30,8 +30,9 @@ use tinympc_rs::{
     Solver, TerminationReason,
     constraint::Constraint,
     policy::FixedPolicy,
-    project::{self, time::Fixed},
+    project::{time::Fixed},
 };
+use tinympc_rs::project;
 
 // ---- Dimensions ----
 pub const NX: usize = 6;   // [roll, pitch, yaw, p, q, r]
