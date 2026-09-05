@@ -48,6 +48,8 @@ pub mod attitude_mekf;
 
 pub mod imu_filter;
 
+pub mod conventions;
+
 pub mod sim {
     #[path = "sim.rs"]
     mod sim;

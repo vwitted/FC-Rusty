@@ -11,19 +11,27 @@
 //   To accelerate horizontally at (ax, ay) the quad must tilt so that
 //   a component of its thrust vector points in that direction.
 //
-//   pitch_desired =  atan2(ax_desired, g)   (tilt forward → accelerate north)
-//   roll_desired  = -atan2(ay_desired, g)   (tilt right   → accelerate east)
-//
-//   The signs follow the NED + Betaflight convention:
+//   Convention (3-2-1 Tait-Bryan, NED) — see src/conventions.rs, which
+//   enforces this for every stage:
 //     +X = north, +Y = east, +Z = down
-//     +pitch = nose up (decelerates northward motion)
-//     +roll  = right wing down (decelerates eastward motion)
+//     +pitch = nose UP, +roll = right wing down
+//
+//   Projecting body -Z thrust into the world gives
+//
+//     a_north = -(T/m) · cos(roll) · sin(pitch)
+//     a_east  = +(T/m) · sin(roll)              (at zero yaw)
+//
+//   so the tilt needed for a demanded acceleration is
+//
+//     pitch_desired = -atan2(ax_desired, g)   (nose DOWN to fly north)
+//     roll_desired  =  atan2(ay_desired, g)   (roll RIGHT to fly east)
 //
 //   For small angles atan2(a, g) ≈ a/g, but we keep the atan2 so the
 //   controller remains valid up to the tilt clamp (typically 15–20°).
 //
-// The controller runs at the same rate as the MPC (50 Hz). Its output
-// is fed directly to `AttitudeMpc::set_reference()`.
+// The controller runs at the same rate as the MPC (100 Hz — pos_ctrl.update
+// sits inside main.rs's MPC_PERIOD_US ticker). Its output feeds
+// `AttitudeMpc::set_reference()` unnegated, at all three call sites.
 
 use core::f32::consts::PI;
 
@@ -110,15 +118,20 @@ impl PositionController {
         let ay_body = -sin_yaw * ax_world + cos_yaw * ay_world;
 
         // ---- Acceleration → tilt angle ----
-        // Matched to the QuadSim physics model:
-        //   ax_thrust =  T · sin(pitch) / m   → positive pitch = north accel
-        //   ay_thrust = −T · sin(roll)  / m   → positive roll  = west accel
+        // Inverted from the physics above: nose DOWN to fly north, roll
+        // RIGHT to fly east.
         //
-        // So to produce desired body-frame acceleration:
-        //   pitch =  atan2(ax_body, g)   (positive ax → positive pitch → north)
-        //   roll  = −atan2(ay_body, g)   (positive ay → negative roll  → east)
-        let pitch_raw = libm::atan2f(ax_body, GRAVITY);
-        let roll_raw = -libm::atan2f(ay_body, GRAVITY);
+        // These two signs were previously the other way round. The comment
+        // that stood here derived them from QuadSim's thrust projection
+        // ("positive pitch = north accel") rather than from physics, and
+        // that projection was itself wrong — it dropped yaw entirely and
+        // carried inverted lateral signs. Sim and controller therefore
+        // agreed with each other and disagreed with the aircraft, so
+        // sim_gps_rescue converged while hardware would have departed at
+        // full tilt. Fixing the sim exposed it; src/conventions.rs now pins
+        // every stage so the two cannot drift apart again silently.
+        let pitch_raw = -libm::atan2f(ax_body, GRAVITY);
+        let roll_raw = libm::atan2f(ay_body, GRAVITY);
 
         // ---- Clamp to max tilt ----
         let max = self.gains.max_tilt_rad;
@@ -148,40 +161,49 @@ mod tests {
         assert!(out.pitch_rad.abs() < 1e-6);
     }
 
+    // NOTE: these four assertions were inverted until 2026-09-05, and their
+    // comments cited "in sim" rather than physics -- written against the
+    // same wrong QuadSim projection the implementation was. That is exactly
+    // why the sign error survived: the tests agreed with the bug. They now
+    // reason from a_north = -(T/m)*cos(roll)*sin(pitch). See
+    // src/conventions.rs.
+
     #[test]
     fn north_of_target_pitches_to_go_south() {
-        // Quad is 10m north of target, heading north (yaw=0).
-        // In sim: negative pitch → south. So pitch should be negative.
+        // 10 m north of target, heading north: must fly SOUTH, which needs
+        // NOSE-UP, i.e. positive pitch.
         let out = ctrl().update([10.0, 0.0], [0.0, 0.0], [0.0, 0.0], 0.0);
-        assert!(out.pitch_rad < 0.0, "pitch={}", out.pitch_rad);
+        assert!(out.pitch_rad > 0.0, "pitch={}", out.pitch_rad);
         assert!(out.roll_rad.abs() < 1e-6, "roll={}", out.roll_rad);
     }
 
     #[test]
     fn south_of_target_pitches_to_go_north() {
-        // Quad is 10m south of target → in sim, positive pitch → north.
+        // 10 m south of target: must fly NORTH, which needs NOSE-DOWN.
         let out = ctrl().update([-10.0, 0.0], [0.0, 0.0], [0.0, 0.0], 0.0);
-        assert!(out.pitch_rad > 0.0, "pitch={}", out.pitch_rad);
+        assert!(out.pitch_rad < 0.0, "pitch={}", out.pitch_rad);
     }
 
     #[test]
     fn east_of_target_rolls_to_go_west() {
-        // Quad is 10m east of target, heading north (yaw=0).
-        // In sim: positive roll → west. So roll should be positive.
+        // 10 m east of target, heading north: must fly WEST, which needs a
+        // LEFT roll (negative, left wing down).
         let out = ctrl().update([0.0, 10.0], [0.0, 0.0], [0.0, 0.0], 0.0);
-        assert!(out.roll_rad > 0.0, "roll={}", out.roll_rad);
+        assert!(out.roll_rad < 0.0, "roll={}", out.roll_rad);
         assert!(out.pitch_rad.abs() < 1e-6, "pitch={}", out.pitch_rad);
     }
 
     #[test]
     fn velocity_damps_command() {
-        // 2m north of target but already flying south at good speed.
-        // Pitch is negative (go south). Velocity damping should make
-        // the pitch *less negative* (closer to zero = less aggressive).
+        // 2 m north of target but already flying south at 1 m/s. The
+        // command is nose-up (positive) to keep going south; damping must
+        // make it LESS positive, i.e. closer to zero.
         let no_vel = ctrl().update([2.0, 0.0], [0.0, 0.0], [0.0, 0.0], 0.0);
         let with_vel = ctrl().update([2.0, 0.0], [-1.0, 0.0], [0.0, 0.0], 0.0);
-        assert!(with_vel.pitch_rad > no_vel.pitch_rad,
-            "damped {} should be closer to zero than undamped {}", with_vel.pitch_rad, no_vel.pitch_rad);
+        assert!(with_vel.pitch_rad < no_vel.pitch_rad,
+            "damped {} should be closer to zero than undamped {}",
+            with_vel.pitch_rad, no_vel.pitch_rad);
+        assert!(with_vel.pitch_rad > 0.0, "still commanding south");
     }
 
     #[test]
@@ -199,8 +221,10 @@ mod tests {
         // "forward" is east, so it should *roll* to go south, not pitch.
         let yaw = core::f32::consts::FRAC_PI_2;
         let out = ctrl().update([10.0, 0.0], [0.0, 0.0], [0.0, 0.0], yaw);
-        // Roll should be significant, pitch should be near zero.
-        assert!(out.roll_rad.abs() > 0.01, "roll={}", out.roll_rad);
+        // Roll significant, pitch near zero -- and the SIGN matters, which
+        // this test used to ignore by taking abs() on both. Heading east,
+        // the right wing points south, so flying south means rolling RIGHT.
+        assert!(out.roll_rad > 0.01, "roll={}", out.roll_rad);
         assert!(out.pitch_rad.abs() < 0.01, "pitch={}", out.pitch_rad);
     }
 }
