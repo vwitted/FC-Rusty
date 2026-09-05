@@ -72,6 +72,31 @@ fn rate_alpha() -> f32 {
 // ---- Constraint bounds ----
 const MAX_ANGLE_RAD: f32 = 45.0 * PI / 180.0;  // ±45°
 const MAX_RATE_RAD: f32 = 400.0 * PI / 180.0;   // ±400°/s
+// A SECOND reason this bound matters, found after the fact and unrelated to
+// the derivation below: the control loop must not outrun the ESTIMATOR.
+//
+// At large attitude error the MEKF's estimate is badly wrong (its accel
+// update is corrupted by the manoeuvre's own acceleration), and the command
+// bound decides how hard the controller acts on that wrong information.
+// Measured, recovering from an upset with the estimator and GPS accel
+// compensation in the loop, on a 6.8:1 airframe:
+//
+//     rate bound    90 deg upset    120 deg upset
+//        40 deg/s      4.28 s          5.25 s
+//        80 deg/s      4.33 s          4.84 s
+//       150 deg/s      3.63 s          NEVER
+//       300 deg/s      3.54 s          NEVER
+//       400 deg/s      3.54 s          NEVER
+//
+// More authority improves the moderate case monotonically and BREAKS the
+// large one above ~80-150 deg/s. Below the threshold the estimator keeps
+// up; above it, extra authority becomes faster divergence. So an FPV
+// airframe's real 800-2000 deg/s of capability is not something to unlock
+// here without the estimator to match it.
+//
+// 40 deg/s therefore sits in the safe region, though the derivation below
+// arrived there for an unrelated reason.
+//
 // MPC rate-command constraint. The inner PID (kp=0.02, output_max=0.5)
 // saturates at a rate error of ~25 °/s. To keep PID in its linear
 // regime we want |u_mpc - rate_actual| < 25 °/s. With Q/R tuned to
