@@ -126,6 +126,43 @@ pub const RESCUE_SWITCH_ON_US: u16 = 1500;
 pub const MODE_SWITCH_POSHOLD_US: u16 = 1600;
 pub const MODE_SWITCH_ALTHOLD_US: u16 = 1200;
 
+/// Minimum ground speed (m/s) before GPS course is trusted as heading.
+pub const V_MIN_COG: f32 = 2.0;
+/// Minimum forward pitch-stick deflection, normalised, before GPS course is
+/// trusted as heading.
+pub const FWD_STICK_MIN: f32 = 0.3;
+
+/// Inputs to the GPS course-over-ground yaw gate.
+#[derive(Clone, Copy, Debug)]
+pub struct CogGate {
+    pub armed: bool,
+    pub has_3d_fix: bool,
+    pub ground_speed_ms: f32,
+    /// Pitch stick, normalised, SAME channel and sign as `NavInputs::pitch_input`.
+    pub pitch_input: f32,
+}
+
+/// Should GPS course-over-ground be fused as a yaw reference this tick?
+///
+/// COG equals heading only in deliberate forward flight, so this requires
+/// armed + a good 3D fix + above V_MIN_COG + forward pitch stick. Get the
+/// last condition backwards and the gate fires while flying BACKWARDS,
+/// where course-over-ground is ~180 deg from heading -- i.e. it injects a
+/// half-turn of yaw error straight into the MEKF.
+///
+/// !! THE FORWARD-STICK SIGN IS UNRESOLVED. See
+/// `cog_gate_and_attitude_path_agree_on_what_forward_means` in
+/// src/conventions.rs. This function preserves main.rs's behaviour
+/// (positive pitch_input treated as forward); the attitude path treats
+/// positive pitch_input as NOSE UP, which is backwards. One of the two is
+/// wrong and it cannot be settled from the RC convention alone.
+pub fn should_fuse_cog(g: &CogGate) -> bool {
+    g.armed
+        && g.has_3d_fix
+        && g.ground_speed_ms > V_MIN_COG
+        && g.pitch_input > FWD_STICK_MIN
+}
+
 /// Inputs to flight-mode selection.
 #[derive(Clone, Copy, Debug)]
 pub struct ModeSelect {

@@ -101,7 +101,7 @@ use control::arm_origin::ArmOriginSync;
 use control::cal_led::{led_on, CalLed};
 use control::mag_cal::{CalCommand, MagCalibrator, DECLINATION_DEG};
 use control::mixer::{AirmodeGate, ControlDemand, QUAD_X};
-use control::modes::{EntryState, FlightMode, ModeSelect, NavEvent, NavInputs, NavState, PosEstimate};
+use control::modes::{CogGate, EntryState, FlightMode, ModeSelect, NavEvent, NavInputs, NavState, PosEstimate};
 use control::mpc::{AttitudeMpc, MPC_DT, MPC_PERIOD_US};
 use control::pid::{PidGains, PidLimits, RatePidController};
 use control::position::{PositionController, PositionGains};
@@ -1907,8 +1907,6 @@ async fn navigation_task() {
     let mut arm_origin_sync = ArmOriginSync::new();
 
     // GPS-COG yaw gating: only trust course when genuinely flying forward.
-    const V_MIN_COG: f32 = 2.0; // m/s
-    const FWD_STICK_MIN: f32 = 0.3; // normalised pitch-forward
     let mut cal_sw_prev = false;
     let mut armed_prev_cal = false;
 
@@ -2078,12 +2076,12 @@ async fn navigation_task() {
         // MEKF fuses it as a generous-sigma scalar yaw update.
         // NOTE: confirm the forward-stick sign on the bench (channels[1]
         // forward should be positive here); flip if your TX is reversed.
-        let fwd_stick = RcChannels::to_normalised(last_rc.channels[1]);
-        if armed
-            && last_gps.has_3d_fix()
-            && last_gps.ground_speed_ms > V_MIN_COG
-            && fwd_stick > FWD_STICK_MIN
-        {
+        if control::modes::should_fuse_cog(&CogGate {
+            armed,
+            has_3d_fix: last_gps.has_3d_fix(),
+            ground_speed_ms: last_gps.ground_speed_ms,
+            pitch_input: RcChannels::to_normalised(last_rc.channels[1]),
+        }) {
             YAW_COG.signal(last_gps.course_deg.to_radians());
         }
 
