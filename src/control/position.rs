@@ -46,19 +46,52 @@ pub struct PositionGains {
     /// Derivative gain (m/s² per m/s of velocity).
     /// Damps overshoot. Should be roughly 2·√(kp) for critical damping.
     pub kd: f32,
-    /// Maximum tilt angle in radians. Limits how aggressively the quad
-    /// can tilt to correct position error. 15° is conservative (GPS
-    /// rescue), 30° is reasonable for autonomous flight.
+    /// Maximum tilt angle in radians. Limits how aggressively the quad can
+    /// tilt to correct position error — and therefore bounds horizontal
+    /// acceleration to g·tan(tilt), and station-keeping speed to
+    /// sqrt(m·a/drag).
+    ///
+    /// Was 15°, described as "conservative (GPS rescue)". It is not
+    /// conservative: 15° caps wind-holding at ~15.6 m/s, so it is the
+    /// setting that makes GPS rescue unable to get home in a gale. Measured
+    /// station-keeping with the estimator and GPS accel compensation in the
+    /// loop (att_rms / pos_rms, 8 seeds):
+    ///
+    ///     wind      15°                30°           45°
+    ///     20 m/s    3.3 / 51  (5/8 drift)  4.7 / 5.3   5.3 / 5.3
+    ///     25 m/s    8/8 drift              5.3 / 28    8.5 / 8.3
+    ///     33 m/s    8/8 drift              8/8 drift  13.4 / 44 (1/8)
+    ///
+    /// 15° DRIFTS AWAY at 20 m/s — an ordinary gusty day — while 45° holds
+    /// through 25 and mostly through 33. Losing the aircraft downwind
+    /// during a rescue is the worse failure and it happens in far more
+    /// common conditions, so 45° is the safer presumptive default.
+    ///
+    /// Two caveats carried deliberately:
+    ///
+    /// The benefit above depends on the GPS-derived acceleration
+    /// compensation (see gps_accel.rs). WITHOUT it, 45° at 33 m/s crashes
+    /// where 15° merely drifts. Gating tilt on
+    /// GpsAccelEstimator::is_fresh() is the principled fix and is not yet
+    /// wired.
+    ///
+    /// And 45° now coincides exactly with mpc::MAX_ANGLE_RAD, so the
+    /// reference sits on the solver's own state constraint with no margin.
+    /// That matters less than it sounds — MAX_ANGLE_RAD is a bare number
+    /// with no stated derivation, unlike MAX_CMD_RAD beside it — but both
+    /// deserve the same scrutiny the tilt limit has now had.
     pub max_tilt_rad: f32,
 }
 
 impl Default for PositionGains {
-    /// Conservative defaults suitable for GPS rescue.
+    /// Defaults suitable for GPS rescue. See `max_tilt_rad` — the tilt
+    /// limit is set for the aircraft to actually reach home in wind, which
+    /// is the opposite trade from the 15° this used to carry.
     fn default() -> Self {
         Self {
             kp: 0.8,
             kd: 1.2,
-            max_tilt_rad: 15.0 * PI / 180.0,
+            max_tilt_rad: 45.0 * PI / 180.0,
         }
     }
 }
