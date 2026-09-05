@@ -266,8 +266,24 @@ impl AttitudeMpc {
 
         let u = solution.u_now();
 
+        // Clamp to the command bound.
+        //
+        // The solver's u_now() is the ADMM PRIMAL variable, not its
+        // constraint-projected copy, so it satisfies MAX_CMD_RAD only to
+        // tolerance -- and measurably does not. At a 20 deg attitude error
+        // it returns 40.39 deg/s against a 40 deg/s bound WHILE REPORTING
+        // CONVERGED; at 120 deg it settles at 43.89 and never converges.
+        // More iterations do not help: 10, 20, 40, 80 and 200 all land on
+        // the same value, so this is not a budget problem.
+        //
+        // That matters because this bound is not a preference. It is sized
+        // so the inner rate PID stays linear (see MAX_CMD_RAD), and a
+        // controller quietly exceeding the limit its downstream stage
+        // depends on shows up only as unexplained saturation in flight.
+        let clamp = |v: f32| v.clamp(-MAX_CMD_RAD, MAX_CMD_RAD);
+
         MpcOutput {
-            rate_setpoints_rads: [u[0], u[1], u[2]],
+            rate_setpoints_rads: [clamp(u[0]), clamp(u[1]), clamp(u[2])],
             converged: solution.reason == TerminationReason::Converged,
             iterations: solution.iterations,
         }
@@ -365,25 +381,44 @@ mod tests {
         );
     }
 
-    /// The solver can return a command OUTSIDE its own constraint.
+    /// The command bound is enforced on the way out, because the solver
+    /// does not enforce it itself.
     ///
-    /// MAX_CMD_RAD is +/-40 deg/s, but a 180 deg heading error produces
-    /// -44.7. ADMM is capped at max_iter = 10 and a partially converged
-    /// iterate is not guaranteed feasible. The cap's comment argues partial
-    /// convergence is fine because "attitude tracking is well below the
-    /// loop bandwidth" -- true for TRACKING, but a constraint is a
-    /// different kind of promise, and this one is sized to keep the inner
-    /// PID in its linear regime.
+    /// Measured before the clamp existed: 40.39 deg/s at a 20 deg attitude
+    /// error WHILE REPORTING CONVERGED, and 43.89 at 120 deg regardless of
+    /// iteration budget (10 through 200 all agree). u_now() is the ADMM
+    /// primal, not its projected copy, so the constraint holds only to
+    /// tolerance.
     #[test]
-    fn solver_output_can_exceed_its_own_command_constraint() {
+    fn output_never_exceeds_the_command_bound() {
         let mut mpc = AttitudeMpc::new();
         mpc.set_reference([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
         let deg = core::f32::consts::PI / 180.0;
-        let out = mpc.solve([0.0, 0.0, 180.0 * deg], [0.0, 0.0, 0.0]);
-        let cmd_dps = out.rate_setpoints_rads[2].abs() / deg;
-        assert!(
-            cmd_dps > 40.0,
-            "expected the documented overshoot past the 40 deg/s bound, got {cmd_dps}"
-        );
+        for err in [1.0f32, 20.0, 120.0, 180.0] {
+            let out = mpc.solve([err * deg, err * deg, err * deg], [0.0; 3]);
+            for (i, u) in out.rate_setpoints_rads.iter().enumerate() {
+                assert!(
+                    u.abs() <= MAX_CMD_RAD + 1e-6,
+                    "axis {i} at {err} deg gave {} deg/s, bound is {}",
+                    u / deg,
+                    MAX_CMD_RAD / deg
+                );
+            }
+        }
+    }
+
+    /// Normal errors converge well inside the iteration cap, so max_iter =
+    /// 10 is not the binding constraint it looks like: 3 iterations at
+    /// 1 deg, 5 at 5 deg, 6 at 20 deg.
+    #[test]
+    fn normal_attitude_errors_converge_well_inside_the_iteration_cap() {
+        let mut mpc = AttitudeMpc::new();
+        mpc.set_reference([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
+        let deg = core::f32::consts::PI / 180.0;
+        for err in [1.0f32, 5.0, 20.0] {
+            let out = mpc.solve([err * deg, 0.0, 0.0], [0.0, 0.0, 0.0]);
+            assert!(out.converged, "{err} deg should converge");
+            assert!(out.iterations <= 8, "{err} deg used {} iters", out.iterations);
+        }
     }
 }
