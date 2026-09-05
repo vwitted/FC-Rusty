@@ -245,6 +245,9 @@ fn tunables() -> Tunables {
     if let Some(v) = std::env::var("POS_MAX_TILT_DEG").ok().and_then(|v| v.parse().ok()) {
         t.pos_max_tilt_deg = v;
     }
+    if let Some(v) = std::env::var("MPC_CMD_DPS").ok().and_then(|v| v.parse().ok()) {
+        t.mpc_cmd_bound_dps = v;
+    }
     if std::env::args().any(|a| a == "--pid") {
         t.attitude = AttitudeMode::AnglePid {
             kp: std::env::var("ANGLE_KP").ok().and_then(|v| v.parse().ok())

@@ -205,6 +205,8 @@ pub struct Tunables {
     /// indefinitely, so a budget is the low limit with extra steps, and it
     /// can limit-cycle -- expire, drift, recover, fight, expire.
     pub pos_max_tilt_deg: f32,
+    /// MPC output command bound, deg/s. 0 keeps the firmware's MAX_CMD_RAD.
+    pub mpc_cmd_bound_dps: f32,
     pub alt: AltitudeGains,
 }
 
@@ -218,6 +220,7 @@ impl Tunables {
             gyro_fc_hz: 150.0,
             attitude: AttitudeMode::Mpc,
             pos_max_tilt_deg: 15.0,
+            mpc_cmd_bound_dps: 0.0,
             alt: AltitudeGains { kp: 0.15, kd: 0.1, ki: 0.05 },
         }
     }
@@ -467,6 +470,9 @@ pub fn run_case(
     let mut current_thrust = hover_throttle;
 
     let mut mpc = AttitudeMpc::new();
+    if tun.mpc_cmd_bound_dps > 0.0 {
+        mpc.set_cmd_bound(tun.mpc_cmd_bound_dps * DEG2RAD);
+    }
     mpc.set_reference([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
     let mut ref_deg = [0.0f32; 2];
     let mut commanded = false;

@@ -97,6 +97,19 @@ const MAX_RATE_RAD: f32 = 400.0 * PI / 180.0;   // ±400°/s
 // 40 deg/s therefore sits in the safe region, though the derivation below
 // arrived there for an unrelated reason.
 //
+// BUT NOT BY BEING THE BINDING CONSTRAINT. Sweeping this bound with the MPC
+// changes nothing at all -- 40, 60, 80, 100 and 150 deg/s all give
+// identical upset recoveries (90 deg: 3.28 s; 120 deg: 3.54 s; 150 deg:
+// never). What limits the MPC is Q/R, not the clamp: the weights are tuned
+// to command <=15 deg/s for typical disturbances, so the bound only bites
+// briefly at the start of a large recovery.
+//
+// The threshold above was measured with the angle PID, where kp = 6 against
+// a 120 deg error demands 720 deg/s and the bound is the only thing holding
+// it back. So the principle holds -- control bandwidth must not exceed
+// estimator bandwidth -- but for the MPC the knob that would violate it is
+// Q/R, not this. Relaxing MAX_CMD_RAD alone would be a no-op.
+//
 // MPC rate-command constraint. The inner PID (kp=0.02, output_max=0.5)
 // saturates at a rate error of ~25 °/s. To keep PID in its linear
 // regime we want |u_mpc - rate_actual| < 25 °/s. With Q/R tuned to
@@ -131,6 +144,10 @@ pub struct AttitudeMpc {
     x_ref: SMatrix<f32, NX, HX>,
     x_con: XConstraint,
     u_con: UConstraint,
+    /// Output clamp, rad/s. Defaults to MAX_CMD_RAD; settable so the
+    /// harness can sweep it, since the right value depends on the
+    /// ESTIMATOR's bandwidth as much as the inner PID's linear range.
+    cmd_bound: f32,
 }
 
 impl AttitudeMpc {
@@ -243,6 +260,7 @@ impl AttitudeMpc {
             x_ref: SMatrix::zeros(),
             x_con,
             u_con,
+            cmd_bound: MAX_CMD_RAD,
         }
     }
 
@@ -305,13 +323,25 @@ impl AttitudeMpc {
         // so the inner rate PID stays linear (see MAX_CMD_RAD), and a
         // controller quietly exceeding the limit its downstream stage
         // depends on shows up only as unexplained saturation in flight.
-        let clamp = |v: f32| v.clamp(-MAX_CMD_RAD, MAX_CMD_RAD);
+        let clamp = |v: f32| v.clamp(-self.cmd_bound, self.cmd_bound);
 
         MpcOutput {
             rate_setpoints_rads: [clamp(u[0]), clamp(u[1]), clamp(u[2])],
             converged: solution.reason == TerminationReason::Converged,
             iterations: solution.iterations,
         }
+    }
+
+    /// Override the output command bound, rad/s.
+    ///
+    /// Two independent constraints set this and they are easy to confuse.
+    /// The documented one keeps the inner rate PID linear. The other, found
+    /// later, is that the control loop must not outrun the ESTIMATOR --
+    /// past a threshold, extra authority becomes faster divergence from a
+    /// wrong attitude rather than faster recovery. See the note by
+    /// MAX_CMD_RAD.
+    pub fn set_cmd_bound(&mut self, rad_per_s: f32) {
+        self.cmd_bound = rad_per_s;
     }
 
     /// Reset the solver state (constraints, warm-start).
