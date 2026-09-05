@@ -45,6 +45,7 @@ pub mod drivers {
 }
 
 pub mod estimation;
+pub mod gps_accel;
 
 pub mod attitude_mekf;
 

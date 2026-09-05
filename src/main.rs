@@ -81,6 +81,7 @@ mod control {
 }
 mod attitude_mekf;
 mod estimation;
+mod gps_accel;
 mod imu_filter;
 mod logger;
 mod rc_task;
@@ -244,6 +245,15 @@ static CAL_CONTROL: Signal<CriticalSectionRawMutex, CalCommand> = Signal::new();
 static CAL_SAVE: Signal<CriticalSectionRawMutex, persist::record::Config> = Signal::new();
 /// Trusted true heading from GPS COG (rad): navigation task → mekf task.
 static YAW_COG: Signal<CriticalSectionRawMutex, f32> = Signal::new();
+/// Horizontal acceleration from GPS Doppler velocity (world NED, m/s²):
+/// pos_kf_task → mekf task.
+///
+/// Gives the attitude estimator an acceleration reference INDEPENDENT of
+/// its own attitude, so the accel update can be corrected back to reading
+/// gravity. Independence is the point: a_world (computed below for the KF)
+/// is R(q)·f_body + g, and subtracting THAT cancels to exactly the
+/// predicted gravity, silently disabling the update. See gps_accel.rs.
+static GPS_ACCEL_NED: Signal<CriticalSectionRawMutex, [f32; 2]> = Signal::new();
 /// Boot-loaded calibration: main → mekf task.
 static STORED_CAL: Signal<CriticalSectionRawMutex, persist::record::Config> = Signal::new();
 /// Cal-feedback LED phase: mekf task → blink task. Watch so the renderer
@@ -903,6 +913,9 @@ async fn mekf_task() {
     const SIGMA_YAW_COG: f32 = 0.26; // ~15°, generous: COG ≈ heading only
     let mut calibrator = MagCalibrator::new();
     let mut cal_active = false;
+    // Latest GPS-derived horizontal acceleration, world NED (m/s²). Held
+    // between fixes; zero when GPS is absent or has faded out.
+    let mut gps_accel_ned = [0.0f32; 2];
     let mut anchor_pending = false;
     let mut last_cal_log = Instant::now();
     let cal_led_tx = CAL_LED.sender();
@@ -943,6 +956,13 @@ async fn mekf_task() {
         if let Some(yaw_cog) = YAW_COG.try_take() {
             mekf.update_yaw_reference(yaw_cog, SIGMA_YAW_COG);
         }
+        // Latest GPS-derived horizontal acceleration, held between fixes.
+        // Held rather than consumed-and-cleared: fixes arrive at ~10 Hz and
+        // this loop runs at 8 kHz, so clearing would leave 799 of every 800
+        // accel updates uncompensated.
+        if let Some(a) = GPS_ACCEL_NED.try_take() {
+            gps_accel_ned = a;
+        }
 
         // DWT, not Instant: `tick-hz-32_768` resolves 30.5 µs, so a true
         // 125 µs interval reads as 122 or 153 µs — ±22% jitter on the
@@ -969,7 +989,35 @@ async fn mekf_task() {
 
         let on_kf_tick = sample_count % ACCEL_DECIMATION == 0;
         if on_kf_tick {
-            if mekf.update_accel(raw.accel_g()) {
+            // Subtract the GPS-derived horizontal acceleration before the
+            // gravity update. The accelerometer measures specific force
+            // a - g; the update assumes a = 0, which is false whenever the
+            // aircraft accelerates. Removing a known a restores the
+            // assumption.
+            //
+            // Rotating a world-frame acceleration into body with the
+            // estimate's own attitude is fine here and is NOT the
+            // degeneracy described on GPS_ACCEL_NED: the magnitude and
+            // direction come from GPS, so an attitude error only mis-rotates
+            // a small correction rather than cancelling the innovation.
+            //
+            // Horizontal only, matching update_gps_velocity: consumer
+            // vertical GPS velocity is too noisy to differentiate.
+            let a_g = raw.accel_g();
+            let accel_corrected = if gps_accel_ned != [0.0; 2] {
+                let e = mekf.euler();
+                let rot = nalgebra::Rotation3::from_euler_angles(e[0], e[1], e[2]);
+                let ab = rot.inverse()
+                    * nalgebra::Vector3::new(gps_accel_ned[0], gps_accel_ned[1], 0.0);
+                [
+                    a_g[0] - ab.x / G_MPS2,
+                    a_g[1] - ab.y / G_MPS2,
+                    a_g[2] - ab.z / G_MPS2,
+                ]
+            } else {
+                a_g
+            };
+            if mekf.update_accel(accel_corrected) {
                 updates_applied = updates_applied.wrapping_add(1);
             } else {
                 updates_rejected = updates_rejected.wrapping_add(1);
@@ -1251,6 +1299,8 @@ async fn pos_kf_task() {
     let mut last_fused_lon: f64 = f64::NAN;
     let mut last_fused_speed: f32 = f32::NAN;
     let mut last_fused_course: f32 = f32::NAN;
+    let mut gps_accel = gps_accel::GpsAccelEstimator::default();
+    let mut last_vel_fix_at = Instant::now();
 
     let mut ticker = Ticker::every(Duration::from_millis(PERIOD_MS));
     let mut last_report = Instant::now();
@@ -1259,6 +1309,15 @@ async fn pos_kf_task() {
 
     loop {
         ticker.next().await;
+
+        // Age the GPS-derived acceleration every tick, not just on a fix.
+        // Without this a lost receiver would leave the last acceleration
+        // applied to the attitude update indefinitely -- worse than no
+        // compensation, because it is confidently wrong. tick() fades it
+        // out once fixes stop, and re-signalling every tick means the MEKF
+        // sees the decay rather than holding a stale value of its own.
+        gps_accel.tick(PERIOD_MS as f32 * 1e-3);
+        GPS_ACCEL_NED.signal(gps_accel.accel_ned());
 
         // ---- Pull latest IMU for predict ----
         if let Some(imu) = IMU_DATA_FOR_KF.try_take() {
@@ -1389,6 +1448,13 @@ async fn pos_kf_task() {
                     )
                 };
                 kf.update_gps_velocity(vn, ve);
+                // Differentiate the same velocity for the attitude
+                // estimator. dt is measured, not assumed: NMEA fixes are
+                // nominally 10 Hz but arrive when they arrive.
+                let now_vel = Instant::now();
+                let dt_vel = (now_vel - last_vel_fix_at).as_micros() as f32 * 1e-6;
+                gps_accel.update(vn, ve, dt_vel);
+                last_vel_fix_at = now_vel;
                 gps_vel_fuses_sec = gps_vel_fuses_sec.wrapping_add(1);
                 last_fused_speed = gps.ground_speed_ms;
                 last_fused_course = gps.course_deg;
