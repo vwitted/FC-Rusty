@@ -316,7 +316,10 @@ fn main() {
     let vib_freqs = [10.0f32, 50.0, 100.0, 200.0, 400.0];
     let vib_amps = [0.0f32, 2.0, 5.0, 10.0, 20.0];
     let p_onlines = [1.0f32, 0.99, 0.95, 0.9, 0.8, 0.6, 0.4];
-    let motor_scales = [1.0f32, 0.95, 0.9, 0.8, 0.7, 0.5];
+    // Down to total loss. 0.0 is a thrown prop or a dead ESC -- worth having
+    // in the sweep because a quad cannot hold attitude AND yaw on three
+    // motors, so what it does here is a real design question, not a detail.
+    let motor_scales = [1.0f32, 0.95, 0.9, 0.8, 0.7, 0.5, 0.25, 0.0];
     let biases = [0.0f32, 0.5, 1.0, 2.0, 5.0, 10.0];
 
     if csv {
