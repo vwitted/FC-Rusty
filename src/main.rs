@@ -73,6 +73,7 @@ mod control {
     pub mod cal_led;
     pub mod mag_cal;
     pub mod mixer;
+    pub mod modes;
     pub mod mpc;
     pub mod pid;
     pub mod position;
@@ -99,6 +100,7 @@ use control::arm_origin::ArmOriginSync;
 use control::cal_led::{led_on, CalLed};
 use control::mag_cal::{CalCommand, MagCalibrator, DECLINATION_DEG};
 use control::mixer::{AirmodeGate, ControlDemand, QUAD_X};
+use control::modes::{FlightMode, NavEvent, NavInputs, NavState, PosEstimate};
 use control::mpc::{AttitudeMpc, MPC_DT, MPC_PERIOD_US};
 use control::pid::{PidGains, PidLimits, RatePidController};
 use control::position::{PositionController, PositionGains};
@@ -116,66 +118,12 @@ use estimation::{geodetic_to_local_ned, PosKf};
 
 // ---- Flight modes ----
 
-/// Active flight mode — determines how RC sticks, the position
-/// controller, and the altitude controller interact in the control
-/// loop. Selected by RC channel 5 (3-position mode switch), channel 6
-/// (GPS rescue override), or the arming FSM’s failsafe flag.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, defmt::Format)]
-enum FlightMode {
-    /// Sticks → angle (MPC) → rate (PID). Direct throttle.
-    Acro,
-    /// Sticks → angle (MPC) → rate (PID). Altitude held by
-    /// controller; throttle stick commands climb/descend rate.
-    AltHold,
-    /// Altitude + horizontal position held. Sticks command velocity.
-    /// Without GPS home, horizontal hold is best-effort dead-reckoning
-    /// damped by NMEA velocity fusion — drift accumulates linearly
-    /// rather than quadratically and is acceptable for tens of seconds.
-    PosHold,
-    /// Autonomous return to GPS home at a safe altitude. Triggered by switch.
-    GpsHome,
-    /// Failsafe mode (RC lost, GPS home available): hover at home.
-    GpsRescue,
-    /// Failsafe mode (RC lost, no GPS home, baro alive): closed-loop
-    /// controlled descent. Level attitude, alt-hold target ramps down,
-    /// auto-disarm at low altitude or 30-s timeout.
-    FailsafeLand,
-    /// Failsafe mode (RC lost, no altitude reference at all): open-loop
-    /// blind descent. Level attitude, fixed throttle slightly below
-    /// hover, auto-disarm at 30-s timeout.
-    FailsafeBlind,
-}
 
 // ---- GPS rescue parameters ----
 /// Altitude to climb to during GPS rescue (metres, positive-up).
 const RESCUE_ALT_M: f32 = 50.0;
-/// Horizontal distance to home at which we consider “arrived” (metres).
-const RESCUE_ARRIVAL_RADIUS_M: f32 = 5.0;
-/// Descent rate during auto-land phase (m/s, positive value).
-const RESCUE_LAND_RATE_MPS: f32 = 0.5;
-/// Time loitering at home before auto-landing if RC stays lost (seconds).
-const RESCUE_LAND_TIMEOUT_S: f32 = 30.0;
-/// Altitude below which auto-land disarms (metres, positive-up).
-const RESCUE_DISARM_ALT_M: f32 = 1.0;
-/// Throttle stick deadband for alt-hold climb/descend (0–1 normalised).
-const ALT_HOLD_DEADBAND: f32 = 0.05;
-/// Max climb/descend rate when throttle stick is fully deflected (m/s).
-const ALT_HOLD_MAX_RATE_MPS: f32 = 2.0;
-/// Max velocity when sticks are fully deflected in PosHold (m/s).
-const POS_HOLD_MAX_VEL_MPS: f32 = 5.0;
 
 // ---- Failsafe descent (no GPS home) ----
-/// Descent rate during FailsafeLand (closed-loop, baro-driven), m/s.
-const FAILSAFE_DESCENT_RATE_MPS: f32 = 0.7;
-/// Altitude (above arm reference) below which FailsafeLand auto-disarms.
-const FAILSAFE_LAND_DISARM_ALT_M: f32 = 0.3;
-/// Open-loop throttle for FailsafeBlind, expressed as a fraction of
-/// hover_throttle (so 0.9 means "10 % below hover" → gentle descent).
-/// FailsafeBlind has no auto-disarm — without altitude data we
-/// can't tell when to cut motors. The descent runs until the pilot
-/// regains RC or the battery cuts. Impact-signature-based disarm is
-/// a Beta-target backlog item (see PROJECT_STATUS.md).
-const FAILSAFE_BLIND_THROTTLE_FRAC: f32 = 0.9;
 
 // ---- DShot configuration ----
 /// Set `true` for bidir DShot (line idles HIGH, telemetry-request bit
@@ -281,45 +229,6 @@ static MAG_DATA: Signal<CriticalSectionRawMutex, MagSample> = Signal::new();
 /// contention with the control loop on `IMU_DATA`.
 static IMU_DATA_FOR_KF: Signal<CriticalSectionRawMutex, ImuData> = Signal::new();
 
-/// Fused position / velocity estimate published by `pos_kf_task`.
-#[derive(Clone, Copy, Debug, defmt::Format)]
-struct PosEstimate {
-    /// Position in NED world frame (m), relative to the GPS home point
-    /// once the GPS home latch completes. Before home latch the
-    /// horizontal components are dead-reckoned and only the altitude
-    /// channel is meaningful.
-    position_ned: [f32; 3],
-    /// Velocity in NED world frame (m/s).
-    velocity_ned: [f32; 3],
-    /// Altitude (m, positive up). Reference is whichever sensor latched
-    /// first: pressure altitude relative to arm (baro present) or
-    /// height above GPS-home origin (GPS only).
-    altitude_up: f32,
-    /// Vertical velocity (m/s, positive up).
-    vz_up: f32,
-    /// Reference pressure latched at arm time (Pa). 0.0 if baro is
-    /// absent or arm has not yet fired.
-    p_ref_pa: f32,
-    /// Milliseconds since the last baro update was applied.
-    baro_age_ms: u32,
-    /// True once at least one altitude sensor is anchored:
-    ///   - baro: p_ref latched at arm and at least one fuse fired, OR
-    ///   - GPS:  home latched and fixes are fusing.
-    /// Altitude-hold and any throttle controller that consumes
-    /// `altitude_up` / `vz_up` must gate on this.
-    altitude_ready: bool,
-    /// True once a sufficiently good GPS fix has been captured as the
-    /// home origin. Horizontal `position_ned` is meaningful only when
-    /// this is true; any GPS-rescue or position-hold behaviour must
-    /// gate on it.
-    home_latched: bool,
-    /// Monotonic counter incremented each time the PosKF consumes the arm
-    /// latch (re-anchors origins + zeros state). The navigation task uses
-    /// it (via `ArmOriginSync`) to withhold target capture until the
-    /// arm-time re-origin has actually landed — otherwise it would capture
-    /// stale pre-zero targets and lurch on arm.
-    arm_origin_seq: u32,
-}
 
 static POS_ESTIMATE: Signal<CriticalSectionRawMutex, PosEstimate> = Signal::new();
 
@@ -1965,11 +1874,15 @@ async fn navigation_task() {
         kd: 0.1,
         ki: 0.05,
     };
-    let mut alt_ctrl = AltitudeController::new(alt_gains, hover_throttle);
-    let mut current_thrust = hover_throttle;
-
-    // ---- Position hold / GPS rescue (50 Hz) ----
-    let mut pos_ctrl = PositionController::new(PositionGains::default());
+    // ---- Mode logic state (control::modes) ----
+    // alt/pos targets, the rescue ladder's flags, the last thrust command
+    // and both controllers live together in NavState, because nav_step
+    // threads them and they must not drift apart.
+    let mut nav = NavState::new(
+        AltitudeController::new(alt_gains, hover_throttle),
+        PositionController::new(PositionGains::default()),
+        hover_throttle,
+    );
 
 
 
@@ -1987,10 +1900,6 @@ async fn navigation_task() {
     // ---- Flight mode state ----
     let mut flight_mode = FlightMode::Acro;
     let mut prev_mode = FlightMode::Acro;
-    let mut alt_target: f32 = 0.0;      // metres, positive-up
-    let mut pos_target: [f32; 2] = [0.0, 0.0]; // [north, east] metres
-    let mut rescue_loiter_start: Option<Instant> = None;
-    let mut rescue_landing = false;
 
     // Arm-time re-origin gate + "have the current mode's targets been
     // captured yet" flag. Together they withhold altitude/position target
@@ -2227,38 +2136,38 @@ async fn navigation_task() {
             if let Some(est) = last_pos_est.filter(|_| target_gate && reoriginated) {
                 match flight_mode {
                     FlightMode::AltHold => {
-                        alt_target = est.altitude_up;
-                        alt_ctrl.reset();
+                        nav.alt_target = est.altitude_up;
+                        nav.alt_ctrl.reset();
                     }
                     FlightMode::PosHold => {
-                        alt_target = est.altitude_up;
-                        pos_target = [est.position_ned[0], est.position_ned[1]];
-                        alt_ctrl.reset();
+                        nav.alt_target = est.altitude_up;
+                        nav.pos_target = [est.position_ned[0], est.position_ned[1]];
+                        nav.alt_ctrl.reset();
                     }
                     FlightMode::GpsRescue => {
                         // Hover in place (lock current position and altitude)
-                        alt_target = est.altitude_up;
-                        pos_target = [est.position_ned[0], est.position_ned[1]];
-                        alt_ctrl.reset();
+                        nav.alt_target = est.altitude_up;
+                        nav.pos_target = [est.position_ned[0], est.position_ned[1]];
+                        nav.alt_ctrl.reset();
                     }
                     FlightMode::GpsHome => {
                         // Climb to rescue alt or hold current if already higher.
-                        alt_target = if est.altitude_up > RESCUE_ALT_M {
+                        nav.alt_target = if est.altitude_up > RESCUE_ALT_M {
                             est.altitude_up
                         } else {
                             RESCUE_ALT_M
                         };
-                        pos_target = [0.0, 0.0]; // home is NED origin
-                        rescue_loiter_start = None;
-                        rescue_landing = false;
-                        alt_ctrl.reset();
+                        nav.pos_target = [0.0, 0.0]; // home is NED origin
+                        nav.rescue_loiter_s = None;
+                        nav.rescue_landing = false;
+                        nav.alt_ctrl.reset();
                     }
                     FlightMode::FailsafeLand => {
                         // Start descent from current altitude; the per-
-                        // tick handler ramps alt_target down at
+                        // tick handler ramps nav.alt_target down at
                         // FAILSAFE_DESCENT_RATE_MPS.
-                        alt_target = est.altitude_up;
-                        alt_ctrl.reset();
+                        nav.alt_target = est.altitude_up;
+                        nav.alt_ctrl.reset();
                     }
                     FlightMode::Acro | FlightMode::FailsafeBlind => {}
                 }
@@ -2296,178 +2205,47 @@ async fn navigation_task() {
                 let yaw_rad = angles_rad[2];
 
                 // -- Determine desired roll/pitch/yaw and thrust per mode --
-                let (desired_roll_rad, desired_pitch_rad, desired_yaw_rad, yaw_rate_dps);
-
-                match flight_mode {
-                    FlightMode::Acro => {
-                        desired_roll_rad = roll_input * max_angle * DEG2RAD;
-                        desired_pitch_rad = pitch_input * max_angle * DEG2RAD;
-                        desired_yaw_rad = 0.0;
-                        yaw_rate_dps = yaw_input * 200.0;
-                        // Direct throttle pass-through
-                        current_thrust = throttle_raw.clamp(0.0, 1.0);
-                    }
-                    FlightMode::AltHold => {
-                        desired_roll_rad = roll_input * max_angle * DEG2RAD;
-                        desired_pitch_rad = pitch_input * max_angle * DEG2RAD;
-                        desired_yaw_rad = 0.0;
-                        yaw_rate_dps = yaw_input * 200.0;
-                        // Throttle stick → climb/descend rate → alt target adjustment
-                        let thr_centered = throttle_raw - 0.5; // -0.5..+0.5
-                        if libm::fabsf(thr_centered) > ALT_HOLD_DEADBAND {
-                            let rate = thr_centered * 2.0 * ALT_HOLD_MAX_RATE_MPS;
-                            alt_target += rate * dt_outer;
+                // The logic itself lives in control::modes::nav_step, so it
+                // can be tested. This block used to hold it inline, which is
+                // the only reason it was unreachable from any test.
+                let nav_out = control::modes::nav_step(
+                    &NavInputs {
+                        mode: flight_mode,
+                        roll_input,
+                        pitch_input,
+                        yaw_input,
+                        throttle_raw,
+                        max_angle_deg: max_angle,
+                        yaw_rad,
+                        pos_est: last_pos_est,
+                        dt: dt_outer,
+                        hover_throttle,
+                    },
+                    &mut nav,
+                );
+                if let Some(ev) = nav_out.event {
+                    match ev {
+                        NavEvent::AutoLandComplete => {
+                            defmt::info!("GPS Home: auto-land complete, disarming")
                         }
-                        if let Some(est) = last_pos_est.filter(|e| e.altitude_ready) {
-                            current_thrust =
-                                alt_ctrl.update(alt_target, est.altitude_up, est.vz_up, dt_outer);
+                        NavEvent::ArrivedAtHome => {
+                            defmt::info!("GPS Home: arrived at home, loitering")
                         }
-                    }
-                    FlightMode::PosHold => {
-                        yaw_rate_dps = yaw_input * 200.0;
-                        // Sticks → velocity → position target offset
-                        if libm::fabsf(roll_input) > ALT_HOLD_DEADBAND
-                            || libm::fabsf(pitch_input) > ALT_HOLD_DEADBAND
-                        {
-                            let cos_yaw = libm::cosf(yaw_rad);
-                            let sin_yaw = libm::sinf(yaw_rad);
-                            let vn = (cos_yaw * pitch_input + sin_yaw * roll_input)
-                                * POS_HOLD_MAX_VEL_MPS;
-                            let ve = (-sin_yaw * pitch_input + cos_yaw * roll_input)
-                                * POS_HOLD_MAX_VEL_MPS;
-                            pos_target[0] += vn * dt_outer;
-                            pos_target[1] += ve * dt_outer;
+                        NavEvent::LoiterTimeout => {
+                            defmt::info!("GPS Home: loiter timeout, auto-landing")
                         }
-                        // Throttle → altitude target
-                        let thr_centered = throttle_raw - 0.5;
-                        if libm::fabsf(thr_centered) > ALT_HOLD_DEADBAND {
-                            alt_target += thr_centered * 2.0 * ALT_HOLD_MAX_RATE_MPS * dt_outer;
+                        NavEvent::FailsafeFloorReached => {
+                            defmt::info!("FailsafeLand: altitude floor reached, disarming")
                         }
-                        if let Some(est) = last_pos_est.filter(|e| e.home_latched) {
-                            let pos_out = pos_ctrl.update(
-                                [est.position_ned[0], est.position_ned[1]],
-                                [est.velocity_ned[0], est.velocity_ned[1]],
-                                pos_target,
-                                yaw_rad,
-                            );
-                            desired_roll_rad = pos_out.roll_rad;
-                            desired_pitch_rad = pos_out.pitch_rad;
-                            current_thrust =
-                                alt_ctrl.update(alt_target, est.altitude_up, est.vz_up, dt_outer);
-                        } else {
-                            desired_roll_rad = 0.0;
-                            desired_pitch_rad = 0.0;
-                            current_thrust = hover_throttle;
-                        }
-                        desired_yaw_rad = 0.0;
-                    }
-                    FlightMode::GpsRescue => {
-                        // Failsafe: just hover in place
-                        yaw_rate_dps = 0.0;
-                        desired_yaw_rad = 0.0;
-                        if let Some(est) = last_pos_est.filter(|e| e.home_latched) {
-                            let pos_out = pos_ctrl.update(
-                                [est.position_ned[0], est.position_ned[1]],
-                                [est.velocity_ned[0], est.velocity_ned[1]],
-                                pos_target,
-                                yaw_rad,
-                            );
-                            desired_roll_rad = pos_out.roll_rad;
-                            desired_pitch_rad = pos_out.pitch_rad;
-                            current_thrust =
-                                alt_ctrl.update(alt_target, est.altitude_up, est.vz_up, dt_outer);
-                        } else {
-                            desired_roll_rad = 0.0;
-                            desired_pitch_rad = 0.0;
-                            current_thrust = hover_throttle;
-                        }
-                    }
-                    FlightMode::GpsHome => {
-                        // Return to home
-                        yaw_rate_dps = 0.0;
-                        desired_yaw_rad = 0.0;
-                        if let Some(est) = last_pos_est.filter(|e| e.home_latched) {
-                            let dist_home = libm::sqrtf(est.position_ned[0] * est.position_ned[0] + est.position_ned[1] * est.position_ned[1]);
-
-                            // Auto-land sequence
-                            if rescue_landing {
-                                alt_target -= RESCUE_LAND_RATE_MPS * dt_outer;
-                                if est.altitude_up < RESCUE_DISARM_ALT_M {
-                                    defmt::info!("GPS Home: auto-land complete, disarming");
-                                    arming.force_disarm();
-                                }
-                            } else if dist_home < RESCUE_ARRIVAL_RADIUS_M {
-                                // Arrived — start loiter timer
-                                if rescue_loiter_start.is_none() {
-                                    defmt::info!("GPS Home: arrived at home, loitering");
-                                    rescue_loiter_start = Some(Instant::now());
-                                }
-                                if let Some(t) = rescue_loiter_start {
-                                    let loiter_s = t.elapsed().as_millis() as f32 / 1000.0;
-                                    // If we are actually in failsafe (or just loiter timeout on switch), land
-                                    if loiter_s > RESCUE_LAND_TIMEOUT_S {
-                                        defmt::info!("GPS Home: loiter timeout, auto-landing");
-                                        rescue_landing = true;
-                                    }
-                                }
-                            }
-
-                            let pos_out = pos_ctrl.update(
-                                [est.position_ned[0], est.position_ned[1]],
-                                [est.velocity_ned[0], est.velocity_ned[1]],
-                                pos_target,
-                                yaw_rad,
-                            );
-                            desired_roll_rad = pos_out.roll_rad;
-                            desired_pitch_rad = pos_out.pitch_rad;
-                            current_thrust =
-                                alt_ctrl.update(alt_target, est.altitude_up, est.vz_up, dt_outer);
-                        } else {
-                            desired_roll_rad = 0.0;
-                            desired_pitch_rad = 0.0;
-                            current_thrust = hover_throttle;
-                        }
-                    }
-                    FlightMode::FailsafeLand => {
-                        // RC lost, no GPS home, baro alive: closed-loop
-                        // controlled descent at FAILSAFE_DESCENT_RATE_MPS.
-                        // Disarm when altitude crosses the floor (we're
-                        // back near the arm reference). No timeout —
-                        // altitude-floor is the sole stop condition.
-                        yaw_rate_dps = 0.0;
-                        desired_yaw_rad = 0.0;
-                        desired_roll_rad = 0.0;
-                        desired_pitch_rad = 0.0;
-                        alt_target -= FAILSAFE_DESCENT_RATE_MPS * dt_outer;
-                        if let Some(est) = last_pos_est.filter(|e| e.altitude_ready) {
-                            current_thrust =
-                                alt_ctrl.update(alt_target, est.altitude_up, est.vz_up, dt_outer);
-                            if est.altitude_up < FAILSAFE_LAND_DISARM_ALT_M {
-                                defmt::info!("FailsafeLand: altitude floor reached, disarming");
-                                arming.force_disarm();
-                            }
-                        } else {
-                            // Altitude went stale mid-descent — fall
-                            // through to blind throttle for this tick.
-                            // Mode-selection will switch us to
-                            // FailsafeBlind on the next pass.
-                            current_thrust = hover_throttle * FAILSAFE_BLIND_THROTTLE_FRAC;
-                        }
-                    }
-                    FlightMode::FailsafeBlind => {
-                        // RC lost AND no altitude reference. Open-loop
-                        // throttle slightly below hover, level attitude.
-                        // No auto-disarm — without altitude data we
-                        // can't tell when to stop. The descent runs
-                        // until pilot recovers RC or battery cuts.
-                        // (Beta backlog: impact-signature disarm.)
-                        yaw_rate_dps = 0.0;
-                        desired_yaw_rad = 0.0;
-                        desired_roll_rad = 0.0;
-                        desired_pitch_rad = 0.0;
-                        current_thrust = hover_throttle * FAILSAFE_BLIND_THROTTLE_FRAC;
                     }
                 }
+                if nav_out.disarm {
+                    arming.force_disarm();
+                }
+                let desired_roll_rad = nav_out.desired_roll_rad;
+                let desired_pitch_rad = nav_out.desired_pitch_rad;
+                let desired_yaw_rad = nav_out.desired_yaw_rad;
+                let yaw_rate_dps = nav_out.yaw_rate_dps;
 
                 // ---- MPC solve (all modes) ----
                 mpc.set_reference(
@@ -2495,17 +2273,17 @@ async fn navigation_task() {
 
             // ---- Publish to fast inner loop ----
             OUTER_CMD.sender().send(OuterLoopCommand {
-                thrust: current_thrust,
+                thrust: nav.current_thrust,
                 rate_sp_degs,
                 armed: true,
             });
         } else {
             // Disarmed — zero everything, reset controllers
             mpc.reset();
-            alt_ctrl.reset();
-            current_thrust = hover_throttle;
-            rescue_loiter_start = None;
-            rescue_landing = false;
+            nav.alt_ctrl.reset();
+            nav.current_thrust = hover_throttle;
+            nav.rescue_loiter_s = None;
+            nav.rescue_landing = false;
 
             OUTER_CMD.sender().send(OuterLoopCommand {
                 thrust: 0.0,
@@ -2534,7 +2312,7 @@ async fn navigation_task() {
             };
 
             let stick_thr_pct = (RcChannels::to_unit(last_rc.channels[2]) * 100.0) as u8;
-            let thrust_cmd_pct = (current_thrust * 100.0) as u8;
+            let thrust_cmd_pct = (nav.current_thrust * 100.0) as u8;
             defmt::info!(
                 "mode={} armed={} roll={:?}° pitch={:?}° yaw={:?}° thr={}% cmd={}% alt_t={=f32}m sats={}",
                 flight_mode,
@@ -2544,7 +2322,7 @@ async fn navigation_task() {
                 last_imu.angle[2],
                 stick_thr_pct,
                 thrust_cmd_pct,
-                alt_target,
+                nav.alt_target,
                 last_gps.satellites,
             );
             defmt::info!(

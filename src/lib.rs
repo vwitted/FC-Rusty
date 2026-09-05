@@ -30,6 +30,7 @@ pub mod control {
     pub mod cal_led;
     pub mod mag_cal;
     pub mod mixer;
+    pub mod modes;
     pub mod pid;
     pub mod mpc;
     pub mod position;
