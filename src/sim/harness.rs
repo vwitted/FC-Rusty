@@ -7,6 +7,7 @@
 // no_std: this module is compiled into the firmware build too, so it must not
 // read the environment or print. Callers do both. Tracing is a callback.
 
+use crate::attitude_mekf::{AttitudeMekf, MekfParams};
 use crate::control::altitude::{AltitudeController, AltitudeGains};
 use crate::control::mixer::{ControlDemand, QUAD_X};
 use crate::control::mpc::AttitudeMpc;
@@ -263,6 +264,21 @@ pub struct HarnessCfg {
     /// position controller is tilt-clamped to 15 deg, so the claim that
     /// levelling protects the recovery needs evidence.
     pub skip_rescue_levelling: bool,
+    /// Run the firmware's MEKF and feed the controller ITS attitude
+    /// estimate, instead of handing it truth.
+    ///
+    /// Without this the harness has no estimator in the loop, which has two
+    /// consequences it is easy to forget. First, the `accel` degradation
+    /// channel has nothing physical to propagate through, so it is
+    /// currently a stand-in for attitude error rather than the real thing.
+    /// Second, and the reason this exists: the MEKF's accel update treats
+    /// the accelerometer as reading gravity, and sustained lateral
+    /// acceleration violates that. A quad holding 15 deg of tilt carries
+    /// 2.63 m/s2 of unmodelled specific force. Nothing about that is a
+    /// sensor imperfection -- a PERFECT accelerometer misleads the
+    /// estimator identically -- and the sim already computes the correct
+    /// specific force, so this needs plumbing rather than sensor models.
+    pub use_estimator: bool,
 }
 
 impl HarnessCfg {
@@ -280,6 +296,7 @@ impl HarnessCfg {
             pos_hold: false,
             firmware_mode: None,
             skip_rescue_levelling: false,
+            use_estimator: false,
         }
     }
 }
@@ -370,6 +387,19 @@ pub fn run_case(
     };
     let mut primed = false;
 
+    // The firmware's attitude estimator, when we are running it. Primed the
+    // way a real boot converges: repeated accel updates against a level
+    // sample before the flight starts.
+    let mut mekf = h.use_estimator.then(|| {
+        let mut m = AttitudeMekf::new(MekfParams::default());
+        let level_g = [0.0, 0.0, -1.0];
+        for _ in 0..3000 {
+            m.predict([0.0; 3], r.dt);
+            m.update_accel(level_g);
+        }
+        m
+    });
+
     let steps = (h.total_s / r.dt) as usize;
     let mut rate_sp_degs = [0.0f32; 3];
 
@@ -427,15 +457,35 @@ pub fn run_case(
             gyro_lpf[2].apply(gyro_raw[2]),
         ];
 
-        // The accel channel stands in for attitude-ESTIMATE error: this
-        // harness feeds truth angles (there is no estimator in the loop), so
-        // accel noise has nothing physical to propagate through. Treating it
-        // as angle error is the honest interpretation of that knob here.
-        let angle = [
-            truth.angle[0] + (angle_err[0] - truth.accel[0]),
-            truth.angle[1] + (angle_err[1] - truth.accel[1]),
-            truth.angle[2] + (angle_err[2] - truth.accel[2]),
-        ];
+        let angle = if let Some(m) = mekf.as_mut() {
+            // Real estimator: drive it exactly as main.rs does -- predict on
+            // every IMU tick from the filtered gyro, accel update every
+            // ACCEL_DECIMATION-th sample. `angle_err` here is the DEGRADED
+            // specific force in m/s2; the MEKF wants g.
+            m.predict(
+                [gyro[0] * DEG2RAD, gyro[1] * DEG2RAD, gyro[2] * DEG2RAD],
+                r.dt,
+            );
+            if step % r.outer_div == 0 {
+                let g = 9.81;
+                m.update_accel([
+                    angle_err[0] / g,
+                    angle_err[1] / g,
+                    angle_err[2] / g,
+                ]);
+            }
+            let e = m.euler();
+            [e[0] * RAD2DEG, e[1] * RAD2DEG, e[2] * RAD2DEG]
+        } else {
+            // No estimator: the accel channel stands in for attitude-ESTIMATE
+            // error, because it has nothing physical to propagate through.
+            // The honest interpretation of that knob in this mode.
+            [
+                truth.angle[0] + (angle_err[0] - truth.accel[0]),
+                truth.angle[1] + (angle_err[1] - truth.accel[1]),
+                truth.angle[2] + (angle_err[2] - truth.accel[2]),
+            ]
+        };
 
         // Two edges: out to the commanded attitude, then back to level.
         // Skipped under position hold or firmware mode, which own the

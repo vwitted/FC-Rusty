@@ -216,6 +216,10 @@ fn harness_cfg(cfg: &Degradation, r: Rates, dual: bool) -> (HarnessCfg, Tunables
         pos_hold: false,
         firmware_mode: None,
         skip_rescue_levelling: false,
+        // --estimator runs the firmware's MEKF and feeds the controller its
+        // estimate instead of truth. Off by default so committed results
+        // stay reproducible.
+        use_estimator: std::env::args().any(|a| a == "--estimator"),
     };
     (h, tunables())
 }
