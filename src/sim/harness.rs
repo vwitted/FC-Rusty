@@ -161,6 +161,10 @@ pub struct Tunables {
     pub gyro_fc_hz: f32,
     /// Which attitude controller to run.
     pub attitude: AttitudeMode,
+    /// Position controller's max tilt, degrees. Bounds horizontal
+    /// acceleration to g*tan(tilt), and hence cruise and wind-holding
+    /// speed to sqrt(m*a/drag_k).
+    pub pos_max_tilt_deg: f32,
     pub alt: AltitudeGains,
 }
 
@@ -173,6 +177,7 @@ impl Tunables {
             limits: PidLimits { integral_max: 0.3, output_max: 0.5, d_lpf_tau_s: 0.008 },
             gyro_fc_hz: 150.0,
             attitude: AttitudeMode::Mpc,
+            pos_max_tilt_deg: 15.0,
             alt: AltitudeGains { kp: 0.15, kd: 0.1, ki: 0.05 },
         }
     }
@@ -331,13 +336,19 @@ pub fn run_case(
     let mut commanded = false;
     // Runs at the outer rate, which is what main.rs does: pos_ctrl.update
     // sits inside the MPC_PERIOD_US ticker, i.e. 100 Hz.
-    let pos_ctrl = PositionController::new(PositionGains::default());
+    let pos_ctrl = PositionController::new(PositionGains {
+            max_tilt_rad: tun.pos_max_tilt_deg * DEG2RAD,
+            ..PositionGains::default()
+        });
     // Firmware mode logic, when driving it. Its own alt/pos controllers
     // live inside, so the harness's are unused in that path.
     let mut nav_state = h.firmware_mode.map(|_| {
         let mut ns = NavState::new(
             AltitudeController::new(tun.alt, hover_throttle),
-            PositionController::new(PositionGains::default()),
+            PositionController::new(PositionGains {
+            max_tilt_rad: tun.pos_max_tilt_deg * DEG2RAD,
+            ..PositionGains::default()
+        }),
             hover_throttle,
         );
         ns.alt_target = h.target_alt;

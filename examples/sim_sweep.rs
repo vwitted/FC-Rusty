@@ -232,6 +232,9 @@ fn tunables() -> Tunables {
     // --pid swaps the attitude MPC for classic angle mode, to ask whether
     // the MPC earns its compute. ANGLE_KP / ANGLE_MAX_DPS tune it, because
     // comparing a tuned MPC against an untuned PID would prove nothing.
+    if let Some(v) = std::env::var("POS_MAX_TILT_DEG").ok().and_then(|v| v.parse().ok()) {
+        t.pos_max_tilt_deg = v;
+    }
     if std::env::args().any(|a| a == "--pid") {
         t.attitude = AttitudeMode::AnglePid {
             kp: std::env::var("ANGLE_KP").ok().and_then(|v| v.parse().ok())
