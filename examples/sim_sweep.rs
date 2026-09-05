@@ -566,6 +566,7 @@ fn main() {
                           air_frac: 0.0, failures: 0, n: 0, first_fail_t: None,
                           causes: [0; 5] };
         let mut ok = 0usize;
+        let mut bias_max = 0.0f32;
         for sd in 0..seeds {
             let m = run_case(&hw, &tun, Degradation::none(), sd * 7919 + 1, None);
             if let Some((t, c)) = m.failed_at {
@@ -577,6 +578,7 @@ fn main() {
             a.att_rms += m.att_rms; a.alt_rms += m.alt_rms; a.air_frac += m.air_frac;
             a.pos_rms += m.pos_rms;
             a.att_max = a.att_max.max(m.att_max);
+            if m.gyro_bias_dps.is_finite() { bias_max = bias_max.max(m.gyro_bias_dps); }
             ok += 1;
         }
         a.n = seeds as usize;
@@ -584,7 +586,12 @@ fn main() {
             a.att_rms /= ok as f32; a.alt_rms /= ok as f32; a.air_frac /= ok as f32;
             a.pos_rms /= ok as f32;
         }
-        if csv { csv_row("wind_ms", wind, a) } else { row(format!("{:.0}", wind), a) }
+        if csv { csv_row("wind_ms", wind, a) } else {
+            row(format!("{:.0}", wind), a);
+            if bias_max > 0.0 {
+                println!("{:>10}   gyro-bias estimate absorbed: {:.3} deg/s", "", bias_max);
+            }
+        }
     }
 
     // --- asymmetric airframe: one motor down ---

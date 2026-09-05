@@ -98,6 +98,11 @@ pub struct Metrics {
     pub pos_rms: f32,
     pub pos_max: f32,
     pub air_frac: f32,
+    /// Final gyro-bias estimate magnitude, deg/s. Only meaningful with
+    /// `use_estimator`. True bias is zero unless degradation injects one,
+    /// so any value here is the estimator having absorbed something that
+    /// was not drift.
+    pub gyro_bias_dps: f32,
     /// Time at which attitude first came back inside RECOVERY_LEVEL_DEG.
     /// Only meaningful when `initial_attitude_deg` is non-zero.
     pub recovered_at: Option<f32>,
@@ -124,7 +129,8 @@ impl Metrics {
         Self {
             att_rms: f32::NAN, att_max: f32::NAN, alt_rms: f32::NAN,
             pos_rms: f32::NAN, pos_max: f32::NAN,
-            air_frac: f32::NAN, recovered_at: None, alt_min: f32::NAN,
+            air_frac: f32::NAN, gyro_bias_dps: f32::NAN,
+            recovered_at: None, alt_min: f32::NAN,
             failed_at: Some((t, cause)),
         }
     }
@@ -712,6 +718,13 @@ pub fn run_case(
         pos_rms: libm::sqrt(pos_sq / n) as f32,
         pos_max,
         air_frac: air_steps as f32 / steps as f32,
+        gyro_bias_dps: mekf
+            .as_ref()
+            .map(|m| {
+                let b = m.bias();
+                libm::sqrtf(b[0] * b[0] + b[1] * b[1] + b[2] * b[2]) * RAD2DEG
+            })
+            .unwrap_or(f32::NAN),
         recovered_at,
         alt_min,
         failed_at: None,
