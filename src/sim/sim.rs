@@ -71,9 +71,20 @@ impl Default for QuadParams {
 
 /// Full state of the quadcopter.
 ///
-/// 12 states: position (3), velocity (3), attitude (3), angular rate (3)
-/// Attitude is Euler angles in degrees for readability.
-#[derive(Debug, Clone, Default)]
+/// 13 states: position (3), velocity (3), attitude quaternion (4),
+/// angular rate (3).
+///
+/// ATTITUDE IS THE QUATERNION. `roll`/`pitch`/`yaw` are a derived VIEW,
+/// recomputed from `q` every step for readability and for the consumers
+/// that want angles. Euler angles are singular at +/-90 deg pitch, so
+/// storing them made the whole model unusable there -- which is exactly
+/// where recovery-from-extreme-attitude testing lives. With the quaternion
+/// authoritative, only the reported angles degrade at the singularity; the
+/// dynamics never do.
+///
+/// Writing `state.roll` directly no longer changes the aircraft's
+/// attitude. Use `QuadSim::set_attitude_deg`.
+#[derive(Debug, Clone)]
 pub struct QuadState {
     // ---- Position (metres, NED frame) ----
     pub x: f32,
@@ -94,6 +105,43 @@ pub struct QuadState {
     pub roll_rate: f32,
     pub pitch_rate: f32,
     pub yaw_rate: f32,
+
+    // ---- Attitude, authoritative ----
+    /// Body->world rotation as [w, x, y, z]. The Euler fields above are
+    /// derived from this.
+    pub q: [f32; 4],
+}
+
+impl Default for QuadState {
+    fn default() -> Self {
+        Self {
+            x: 0.0, y: 0.0, z: 0.0,
+            vx: 0.0, vy: 0.0, vz: 0.0,
+            roll: 0.0, pitch: 0.0, yaw: 0.0,
+            roll_rate: 0.0, pitch_rate: 0.0, yaw_rate: 0.0,
+            // Identity, NOT zero: a zero quaternion is not a rotation and
+            // derive(Default) would have produced one.
+            q: [1.0, 0.0, 0.0, 0.0],
+        }
+    }
+}
+
+/// Build a body->world unit quaternion from Euler degrees (3-2-1 ZYX).
+fn quat_from_euler_deg(roll: f32, pitch: f32, yaw: f32) -> [f32; 4] {
+    const D2R: f32 = core::f32::consts::PI / 180.0;
+    let r = nalgebra::UnitQuaternion::from_euler_angles(roll * D2R, pitch * D2R, yaw * D2R);
+    let c = r.into_inner();
+    [c.w, c.i, c.j, c.k]
+}
+
+/// Euler degrees (3-2-1 ZYX) from a body->world quaternion.
+fn euler_deg_from_quat(q: [f32; 4]) -> (f32, f32, f32) {
+    const R2D: f32 = 180.0 / core::f32::consts::PI;
+    let u = nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
+        q[0], q[1], q[2], q[3],
+    ));
+    let (r, p, y) = u.euler_angles();
+    (r * R2D, p * R2D, y * R2D)
 }
 
 impl QuadState {
@@ -137,6 +185,12 @@ pub struct QuadSim {
 
 impl QuadSim {
     pub fn new(params: QuadParams, initial_state: QuadState) -> Self {
+        // Sync the quaternion from whatever Euler angles the caller set, so
+        // constructing a tilted initial state still works.
+        let mut initial_state = initial_state;
+        initial_state.q = quat_from_euler_deg(
+            initial_state.roll, initial_state.pitch, initial_state.yaw,
+        );
         Self {
             params,
             state: initial_state,
@@ -156,6 +210,22 @@ impl QuadSim {
             // (thrust exactly cancels gravity). Kinematic accel is 0,0,0.
             last_accel_world: [0.0, 0.0, 0.0],
         }
+    }
+
+    /// Set attitude from Euler degrees, updating the authoritative
+    /// quaternion as well as the derived view.
+    ///
+    /// Needed because writing `state.roll` no longer rotates anything --
+    /// the quaternion is the attitude and the angles are a read-only view
+    /// of it. Silently ignoring such a write would be the worst outcome,
+    /// so anything that used to poke the Euler fields must come through
+    /// here.
+    pub fn set_attitude_deg(&mut self, roll: f32, pitch: f32, yaw: f32) {
+        self.state.q = quat_from_euler_deg(roll, pitch, yaw);
+        let (r, p, y) = euler_deg_from_quat(self.state.q);
+        self.state.roll = r;
+        self.state.pitch = p;
+        self.state.yaw = y;
     }
 
     /// Step the simulation forward by dt seconds.
@@ -254,11 +324,10 @@ impl QuadSim {
         // -Z in body frame (up); rotating it into world NED is the whole
         // coupling between attitude and translation, and getting it right
         // is what makes yaw affect WHICH WAY the aircraft accelerates.
-        use nalgebra::{Rotation3, Vector3};
-        let roll_rad = self.state.roll * D2R;
-        let pitch_rad = self.state.pitch * D2R;
-        let yaw_rad = self.state.yaw * D2R;
-        let rot = Rotation3::from_euler_angles(roll_rad, pitch_rad, yaw_rad);
+        use nalgebra::{Quaternion, UnitQuaternion, Vector3};
+        let rot = UnitQuaternion::from_quaternion(Quaternion::new(
+            self.state.q[0], self.state.q[1], self.state.q[2], self.state.q[3],
+        ));
         let a_thrust = rot * Vector3::new(0.0, 0.0, -total_thrust / p.mass);
 
         // Quadratic drag on airspeed RELATIVE TO THE WIND. Without this the
@@ -286,26 +355,43 @@ impl QuadSim {
         self.state.pitch_rate += pitch_accel_deg * dt;
         self.state.yaw_rate += yaw_accel_deg * dt;
 
-        // Attitude. Body rates are NOT Euler rates -- the old code integrated
-        // them as if they were, which is a small-angle assumption hiding in
-        // the kinematics rather than in the forces. The transform below is
-        // exact; it only breaks at |pitch| = 90 deg, where Euler angles
-        // themselves are singular (see the cos_p guard).
-        let (sr, cr) = (libm::sinf(roll_rad), libm::cosf(roll_rad));
-        let cos_p = libm::cosf(pitch_rad);
-        // Guard the gimbal-lock singularity. Euler STATE cannot represent
-        // it; representing it needs a quaternion state, which is a larger
-        // change. Past ~85 deg pitch, treat results here as unreliable.
-        let cos_p = if cos_p.abs() < 1e-3 { 1e-3f32.copysign(cos_p) } else { cos_p };
-        let tan_p = libm::sinf(pitch_rad) / cos_p;
+        // Attitude: integrate the QUATERNION from body rates.
+        //
+        //     q_dot = 0.5 * q (x) (0, wx, wy, wz)
+        //
+        // This has no singularity, which is the point: the previous
+        // Euler-rate transform blew up at +/-90 deg pitch and had to be
+        // numerically guarded there. Recovery-from-inverted is now a
+        // question the model can actually answer.
+        let (qw, qx, qy, qz) = (
+            self.state.q[0], self.state.q[1], self.state.q[2], self.state.q[3],
+        );
         let (wx, wy, wz) = (w[0], w[1], w[2]); // body rates, rad/s
-        let roll_dot = wx + sr * tan_p * wy + cr * tan_p * wz;
-        let pitch_dot = cr * wy - sr * wz;
-        let yaw_dot = (sr / cos_p) * wy + (cr / cos_p) * wz;
-
-        self.state.roll += roll_dot * R2D * dt;
-        self.state.pitch += pitch_dot * R2D * dt;
-        self.state.yaw += yaw_dot * R2D * dt;
+        let dq = [
+            0.5 * (-qx * wx - qy * wy - qz * wz),
+            0.5 * (qw * wx + qy * wz - qz * wy),
+            0.5 * (qw * wy - qx * wz + qz * wx),
+            0.5 * (qw * wz + qx * wy - qy * wx),
+        ];
+        let mut q = [
+            qw + dq[0] * dt,
+            qx + dq[1] * dt,
+            qy + dq[2] * dt,
+            qz + dq[3] * dt,
+        ];
+        // Renormalise: Euler integration drifts off the unit sphere.
+        let n = libm::sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+        if n > 1e-9 {
+            for c in q.iter_mut() {
+                *c /= n;
+            }
+        }
+        self.state.q = q;
+        // Refresh the derived Euler view.
+        let (r_deg, p_deg, y_deg) = euler_deg_from_quat(q);
+        self.state.roll = r_deg;
+        self.state.pitch = p_deg;
+        self.state.yaw = y_deg;
 
         // Velocity
         self.state.vx += ax * dt;
@@ -541,10 +627,9 @@ mod tests {
         let hover = (p.mass * 9.81) / p.max_thrust;
 
         let mut level = QuadSim::new(p, QuadState::hovering(20.0));
-        level.state.pitch = -15.0;
+        level.set_attitude_deg(0.0, -15.0, 0.0);
         let mut yawed = QuadSim::new(p, QuadState::hovering(20.0));
-        yawed.state.pitch = -15.0;
-        yawed.state.yaw = 90.0;
+        yawed.set_attitude_deg(0.0, -15.0, 90.0);
 
         for _ in 0..400 {
             level.step(&MotorForces { motors: [hover; 4] }, 1.0 / 400.0);
@@ -599,7 +684,7 @@ mod tests {
     fn body_rates_are_transformed_into_euler_rates() {
         let p = hover_params();
         let mut sim = QuadSim::new(p, QuadState::hovering(50.0));
-        sim.state.roll = 90.0;
+        sim.set_attitude_deg(90.0, 0.0, 0.0);
         sim.state.yaw_rate = 20.0; // deg/s about body z
         let before = (sim.state.pitch, sim.state.yaw);
         for _ in 0..100 {
@@ -628,5 +713,85 @@ mod tests {
             "yaw rate should be driven by roll*pitch coupling, moved {}",
             sim.state.yaw_rate - before
         );
+    }
+
+    // ---- What the quaternion state buys ----
+
+    /// A full 360 deg roll must stay finite and come back to level. Under
+    /// the old Euler integration this passed through the +/-90 deg pitch
+    /// singularity guard and the attitude was meaningless on the way round.
+    #[test]
+    fn a_full_barrel_roll_stays_finite_and_returns_to_level() {
+        let p = hover_params();
+        let mut sim = QuadSim::new(p, QuadState::hovering(100.0));
+        let hover = (p.mass * 9.81) / p.max_thrust;
+        // 360 deg/s for exactly one second.
+        sim.state.roll_rate = 360.0;
+        let dt = 1.0 / 8000.0;
+        for _ in 0..8000 {
+            sim.step(&MotorForces { motors: [hover; 4] }, dt);
+            assert!(sim.state.q.iter().all(|c| c.is_finite()), "quaternion went non-finite");
+        }
+        // Back to level, give or take integration error.
+        assert!(
+            sim.state.roll.abs() < 2.0,
+            "after a full roll, roll should be ~0, got {}",
+            sim.state.roll
+        );
+    }
+
+    /// Pitching straight through vertical. The quaternion must stay unit
+    /// and finite even where the Euler VIEW is singular -- the old model
+    /// clamped cos(pitch) here and produced nonsense.
+    #[test]
+    fn pitching_through_vertical_keeps_the_quaternion_unit() {
+        let p = hover_params();
+        let mut sim = QuadSim::new(p, QuadState::hovering(200.0));
+        let hover = (p.mass * 9.81) / p.max_thrust;
+        sim.state.pitch_rate = 180.0; // straight up and over
+        let dt = 1.0 / 8000.0;
+        for _ in 0..8000 {
+            sim.step(&MotorForces { motors: [hover; 4] }, dt);
+            let n = sim.state.q.iter().map(|c| c * c).sum::<f32>().sqrt();
+            assert!((n - 1.0).abs() < 1e-3, "quaternion norm drifted to {n}");
+        }
+    }
+
+    /// Inverted flight: upside down, thrust points at the ground, so the
+    /// aircraft must accelerate DOWNWARD faster than gravity alone. This is
+    /// simply unrepresentable with a guarded Euler model.
+    #[test]
+    fn inverted_thrust_accelerates_downward_faster_than_gravity() {
+        let p = hover_params();
+        let hover = (p.mass * 9.81) / p.max_thrust;
+
+        let mut inverted = QuadSim::new(p, QuadState::hovering(500.0));
+        inverted.set_attitude_deg(180.0, 0.0, 0.0);
+        let mut free = QuadSim::new(p, QuadState::hovering(500.0));
+
+        for _ in 0..200 {
+            inverted.step(&MotorForces { motors: [hover; 4] }, 1.0 / 400.0);
+            free.step(&MotorForces { motors: [0.0; 4] }, 1.0 / 400.0);
+        }
+        // vz is NED, positive down.
+        assert!(
+            inverted.state.vz > free.state.vz,
+            "inverted thrust ({}) must add to gravity, beating free-fall ({})",
+            inverted.state.vz, free.state.vz
+        );
+    }
+
+    /// Setting attitude must actually rotate the aircraft now that the
+    /// quaternion is authoritative -- a direct write to state.roll no
+    /// longer does anything, and silently ignoring it would be the worst
+    /// possible failure.
+    #[test]
+    fn set_attitude_deg_round_trips_through_the_quaternion() {
+        let p = hover_params();
+        let mut sim = QuadSim::new(p, QuadState::hovering(50.0));
+        sim.set_attitude_deg(20.0, -35.0, 110.0);
+        assert!((sim.state.roll - 20.0).abs() < 1e-3, "roll {}", sim.state.roll);
+        assert!((sim.state.pitch + 35.0).abs() < 1e-3, "pitch {}", sim.state.pitch);
+        assert!((sim.state.yaw - 110.0).abs() < 1e-3, "yaw {}", sim.state.yaw);
     }
 }

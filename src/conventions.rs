@@ -105,7 +105,7 @@ mod tests {
         let p = QuadParams::default();
         let hover = (p.mass * 9.81) / p.max_thrust;
         let mut sim = QuadSim::new(p, QuadState::hovering(50.0));
-        sim.state.pitch = 20.0; // nose up
+        sim.set_attitude_deg(0.0, 20.0, 0.0); // nose up
         for _ in 0..400 {
             sim.step(&MotorForces { motors: [hover; 4] }, 1.0 / 400.0);
         }
@@ -117,7 +117,7 @@ mod tests {
         let p = QuadParams::default();
         let hover = (p.mass * 9.81) / p.max_thrust;
         let mut sim = QuadSim::new(p, QuadState::hovering(50.0));
-        sim.state.roll = 20.0; // right wing down
+        sim.set_attitude_deg(20.0, 0.0, 0.0); // right wing down
         for _ in 0..400 {
             sim.step(&MotorForces { motors: [hover; 4] }, 1.0 / 400.0);
         }
