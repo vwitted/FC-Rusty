@@ -111,6 +111,7 @@ use control::pid::{PidGains, PidLimits, RatePidController};
 use control::position::{PositionController, PositionGains};
 use drivers::baro::{self, BaroSample};
 use drivers::crsf::RcChannels;
+use drivers::dshot_bb_decode::BbTelemetry;
 use drivers::lis2mdl::Lis2mdl;
 use drivers::mag::{MagError, MagSample, Orientation as MagOrientation};
 use drivers::qmc5883l::Qmc5883l;
@@ -2533,6 +2534,15 @@ async fn navigation_task() {
 // Reads the latest target rates and thrust from the outer loop, runs
 // the rate PID, and pushes commands to the ESCs via DShot.
 
+/// Frames between bidir-telemetry health reports. 8000 at 8 kHz is 1 Hz.
+///
+/// Counted in frames rather than timed, so the report is also a check on
+/// the loop actually running at the rate it claims: if this line appears
+/// twice a second, the loop is at 16 kHz, and if it appears every two
+/// seconds it is at 4 kHz.
+#[cfg(feature = "firmware")]
+const TELEM_REPORT_FRAMES: u32 = 8000;
+
 async fn control_loop(mut dshot: DshotBitbang<'static>) -> ! {
     defmt::info!("Fast inner loop started (8 kHz synced to IMU_DATA)");
 
@@ -2565,6 +2575,14 @@ async fn control_loop(mut dshot: DshotBitbang<'static>) -> ! {
     // arming, so an armed quad on the ground can't spin up on stick input.
     const AIRMODE_ACTIVATE_THROTTLE: f32 = 0.05; // 5% collective
     let mut airmode_gate = AirmodeGate::new();
+
+    // Bidir DShot telemetry health, accumulated between reports. See the
+    // report site below for why this is a rate rather than a sample.
+    let mut telem_frames: u32 = 0;
+    let mut telem_ok = [0u32; 4];
+    let mut telem_nosig = [0u32; 4];
+    let mut telem_bad = [0u32; 4];
+    let mut telem_last_period = [0u32; 4];
 
     loop {
         // Wait for the next 8 kHz IMU sample
@@ -2624,20 +2642,55 @@ async fn control_loop(mut dshot: DshotBitbang<'static>) -> ! {
             if DSHOT_BIDIR {
                 let telemetry = dshot.send_and_decode(frames).await;
 
-                // Telemetry log at ~10 Hz (every 800 frames at 8 kHz). Each
-                // per-motor result is Erpm{period_us} / NoSignal / InvalidGcr
-                // / InvalidCrc — the key signal that bidir RX is decoding.
-                use core::sync::atomic::{AtomicU32, Ordering};
-                static TELEM_LOG_N: AtomicU32 = AtomicU32::new(0);
-                let n = TELEM_LOG_N.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-                if n.is_multiple_of(800) {
+                // Aggregate, once a second, not four raw enums ten times a
+                // second.
+                //
+                // Two reasons. The logger busy-waits on USART6 TXE
+                // (~87 us/byte) inside a critical_section, so every line
+                // here masks interrupts for milliseconds -- in the 8 kHz
+                // loop that drops ~20 iterations, and IMU_DATA is a
+                // latest-value Signal, so the gyro samples produced during
+                // the stall are gone. dshot_bitbang.rs carries this warning
+                // about its bench RX probe; the same arithmetic applied here
+                // and to the flight path.
+                //
+                // And a 10 Hz spot sample of four enums answers a worse
+                // question than a rate does. "M4 InvalidCrc" once tells you
+                // nothing; "M4 ok=7994 crc=6" tells you the link is
+                // essentially healthy, and "ok=0 nosig=8000" tells you it is
+                // not wired.
+                telem_frames = telem_frames.wrapping_add(1);
+                for (i, t) in telemetry.iter().enumerate() {
+                    match t {
+                        BbTelemetry::Erpm { period_us } => {
+                            telem_ok[i] = telem_ok[i].wrapping_add(1);
+                            telem_last_period[i] = *period_us;
+                        }
+                        BbTelemetry::NoSignal => {
+                            telem_nosig[i] = telem_nosig[i].wrapping_add(1)
+                        }
+                        // GCR and CRC failures are both "arrived but did not
+                        // reconstruct" and are counted together; telling them
+                        // apart is what the dshot-rx-probe feature is for.
+                        BbTelemetry::InvalidGcr | BbTelemetry::InvalidCrc => {
+                            telem_bad[i] = telem_bad[i].wrapping_add(1)
+                        }
+                    }
+                }
+                if telem_frames >= TELEM_REPORT_FRAMES {
                     defmt::info!(
-                        "DShot RX: M1={=?} M2={=?} M3={=?} M4={=?}",
-                        telemetry[0],
-                        telemetry[1],
-                        telemetry[2],
-                        telemetry[3],
+                        "DShot RX {=u32} frames: ok[{=u32},{=u32},{=u32},{=u32}] nosig[{=u32},{=u32},{=u32},{=u32}] bad[{=u32},{=u32},{=u32},{=u32}] period_us[{=u32},{=u32},{=u32},{=u32}]",
+                        telem_frames,
+                        telem_ok[0], telem_ok[1], telem_ok[2], telem_ok[3],
+                        telem_nosig[0], telem_nosig[1], telem_nosig[2], telem_nosig[3],
+                        telem_bad[0], telem_bad[1], telem_bad[2], telem_bad[3],
+                        telem_last_period[0], telem_last_period[1],
+                        telem_last_period[2], telem_last_period[3],
                     );
+                    telem_frames = 0;
+                    telem_ok = [0; 4];
+                    telem_nosig = [0; 4];
+                    telem_bad = [0; 4];
                 }
             } else {
                 dshot.send(frames).await;

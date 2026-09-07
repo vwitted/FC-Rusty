@@ -65,6 +65,19 @@ firmware = [
 # keeps `firmware` on. No extra deps of its own.
 motor-test = []
 
+# Per-frame bidirectional-DShot RX instrumentation: run lengths, edge
+# positions and transition counts for every reply, dumped over defmt.
+#
+# This is what was used to find the bidir decode bug, and it is kept for
+# the next time that path misbehaves -- but it is OFF by default, and not
+# implied by `motor-test`. It logs from inside the DShot send loop through
+# a logger that busy-waits on USART6 TXE inside a critical section, so it
+# holds interrupts off for milliseconds at a time. That is tolerable when
+# the probe IS the experiment and ruinous for any other measurement taken
+# on the same build -- including the plant capture, which shares the
+# motor-test loop.
+dshot-rx-probe = []
+
 # Bench-only self-test for the persist flash store (sub-project A).
 # On boot: logs the pre-write read, then writes a known marker Config.
 # Power-cycle and re-flash-free reboot should then read the marker back,
