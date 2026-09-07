@@ -17,6 +17,7 @@
 // at init and on each read so it can be shared with the onboard
 // SPL06 baro on the same I2C peripheral.
 
+use super::mag::{MagError, MagSample, Orientation};
 use embassy_stm32::i2c::{Error as I2cError, I2c, Master};
 use embassy_stm32::mode::Blocking;
 use embassy_time::{Duration, Timer};
@@ -91,78 +92,19 @@ pub const SENS_UT_PER_LSB:     f32 = 0.15;
 /// compensation internally via COMP_TEMP_EN.
 pub const TEMP_LSB_PER_C: f32 = 8.0;
 
-// ---- Board orientation ----
+// ---- Board orientation and sample type ----
+//
+// Both now live in `super::mag`, shared with the QMC5883L on the SE100
+// GPS module, because everything downstream (MAG_DATA, MagCalibrator,
+// AttitudeMekf::update_mag) consumes `MagSample::ut()` and must not care
+// which part produced it. The only per-chip difference is the scale,
+// which the sample now carries.
 
-/// How the LIS2MDL is mounted relative to the FC body frame (NED).
-/// Same shape as the IMU drivers so downstream fusion code doesn't
-/// need to special-case the magnetometer.
-#[derive(Clone, Copy, Debug, defmt::Format)]
-pub enum Orientation {
-    /// No axis flips — sensor frame == body frame (NED).
-    Identity,
-    /// Roll 180°: X → +X, Y → −Y, Z → −Z.
-    Roll180,
-    /// Pitch 180°: X → −X, Y → +Y, Z → −Z.
-    Pitch180,
-    /// Yaw 180°: X → −X, Y → −Y, Z → +Z.
-    Yaw180,
-}
-
-impl Orientation {
-    pub const fn sign(self) -> [f32; 3] {
-        match self {
-            Self::Identity => [ 1.0,  1.0,  1.0],
-            Self::Roll180  => [ 1.0, -1.0, -1.0],
-            Self::Pitch180 => [-1.0,  1.0, -1.0],
-            Self::Yaw180   => [-1.0, -1.0,  1.0],
-        }
-    }
-}
-
-// ---- Public sample type ----
-
-#[derive(Clone, Copy, Debug, defmt::Format)]
-pub struct MagSample {
-    pub raw: [i16; 3],
-    sign: [f32; 3],
-}
-
-impl MagSample {
-    /// Field in microtesla, rotated into FC body frame (NED).
-    pub fn ut(&self) -> [f32; 3] {
-        [
-            self.raw[0] as f32 * SENS_UT_PER_LSB * self.sign[0],
-            self.raw[1] as f32 * SENS_UT_PER_LSB * self.sign[1],
-            self.raw[2] as f32 * SENS_UT_PER_LSB * self.sign[2],
-        ]
-    }
-
-    /// Field in mgauss, rotated into FC body frame (NED).
-    pub fn mgauss(&self) -> [f32; 3] {
-        [
-            self.raw[0] as f32 * SENS_MGAUSS_PER_LSB * self.sign[0],
-            self.raw[1] as f32 * SENS_MGAUSS_PER_LSB * self.sign[1],
-            self.raw[2] as f32 * SENS_MGAUSS_PER_LSB * self.sign[2],
-        ]
-    }
-
-    /// Field in µT, sensor native frame — diagnostic / calibration use.
-    pub fn ut_sensor(&self) -> [f32; 3] {
-        [
-            self.raw[0] as f32 * SENS_UT_PER_LSB,
-            self.raw[1] as f32 * SENS_UT_PER_LSB,
-            self.raw[2] as f32 * SENS_UT_PER_LSB,
-        ]
-    }
-}
-
-#[derive(Debug, defmt::Format)]
-pub enum InitError {
-    I2c,
-    WhoAmIMismatch(u8),
-}
-
-impl From<I2cError> for InitError {
+// Errors are `mag::MagError`, shared with the QMC5883L: the caller
+// probes both parts and must be able to treat "this one isn't here" the
+// same way regardless of which it asked. WhoAmIMismatch became
+// MagError::IdMismatch.
+impl From<I2cError> for MagError {
     fn from(_: I2cError) -> Self { Self::I2c }
 }
 
@@ -182,14 +124,14 @@ impl Lis2mdl {
     pub async fn init(
         i2c: &mut I2c<'_, Blocking, Master>,
         orient: Orientation,
-    ) -> Result<Self, InitError> {
+    ) -> Result<Self, MagError> {
         let addr = I2C_ADDR;
 
         // Sanity check before touching CFG. WHO_AM_I is constant 0x40.
         let mut id = [0u8; 1];
         i2c.blocking_write_read(addr, &[REG_WHO_AM_I], &mut id)?;
         if id[0] != WHO_AM_I_VALUE {
-            return Err(InitError::WhoAmIMismatch(id[0]));
+            return Err(MagError::IdMismatch(id[0]));
         }
 
         // Soft reset clears CFG/user registers; flash trim is preserved
@@ -217,18 +159,19 @@ impl Lis2mdl {
     pub fn read(
         &self,
         i2c: &mut I2c<'_, Blocking, Master>,
-    ) -> Result<MagSample, InitError> {
+    ) -> Result<MagSample, MagError> {
         let mut buf = [0u8; 6];
         i2c.blocking_write_read(self.addr, &[REG_OUTX_L | SUB_AUTO_INC], &mut buf)?;
 
-        Ok(MagSample {
-            raw: [
+        Ok(MagSample::new(
+            [
                 i16::from_le_bytes([buf[0], buf[1]]),
                 i16::from_le_bytes([buf[2], buf[3]]),
                 i16::from_le_bytes([buf[4], buf[5]]),
             ],
-            sign: self.orientation.sign(),
-        })
+            SENS_UT_PER_LSB,
+            self.orientation.sign(),
+        ))
     }
 
     /// Read the internal die-temperature sensor (°C, approximate —
@@ -237,7 +180,7 @@ impl Lis2mdl {
     pub fn read_temp_c(
         &self,
         i2c: &mut I2c<'_, Blocking, Master>,
-    ) -> Result<f32, InitError> {
+    ) -> Result<f32, MagError> {
         let mut buf = [0u8; 2];
         i2c.blocking_write_read(self.addr, &[REG_TEMP_L | SUB_AUTO_INC], &mut buf)?;
         let raw = i16::from_le_bytes([buf[0], buf[1]]);
@@ -249,7 +192,7 @@ impl Lis2mdl {
     pub fn data_ready(
         &self,
         i2c: &mut I2c<'_, Blocking, Master>,
-    ) -> Result<bool, InitError> {
+    ) -> Result<bool, MagError> {
         let mut buf = [0u8; 1];
         i2c.blocking_write_read(self.addr, &[REG_STATUS], &mut buf)?;
         Ok(buf[0] & STATUS_ZYXDA != 0)

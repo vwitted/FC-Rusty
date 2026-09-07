@@ -62,6 +62,8 @@ mod drivers {
     pub mod icm42688;
     pub mod ism6hg256x;
     pub mod lis2mdl;
+    pub mod mag;
+    pub mod qmc5883l;
     pub mod orientation;
     pub mod nmea;
     pub mod ubx;
@@ -108,7 +110,9 @@ use control::pid::{PidGains, PidLimits, RatePidController};
 use control::position::{PositionController, PositionGains};
 use drivers::baro::{self, BaroSample};
 use drivers::crsf::RcChannels;
-use drivers::lis2mdl::{Lis2mdl, MagSample, Orientation as MagOrientation};
+use drivers::lis2mdl::Lis2mdl;
+use drivers::mag::{MagError, MagSample, Orientation as MagOrientation};
+use drivers::qmc5883l::Qmc5883l;
 use drivers::dshot_bitbang::DshotBitbang;
 use drivers::dshot_frame::DshotFrame;
 use drivers::icm42688::RawImu;
@@ -571,6 +575,86 @@ async fn blink_task(mut led: embassy_stm32::gpio::Output<'static>) {
 }
 
 // ---- Persist Task ----
+/// Whichever magnetometer is actually fitted.
+///
+/// Two are supported and they are not alternatives in the "pick one in a
+/// config" sense -- they live on different boards. The LIS2MDL is the
+/// breakout on the FC; the QMC5883L is inside the Radiolink SE100 GPS
+/// module. Either, both or neither may be plugged in on a given day, and
+/// the addresses do not collide (0x1E vs 0x0D), so the honest thing is to
+/// ask the bus rather than to carry a build flag someone will forget to
+/// flip.
+///
+/// Downstream sees only `MagSample`, so nothing past this enum knows or
+/// cares which part answered.
+enum Compass {
+    Lis2mdl(Lis2mdl),
+    Qmc5883l(Qmc5883l),
+}
+
+/// The shared I2C1 handle as the baro/mag task owns it: blocking master.
+type MagBus<'a> = embassy_stm32::i2c::I2c<'a, embassy_stm32::mode::Blocking, embassy_stm32::i2c::Master>;
+
+impl Compass {
+    /// Try each supported part in turn; return the first that answers.
+    ///
+    /// Order is deliberate: the LIS2MDL is soldered to the FC and the
+    /// QMC5883L arrives on a cable, so if both are present the fixed one
+    /// wins. A part on a GPS mast has a better magnetic environment but
+    /// an unknown orientation, which is the opposite trade and not one to
+    /// make silently.
+    ///
+    /// ORIENTATION IS UNVERIFIED FOR THE SE100. Identity is a placeholder
+    /// for both parts: this firmware has never flown, and the mounting of
+    /// the QMC5883L inside the SE100 relative to the airframe has not
+    /// been checked on the bench. A wrong Orientation here does not
+    /// degrade yaw, it inverts or mirrors it. Confirm against the
+    /// magnitude and axis signs logged below before trusting heading.
+    async fn probe(i2c: &mut MagBus<'_>) -> Option<Self> {
+        match Lis2mdl::init(i2c, MagOrientation::Identity).await {
+            Ok(d) => {
+                defmt::info!("Magnetometer: LIS2MDL online @ 100 Hz (I2C 0x1E)");
+                return Some(Self::Lis2mdl(d));
+            }
+            Err(e) => defmt::info!("Magnetometer: no LIS2MDL ({:?}), trying QMC5883L", e),
+        }
+
+        match Qmc5883l::init(i2c, MagOrientation::Identity).await {
+            Ok(d) => {
+                defmt::info!("Magnetometer: QMC5883L online @ 200 Hz (I2C 0x0D, SE100)");
+                let c = Self::Qmc5883l(d);
+                // One reading at init, purely so bring-up has a number to
+                // judge. Earth's field is 25-65 uT everywhere on the
+                // surface; anything outside that is a scale or wiring
+                // fault, and it is far cheaper to see it here than to
+                // discover it as a slow yaw error in flight.
+                if let Ok(s) = c.read(i2c) {
+                    let v = s.ut();
+                    defmt::info!(
+                        "Magnetometer: |B| = {=f32} uT, body [{=f32}, {=f32}, {=f32}] uT (expect 25-65 uT)",
+                        s.magnitude_ut(), v[0], v[1], v[2],
+                    );
+                }
+                Some(c)
+            }
+            Err(e) => {
+                defmt::warn!(
+                    "Magnetometer: none found ({:?}) — continuing without mag (yaw will drift)",
+                    e,
+                );
+                None
+            }
+        }
+    }
+
+    fn read(&self, i2c: &mut MagBus<'_>) -> Result<MagSample, MagError> {
+        match self {
+            Self::Lis2mdl(d) => d.read(i2c),
+            Self::Qmc5883l(d) => d.read(i2c),
+        }
+    }
+}
+
 // Owns the flash handle; writes a completed magnetometer calibration to
 // the persist store. Triggered only by cal completion, which is
 // disarmed-only — so the multi-second sector erase happens on the ground.
@@ -1793,35 +1877,22 @@ async fn baro_task(
         // against the boot-time init budget.
         init_failures = 0;
 
-        // ---- LIS2MDL magnetometer (same bus, optional) ----
+        // ---- Magnetometer (same bus, optional) ----
         // The mag shares I2C1 with the baro. We init it here so it can't
         // get stuck waiting for the bus owner — if absent or DOA, we
         // continue without mag fusion (yaw stays unobservable in the
-        // MEKF, exactly the pre-magnetometer behaviour). The chip is in
-        // 100 Hz continuous mode after init, so we just poll it once per
-        // tick (125 Hz) and let the chip's own ODR cap effective rate.
-        // Orientation::Identity is correct for the LIS2MDL breakout
-        // soldered with its X+ aligned to body forward; revise here if
-        // the airframe mounts it differently.
-        let mag = match Lis2mdl::init(&mut i2c, MagOrientation::Identity).await {
-            Ok(d) => {
-                defmt::info!("LIS2MDL magnetometer online @ 100 Hz");
-                Some(d)
-            }
-            Err(e) => {
-                defmt::warn!(
-                    "LIS2MDL init failed: {:?} — continuing without mag (yaw will drift)",
-                    e,
-                );
-                None
-            }
-        };
+        // MEKF, exactly the pre-magnetometer behaviour). Both supported
+        // parts run continuous conversion after init, so we just poll
+        // once per tick (125 Hz) and let the chip's own ODR cap the
+        // effective rate.
+        let mag = Compass::probe(&mut i2c).await;
 
         // ---- Read loop ----
         // SPL06 configured at 128 Hz; tick at 8 ms (125 Hz) to consume
-        // each new sample without skipping. LIS2MDL is 100 Hz so polling
-        // at 125 Hz yields ~20% duplicate samples — harmless, the MEKF
-        // does a try_take and just skips when no new data arrived.
+        // each new sample without skipping. The LIS2MDL runs at 100 Hz so
+        // polling at 125 Hz yields ~20% duplicate samples; the QMC5883L
+        // runs at 200 Hz so we undersample it instead. Both are harmless
+        // — the MEKF does a try_take and skips when no new data arrived.
         let mut ticker = Ticker::every(Duration::from_millis(8)); // 125 Hz
         let mut reads: u32 = 0;
         let mut errs: u32 = 0;
