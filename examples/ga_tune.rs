@@ -40,6 +40,7 @@ use fc_rusty::sim::harness::{
 };
 use fc_rusty::sim::sensors::Rng;
 use fc_rusty::sim::QuadParams;
+use core::derive;
 
 /// Flights are shorter than the sweep's 10 s: both disturbances land by 5 s,
 /// and 8 s leaves 3 s of settling to score. The GA runs thousands of these.

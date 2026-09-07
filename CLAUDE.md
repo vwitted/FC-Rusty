@@ -4,6 +4,17 @@ This file is loaded automatically into every Claude Code session
 working on FC-Rusty. Keep it short and durable — conversational
 state belongs in Claude's memory, not here.
 
+## Environment
+This machine is Windows. Use PowerShell-compatible commands, not Git Bash heredocs or POSIX globs. When writing multi-line files, use the Write tool instead of `cat <<EOF`. Quote and escape Windows paths (`C:\Users\...`) explicitly, and never rely on shell glob expansion for `--exclude`/upload path arguments.
+
+## Conventions
+ Always state and verify conventions, including both firmware-based conventions (like idle high vs. low), and physics/conceptual conventions (body vs. world frame) before implementing dev work. 
+
+## Verification
+Do not claim a change works until it has been verified by actually running it (compile, execute the endpoint, hit the deployed URL, or check the build log). If verification is not possible, say so explicitly rather than asserting success.
+
+## Assertions
+When making assertions - especially bold assertions or that existing code/logic/theory is erroneous - verify and surface  in the conversation only with evidence and specific codebase references. 
 ---
 
 ## What this project is
@@ -30,11 +41,11 @@ Keep logging material changes there when they land — verified
 peripheral, commit that changes control behaviour, killed sensor,
 new backlog item. The running record is useful.
 
-But **never infer current behaviour from these docs.** Parts are
+But **never infer current behaviour from informational docs/logging items** Parts are
 stale, and parts were aspirational or never true (this has already
-misled an outside reviewer into "fixing" bugs that didn't exist).
-Verify behaviour against the code. This file (CLAUDE.md) is the only
-doc kept short, curated, and trustworthy.
+misled an outside reviewer into "fixing" bugs that didn't exist). 
+Be skeptical of stale code comments that have pre-date code changes in the file. 
+Verify behaviour against the code. This file (CLAUDE.md) is the only doc kept short, curated, and trustworthy.
 
 **Comments:** keep the *why* — rationale, hazards, conventions,
 current pin/sensor mappings. Delete or fix comments that assert a
@@ -49,12 +60,7 @@ is what prevents regressions.
   short-circuits the MCU's PMOS through the slave's NMOS. This
   killed the onboard DPS310 on 2026-04-20. Never `Output::new` on
   an I2C pin.
-
-- **The ESC 'V' pad is Vbat (11–25 V LiPo), not 5 V.** Bridging it
-  to the FC's 5 V rail has already destroyed a previous dev board,
-  the GPS, and the ST-Link. If you're writing code or docs that
-  touch ESC wiring, carry this warning forward.
-
+  
 ### DShot
 
 - **DShot is bit-banged, not timer output-compare.** BF resolves
