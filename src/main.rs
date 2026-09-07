@@ -506,10 +506,9 @@ async fn main(spawner: Spawner) {
     // can be found; `gps_task` then negotiates UBX at 115200 and moves
     // this UART with it. See `drivers::ubx::configure`.
     //
-    // If a module turns up that ships at some other rate (38400 is the
-    // other common one), configure() probes only 115200 and 9600 and
-    // will report silence. That is a bench finding, not a guess to
-    // encode here.
+    // configure() probes 115200, 9600 and 38400 — the two u-blox factory
+    // defaults plus wherever a previous boot left it. Anything else
+    // reports silence and falls back to NMEA.
     let gps_uart_config = {
         let mut c = usart::Config::default();
         c.baudrate = 9600;

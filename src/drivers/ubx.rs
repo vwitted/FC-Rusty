@@ -419,71 +419,115 @@ pub const NAV_RATE_MS: u16 = 100;
 /// Target UART baud after `configure()` completes.
 pub const TARGET_BAUD: u32 = 115_200;
 
-/// Factory-default baud rate for u-blox modules.
+/// Factory-default baud rate for u-blox M8 modules, and what the M8
+/// build of the Radiolink SE100 ships at.
 pub const FACTORY_BAUD: u32 = 9600;
 
-/// Listen for ~500ms at the current baud and report what was seen.
+/// The other factory default worth probing: u-blox M10 modules ship at
+/// 38400, and the M10 SE100 is externally indistinguishable from the M8
+/// one. Cheaper to try than to open the case.
+pub const ALT_FACTORY_BAUD: u32 = 38_400;
+
+/// Candidate baud rates, in probe order.
 ///
-/// Distinguishes three outcomes so the caller can decide what to do:
-/// - `Ubx`: a valid UBX frame parsed fully (module already UBX-configured).
-/// - `NmeaOrSync`: we saw a UBX sync byte (0xB5) or an NMEA start ($)
-///   but didn't complete a UBX frame — the module is alive at this
-///   baud but streaming NMEA (factory default on most u-blox units).
-/// - `Silent`: no recognisable GPS bytes within the window (wrong
-///   baud or module silent / misrouted).
+/// 115200 first because that is where a module configured by a previous
+/// boot already is, and finding it there costs one window instead of
+/// three.
+///
+/// Then both factory defaults. 9600 is the u-blox M8 default and what
+/// the SE100's M8 build ships at; 38400 is the M10 default, and the M10
+/// SE100 is externally identical. You cannot tell which you have without
+/// opening it, so the firmware asks instead of assuming.
+pub const CANDIDATE_BAUDS: [u32; 3] = [TARGET_BAUD, FACTORY_BAUD, ALT_FACTORY_BAUD];
+
+/// How long to listen at each candidate baud.
+///
+/// Has to exceed one solution period, because an unconfigured receiver
+/// emits its whole sentence set in a burst once per second and a shorter
+/// window can land entirely in the gap and call a live module silent.
+/// 1200 ms covers a 1 Hz burst with margin. A module that IS at the baud
+/// being tried usually answers well inside this -- the window only runs
+/// to completion when the guess was wrong.
+pub const PROBE_WINDOW_MS: u64 = 1200;
+
+/// What was heard at a given baud.
+///
+/// The distinction that matters is CHECKSUM-VALID or nothing. An earlier
+/// version accepted a single 0xB5 or '$' byte as evidence of life, which
+/// does not survive contact with a baud mismatch: a receiver transmitting
+/// at 9600 while we listen at 115200 produces a continuous stream of
+/// framing garbage, and over a window of several thousand bytes the odds
+/// of never seeing one of two specific byte values are negligible. The
+/// probe would lock onto the wrong rate almost every time it guessed
+/// wrong -- and the more candidate bauds there are, the more chances it
+/// gets to be wrong. Both arms below now require a frame whose checksum
+/// verifies, which garbage does not produce.
 #[cfg(feature = "firmware")]
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum ProbeResult { Ubx, NmeaOrSync, Silent }
+enum ProbeResult {
+    /// A complete UBX frame parsed and its Fletcher-16 checked out.
+    Ubx,
+    /// A complete NMEA sentence parsed and its XOR checksum checked out.
+    Nmea,
+    /// Nothing intelligible within the window.
+    Silent,
+}
 
 #[cfg(feature = "firmware")]
 async fn probe_for_data(
     rx: &mut embassy_stm32::usart::UartRx<'_, embassy_stm32::mode::Async>,
 ) -> ProbeResult {
-    use embassy_time::{Duration, Instant, with_timeout};
+    use embassy_time::{with_timeout, Duration, Instant};
 
-    let mut parser = UbxParser::new();
+    let mut ubx = UbxParser::new();
+    let mut nmea = super::nmea::NmeaParser::new();
     let mut buf = [0u8; 64];
-    let deadline = Instant::now() + Duration::from_millis(500);
-    let mut saw_hint = false;
+    let deadline = Instant::now() + Duration::from_millis(PROBE_WINDOW_MS);
 
     while Instant::now() < deadline {
         let timeout = deadline - Instant::now();
         match with_timeout(timeout, rx.read(&mut buf)).await {
             Ok(Ok(())) => {
                 for &byte in &buf {
-                    if parser.push_byte(byte).is_some() {
+                    if ubx.push_byte(byte).is_some() {
                         return ProbeResult::Ubx;
                     }
-                    // 0xB5 = UBX sync1, '$' = NMEA sentence start.
-                    // Either is strong evidence the module is alive
-                    // at this baud; neither is likely to appear in
-                    // random noise from a baud mismatch.
-                    if byte == SYNC_1 || byte == b'$' {
-                        saw_hint = true;
+                    if nmea.push_byte(byte).is_some() {
+                        return ProbeResult::Nmea;
                     }
                 }
             }
+            // A UART framing/overrun error is itself a signature of a
+            // baud mismatch, but not a reliable one (a disconnected line
+            // is simply quiet), so it ends this attempt and the caller
+            // moves to the next candidate rate.
             _ => break,
         }
     }
-    if saw_hint { ProbeResult::NmeaOrSync } else { ProbeResult::Silent }
+    ProbeResult::Silent
 }
 
-/// Auto-detect the module's current baud and leave the UART at
-/// `TARGET_BAUD` if the module is alive.
+/// Find the module, put it on `TARGET_BAUD` speaking UBX only, and set
+/// the solution rate.
 ///
-/// - If the module is already at 115200 (persisted from a prior
-///   session, or for some units that ship configured higher):
-///   returns 115200 immediately.
-/// - If at factory 9600: sends CFG-PRT to switch the module to
-///   115200, then bumps the UART to match. u-blox modules change
-///   baud immediately on CFG-PRT acknowledgement (unlike WT901B
-///   which requires a power cycle), so we keep using the new rate
-///   this session. We deliberately do NOT issue CFG-CFG save,
-///   because on some modules the setting doesn't persist across
-///   cold boots reliably — configuring every boot is cheaper than
-///   debugging "why is it 9600 again after unplugging".
-/// - If no data at either baud: logs a warning and returns 0.
+/// Returns the baud the link ends up on, or 0 if nothing answered at any
+/// candidate rate -- in which case the caller's NMEA fallback is still
+/// live and behaves as it did before.
+///
+/// Every successful path ends the same way: CFG-PRT to pin baud and
+/// UBX-only output, then `enable_nav_pvt`. Including the case where the
+/// module was ALREADY at 115200 speaking UBX, which the previous version
+/// returned from immediately. That shortcut assumed a module found in
+/// UBX had been configured by us, and since CFG-RATE became load-bearing
+/// the assumption is no longer safe: a module set up by u-center at its
+/// 1 Hz default would have been accepted as correct and would silently
+/// starve gps_accel of the rate it needs. These commands are idempotent
+/// and cost a few hundred milliseconds once at boot.
+///
+/// CFG-CFG (save to flash) is deliberately NOT sent: on some modules it
+/// does not persist across cold boots reliably, and configuring every
+/// boot is cheaper than debugging "why is it 9600 again after
+/// unplugging".
 #[cfg(feature = "firmware")]
 pub async fn configure(
     tx: &mut embassy_stm32::usart::UartTx<'static, embassy_stm32::mode::Async>,
@@ -494,72 +538,52 @@ pub async fn configure(
     // Give the module time to boot and start streaming after power-on.
     Timer::after(Duration::from_millis(500)).await;
 
-    // ---- Phase 1: try TARGET_BAUD first ----
-    tx.set_baudrate(TARGET_BAUD).unwrap();
-    rx.set_baudrate(TARGET_BAUD).unwrap();
-    Timer::after(Duration::from_millis(50)).await;
+    for &baud in CANDIDATE_BAUDS.iter() {
+        tx.set_baudrate(baud).unwrap();
+        rx.set_baudrate(baud).unwrap();
+        Timer::after(Duration::from_millis(50)).await;
 
-    match probe_for_data(rx).await {
-        ProbeResult::Ubx => {
-            defmt::info!("GPS: detected UBX at {} baud", TARGET_BAUD);
-            return TARGET_BAUD;
+        let found = probe_for_data(rx).await;
+        if found == ProbeResult::Silent {
+            defmt::info!("GPS: nothing at {} baud", baud);
+            continue;
         }
-        ProbeResult::NmeaOrSync => {
-            defmt::info!(
-                "GPS: alive at {} but emitting NMEA — switching to UBX-only",
-                TARGET_BAUD,
-            );
-            // CFG-PRT carries both baud and outProtoMask; reuse it
-            // to force UBX-only output at the same rate.
-            let mut frame = [0u8; 28];
-            let n = cfg::set_uart_baud(&mut frame, TARGET_BAUD);
-            let _ = tx.write(&frame[..n]).await;
+
+        defmt::info!(
+            "GPS: module found at {} baud speaking {}",
+            baud,
+            if found == ProbeResult::Ubx { "UBX" } else { "NMEA" },
+        );
+
+        // CFG-PRT carries baud AND the protocol masks, so this both moves
+        // the module to TARGET_BAUD and restricts it to UBX output. Sent
+        // even when baud already equals TARGET_BAUD, for the masks.
+        let mut frame = [0u8; 28];
+        let n = cfg::set_uart_baud(&mut frame, TARGET_BAUD);
+        let _ = tx.write(&frame[..n]).await;
+
+        // u-blox modules switch as soon as the command is accepted, so
+        // let the ACK drain at the OLD rate before following it.
+        Timer::after(Duration::from_millis(100)).await;
+        if baud != TARGET_BAUD {
+            tx.set_baudrate(TARGET_BAUD).unwrap();
+            rx.set_baudrate(TARGET_BAUD).unwrap();
             Timer::after(Duration::from_millis(100)).await;
-            enable_nav_pvt(tx).await;
-            return TARGET_BAUD;
         }
-        ProbeResult::Silent => {}
+
+        // Factory configs enable no UBX messages at all, only NMEA, so
+        // the module is silent on UBX until this.
+        enable_nav_pvt(tx).await;
+        return TARGET_BAUD;
     }
 
-    // ---- Phase 2: fall back to factory 9600 ----
-    defmt::info!("GPS: no data at {}, trying {}", TARGET_BAUD, FACTORY_BAUD);
-    tx.set_baudrate(FACTORY_BAUD).unwrap();
-    rx.set_baudrate(FACTORY_BAUD).unwrap();
-    Timer::after(Duration::from_millis(50)).await;
-
-    let probe2 = probe_for_data(rx).await;
-    if probe2 == ProbeResult::Silent {
-        defmt::warn!("GPS: no data at {} either — check wiring!", FACTORY_BAUD);
-        return 0;
-    }
-
-    defmt::info!(
-        "GPS: detected at {} ({}), switching module to {} UBX-only",
-        FACTORY_BAUD,
-        if probe2 == ProbeResult::Ubx { "UBX" } else { "NMEA" },
-        TARGET_BAUD,
+    defmt::warn!(
+        "GPS: no response at {}, {} or {} baud - check wiring, and whether the module is on a rate we do not probe",
+        CANDIDATE_BAUDS[0],
+        CANDIDATE_BAUDS[1],
+        CANDIDATE_BAUDS[2],
     );
-
-    // Send CFG-PRT to change the module's UART1 baud AND restrict
-    // output to UBX (see `set_uart_baud` — outProtoMask = 0x0001).
-    // u-blox modules change rate as soon as the ACK is sent, so we
-    // flip our own UART immediately after.
-    let mut frame = [0u8; 28];
-    let n = cfg::set_uart_baud(&mut frame, TARGET_BAUD);
-    let _ = tx.write(&frame[..n]).await;
-
-    // Drain the ACK at the old rate, then flip our UART.
-    Timer::after(Duration::from_millis(100)).await;
-    tx.set_baudrate(TARGET_BAUD).unwrap();
-    rx.set_baudrate(TARGET_BAUD).unwrap();
-    Timer::after(Duration::from_millis(100)).await;
-
-    // Module is now silent on UBX — factory configs don't enable
-    // any UBX messages by default, only NMEA. Enable NAV-PVT (the
-    // single message our parser consumes) at 1 Hz.
-    enable_nav_pvt(tx).await;
-
-    TARGET_BAUD
+    0
 }
 
 /// Enable UBX NAV-PVT (0x01 0x07) at 1 Hz on the current UART.
@@ -808,6 +832,52 @@ mod tests {
         let (a, b) = fletcher16(&data);
         assert_eq!(a, 0x08);
         assert_eq!(b, 0x19);
+    }
+
+    #[test]
+    fn every_candidate_baud_is_distinct_and_starts_at_the_target() {
+        // A duplicated entry would waste a full probe window at boot for
+        // nothing, and would be invisible -- the loop would just try the
+        // same rate twice and report the same result.
+        for (i, a) in CANDIDATE_BAUDS.iter().enumerate() {
+            for b in CANDIDATE_BAUDS.iter().skip(i + 1) {
+                assert_ne!(a, b, "duplicate candidate baud {a}");
+            }
+        }
+        // TARGET_BAUD first: a module already configured by a previous
+        // boot is found in one window instead of three.
+        assert_eq!(CANDIDATE_BAUDS[0], TARGET_BAUD);
+    }
+
+    #[test]
+    fn both_factory_defaults_are_probed() {
+        // 9600 is the u-blox M8 default, 38400 the M10's. The SE100 ships
+        // in both builds and they look identical from outside, so leaving
+        // either out means a module that simply never answers.
+        assert!(CANDIDATE_BAUDS.contains(&FACTORY_BAUD), "M8 default missing");
+        assert!(CANDIDATE_BAUDS.contains(&ALT_FACTORY_BAUD), "M10 default missing");
+        assert_eq!(ALT_FACTORY_BAUD, 38_400);
+    }
+
+    #[test]
+    fn probe_window_outlasts_an_unconfigured_receivers_burst() {
+        // An unconfigured module emits its whole NMEA set once per
+        // second. A window shorter than that can land entirely in the
+        // gap and declare a live module silent -- which then shows up as
+        // "the GPS does not work", three candidate rates later.
+        assert!(
+            PROBE_WINDOW_MS > 1000,
+            "{PROBE_WINDOW_MS} ms can miss a 1 Hz burst entirely"
+        );
+    }
+
+    #[test]
+    fn worst_case_probe_time_stays_reasonable() {
+        // Nothing connected means every window runs to completion. This
+        // is boot latency the user pays before the GPS task starts
+        // reading, so it is worth knowing when it grows.
+        let worst_ms = PROBE_WINDOW_MS * CANDIDATE_BAUDS.len() as u64;
+        assert!(worst_ms <= 5000, "{worst_ms} ms of probing at boot");
     }
 
     #[test]
