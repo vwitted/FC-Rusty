@@ -408,6 +408,14 @@ pub fn poll_msg(out: &mut [u8], class: u8, id: u8) -> usize {
 
 // ---- Boot-time configuration ----
 
+/// Navigation solution period in milliseconds. 100 ms = 10 Hz.
+///
+/// Chosen to match what gps_accel::GpsAccelEstimator assumes ("~5 fixes
+/// at 10 Hz are averaged") and what pos_kf's velocity fusion is tuned
+/// for. Raising it costs bandwidth and lowering it costs the whole
+/// benefit of the acceleration estimate.
+pub const NAV_RATE_MS: u16 = 100;
+
 /// Target UART baud after `configure()` completes.
 pub const TARGET_BAUD: u32 = 115_200;
 
@@ -561,11 +569,31 @@ async fn enable_nav_pvt(
 ) {
     use embassy_time::{Duration, Timer};
     let mut frame = [0u8; 16];
-    // rate=1 means "once per nav solution". CFG-RATE default is 1 Hz.
+
+    // Solution rate FIRST, then the message rate against it.
+    //
+    // CFG-RATE was never sent before, so NAV-PVT arrived at the module
+    // default of 1 Hz -- which quietly undoes the reason for using UBX at
+    // all. gps_accel.rs differentiates GPS velocity and is specified
+    // against 10 Hz fixes; at 1 Hz the differentiation interval is a full
+    // second and the estimate is worthless.
+    //
+    // 100 ms with nav_rate = 1 is 10 Hz, which an M8 sustains on
+    // multi-GNSS (the 18 Hz figure in the M8 datasheet is GPS-only). One
+    // NAV-PVT is 100 bytes, so 10 Hz is 1 kB/s against 11.5 kB/s of
+    // 115200 link -- comfortable. It would NOT fit in the factory 9600.
+    let n = cfg::set_nav_rate(&mut frame, NAV_RATE_MS, 1);
+    let _ = tx.write(&frame[..n]).await;
+    Timer::after(Duration::from_millis(50)).await;
+
+    // rate=1 means "once per nav solution", so this now means 10 Hz.
     let n = cfg::set_msg_rate(&mut frame, 0x01, 0x07, 1);
     let _ = tx.write(&frame[..n]).await;
     Timer::after(Duration::from_millis(50)).await;
-    defmt::info!("GPS: enabled NAV-PVT at nav-solution rate");
+    defmt::info!(
+        "GPS: NAV-PVT enabled at {} ms solution rate",
+        NAV_RATE_MS,
+    );
 }
 
 // ---- Common configuration commands ----
@@ -780,6 +808,40 @@ mod tests {
         let (a, b) = fletcher16(&data);
         assert_eq!(a, 0x08);
         assert_eq!(b, 0x19);
+    }
+
+    #[test]
+    fn cfg_rate_frame_asks_for_ten_hz() {
+        // CFG-RATE (0x06 0x08), payload measRate=100 ms, navRate=1,
+        // timeRef=1. This frame is now load-bearing: without it NAV-PVT
+        // arrives at the module default of 1 Hz and the GPS-derived
+        // acceleration estimate is worthless.
+        let mut out = [0u8; 16];
+        let n = cfg::set_nav_rate(&mut out, NAV_RATE_MS, 1);
+        assert_eq!(n, 14, "6-byte payload plus 8 bytes of framing");
+        assert_eq!(&out[..2], &[SYNC_1, SYNC_2]);
+        assert_eq!(out[2], 0x06, "class");
+        assert_eq!(out[3], 0x08, "id");
+        assert_eq!(&out[4..6], &[6, 0], "payload length, little-endian");
+        assert_eq!(&out[6..8], &[0x64, 0x00], "measRate = 100 ms = 10 Hz");
+        assert_eq!(&out[8..10], &[0x01, 0x00], "navRate = 1 solution");
+        // Checksum must cover class..payload inclusive.
+        let (a, b) = fletcher16(&out[2..12]);
+        assert_eq!((out[12], out[13]), (a, b));
+    }
+
+    #[test]
+    fn nav_rate_fits_the_configured_link() {
+        // One NAV-PVT is 92 payload + 8 framing = 100 bytes. At 10 Hz
+        // that is 1000 B/s; 115200 8N1 carries 11520 B/s. If someone
+        // raises the rate far enough that this fails, the receiver will
+        // silently start dropping frames instead.
+        let bytes_per_s = 100.0 * (1000.0 / NAV_RATE_MS as f32);
+        let link_bytes_per_s = TARGET_BAUD as f32 / 10.0;
+        assert!(
+            bytes_per_s < link_bytes_per_s * 0.5,
+            "{bytes_per_s} B/s needs more than half of {link_bytes_per_s} B/s"
+        );
     }
 
     #[test]

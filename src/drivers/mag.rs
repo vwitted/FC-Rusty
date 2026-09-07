@@ -95,15 +95,10 @@ impl MagSample {
     /// it is the right sanity check for "is this a plausible reading".
     pub fn magnitude_ut(&self) -> f32 {
         let v = self.ut_sensor();
-        let sq = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
-        #[cfg(feature = "firmware")]
-        {
-            libm::sqrtf(sq)
-        }
-        #[cfg(not(feature = "firmware"))]
-        {
-            sq.sqrt()
-        }
+        // libm unconditionally: the crate is no_std on the host too, so
+        // f32::sqrt only exists under cfg(test). Same choice as
+        // control::position.
+        libm::sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
     }
 }
 

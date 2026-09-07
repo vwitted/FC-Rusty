@@ -42,7 +42,7 @@
 
 use embassy_executor::Spawner;
 use embassy_stm32::time::Hertz;
-use embassy_stm32::usart::{self, Uart, UartRx};
+use embassy_stm32::usart::{self, Uart, UartRx, UartTx};
 use embassy_stm32::{bind_interrupts, peripherals};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
@@ -67,6 +67,7 @@ mod drivers {
     pub mod orientation;
     pub mod nmea;
     pub mod ubx;
+    pub mod gps_adapt;
     pub mod wt901b;
 }
 mod control {
@@ -500,9 +501,15 @@ async fn main(spawner: Spawner) {
     spawner.spawn(pos_kf_task()).unwrap();
 
     // ---- Configure and spawn the GPS task ----
-    // GPS on USART1 TX=PA9 RX=PA10 at factory 9600 baud, speaking
-    // factory-default NMEA. SERIAL1 / T1+R1 pads — the board's
-    // dedicated GPS connector. See `drivers::nmea`.
+    // GPS on USART1 TX=PA9 RX=PA10. SERIAL1 / T1+R1 pads — the board's
+    // dedicated GPS connector. Opened at the factory 9600 so the module
+    // can be found; `gps_task` then negotiates UBX at 115200 and moves
+    // this UART with it. See `drivers::ubx::configure`.
+    //
+    // If a module turns up that ships at some other rate (38400 is the
+    // other common one), configure() probes only 115200 and 9600 and
+    // will report silence. That is a bench finding, not a guess to
+    // encode here.
     let gps_uart_config = {
         let mut c = usart::Config::default();
         c.baudrate = 9600;
@@ -520,9 +527,12 @@ async fn main(spawner: Spawner) {
     )
     .unwrap();
 
-    let (_gps_tx, gps_rx) = gps_uart.split();
-    spawner.spawn(gps_task(gps_rx)).unwrap();
-    defmt::info!("GPS task spawned (NMEA at 9600)");
+    // TX is kept now: it used to be dropped, which meant the module
+    // could not be configured at all and was stuck on factory-default
+    // NMEA at 9600. See gps_task.
+    let (gps_tx, gps_rx) = gps_uart.split();
+    spawner.spawn(gps_task(gps_tx, gps_rx)).unwrap();
+    defmt::info!("GPS task spawned (probing for UBX, NMEA fallback)");
 
     // DShot ESC outputs, bit-banged on PA0..PA3 (M1..M4). TIM1 is a pacer
     // only — it drives no pin; DMA2_CH2 writes BSRR words to GPIOA at each
@@ -672,24 +682,88 @@ async fn persist_task(
 }
 
 // ---- GPS Task ----
-// Reads NMEA sentences from the GPS module, publishes via GPS_DATA signal.
+// Publishes fixes via GPS_DATA / GPS_DATA_FOR_KF.
+//
+// Tries to put the module into UBX NAV-PVT at 115200 and falls back to
+// whatever NMEA it is already emitting.
+//
+// The reason to bother is rate, not elegance. At the factory 9600 baud a
+// full NMEA sentence set is ~500 characters, i.e. ~960 characters per
+// second of link budget against ~5000 needed for 10 Hz -- so on the old
+// configuration the receiver CANNOT deliver more than about 1 Hz no
+// matter what it is set to. The GPS-derived acceleration in gps_accel.rs
+// is specified against 10 Hz velocity fixes and differentiates them; at
+// 1 Hz it has a 1 s differentiation interval and is close to useless.
+// One NAV-PVT is 100 bytes, which is 10 Hz inside 115200 with room to
+// spare.
+//
+// BOTH parsers run on every byte, deliberately. `ubx::configure` has to
+// guess the module's current baud, and if it guesses wrong or the module
+// declines the CFG-PRT we would otherwise have traded a working 1 Hz GPS
+// for none at all. Feeding both costs a few microseconds per byte and
+// means the failure mode is "same as before" rather than "no
+// navigation". UBX wins whenever it is producing frames.
 
 #[embassy_executor::task]
-async fn gps_task(mut rx: UartRx<'static, embassy_stm32::mode::Async>) {
+async fn gps_task(
+    mut tx: UartTx<'static, embassy_stm32::mode::Async>,
+    mut rx: UartRx<'static, embassy_stm32::mode::Async>,
+) {
+    // Ask for UBX before opening the read loop. Leaves the UART at
+    // whatever baud the module actually answered on; 0 means nothing
+    // answered at any baud we tried, in which case the NMEA path below
+    // is still live and behaves exactly as it did before.
+    let baud = drivers::ubx::configure(&mut tx, &mut rx).await;
+    if baud == 0 {
+        defmt::warn!(
+            "GPS: no response during UBX configuration — falling back to NMEA at 9600"
+        );
+    }
+
     let mut parser = NmeaParser::new();
+    let mut ubx_parser = drivers::ubx::UbxParser::new();
     let mut buf = [0u8; 128];
     let mut sentence_count: u32 = 0;
+    let mut ubx_count: u32 = 0;
     let mut last_report = Instant::now();
     let mut announced_first = false;
+    let mut announced_ubx = false;
+    // Whatever was last published, whichever parser produced it.
+    let mut last_pub: Option<drivers::nmea::GpsData> = None;
 
-    defmt::info!("GPS task started (NMEA)");
+    defmt::info!("GPS task started (UBX preferred, NMEA fallback)");
 
     loop {
         match rx.read(&mut buf).await {
             Ok(()) => {
                 for &byte in &buf {
+                    // UBX first. A NAV-PVT carries everything the four
+                    // NMEA sentences carry between them, so when one
+                    // lands it publishes a complete record on its own.
+                    if ubx_parser.push_byte(byte).is_some() && ubx_parser.data.updated {
+                        ubx_count += 1;
+                        let g = drivers::gps_adapt::ubx_to_nmea(&ubx_parser.data);
+                        GPS_DATA.signal(g);
+                        GPS_DATA_FOR_KF.signal(g);
+                        last_pub = Some(g);
+                        if !announced_ubx {
+                            defmt::info!(
+                                "GPS: NAV-PVT stream alive at {} baud — UBX in use",
+                                baud,
+                            );
+                            announced_ubx = true;
+                        }
+                        continue;
+                    }
                     if parser.push_byte(byte).is_some() {
                         sentence_count += 1;
+                        // Don't let a straggling NMEA sentence overwrite
+                        // a good UBX record. Once NAV-PVT is flowing the
+                        // module has been told to stop emitting NMEA
+                        // anyway; this covers the changeover.
+                        if announced_ubx {
+                            continue;
+                        }
                         GPS_DATA.signal(parser.data);
                         // Second consumer: `pos_kf_task` needs GPS
                         // updates too and can't share a single-shot
@@ -700,24 +774,37 @@ async fn gps_task(mut rx: UartRx<'static, embassy_stm32::mode::Async>) {
                             defmt::info!("GPS: first NMEA sentence parsed — stream is alive");
                             announced_first = true;
                         }
-
-                        // Report GPS stats every 5 seconds, regardless of fix.
-                        let now = Instant::now();
-                        if now.duration_since(last_report) >= Duration::from_secs(5) {
-                            defmt::info!(
-                                "GPS: {} sentences, fix={} mode={} sats={} hdop={:?} lat={:?} lon={:?} alt={:?}m",
-                                sentence_count,
-                                parser.data.fix as u8,
-                                parser.data.fix_mode as u8,
-                                parser.data.satellites,
-                                parser.data.hdop,
-                                parser.data.latitude as f32,
-                                parser.data.longitude as f32,
-                                parser.data.altitude_m,
-                            );
-                            last_report = now;
-                        }
+                        last_pub = Some(parser.data);
                     }
+                }
+
+                // Periodic report, outside both branches. It used to sit
+                // inside the NMEA arm, which would have gone silent the
+                // moment UBX took over -- and "the GPS log stopped" is
+                // exactly how a working change gets blamed for a fault.
+                let now = Instant::now();
+                if now.duration_since(last_report) >= Duration::from_secs(5) {
+                    if let Some(d) = last_pub {
+                        defmt::info!(
+                            "GPS [{}]: {} navpvt / {} sentences, mode={} sats={} dop={:?} lat={:?} lon={:?} alt={:?}m",
+                            if announced_ubx { "UBX" } else { "NMEA" },
+                            ubx_count,
+                            sentence_count,
+                            d.fix_mode as u8,
+                            d.satellites,
+                            d.hdop,
+                            d.latitude as f32,
+                            d.longitude as f32,
+                            d.altitude_m,
+                        );
+                    } else {
+                        defmt::info!(
+                            "GPS: no complete record yet ({} navpvt, {} sentences)",
+                            ubx_count,
+                            sentence_count,
+                        );
+                    }
+                    last_report = now;
                 }
             }
             Err(e) => {
