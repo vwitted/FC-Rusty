@@ -448,11 +448,19 @@ pub struct TracePoint {
     pub roll: f32,
     pub roll_rate: f32,
     pub pid_roll: f32,
+    /// The other two Euler axes. A body roll rate with a constant Euler
+    /// roll angle is not a contradiction if the aircraft is pitched over,
+    /// and without these there is no way to tell that from a stuck sensor.
+    pub pitch: f32,
+    pub yaw: f32,
+    /// Post-airmode motor extremes. `msum/4` alone cannot distinguish
+    /// "full differential, mean 0.5" from "all four rails at 0.5, no
+    /// differential left" -- which is the difference between a controller
+    /// that is working and one with no authority at all.
+    pub motor_min: f32,
+    pub motor_max: f32,
 }
 
-/// Fly one case and score it.
-///
-/// `trace` is called once per outer tick when present. The sim never prints.
 /// Position gains at a chosen tilt limit, with the compensation gate made
 /// INERT -- both limits set to the swept value.
 ///
@@ -481,6 +489,24 @@ fn tilt_gains(max_tilt_deg: f32, gated: bool) -> PositionGains {
     PositionGains { max_tilt_rad, max_tilt_rad_degraded, ..PositionGains::default() }
 }
 
+/// Fly one case and score it.
+///
+/// `trace` is called once per outer tick when present. The sim never prints.
+///
+/// READ `air_frac` BEFORE `att_rms`. At the firmware's rate gains the
+/// inner loop goes into a full-scale limit cycle after any disturbance,
+/// oscillating far faster than the outer tick this traces. It is close to
+/// invisible in attitude -- the oscillation is symmetric, so the mean
+/// torque is ~0 and att_rms stays around 1.5 deg, which reads as excellent
+/// control -- but airmode rectifies it: holding the floor above zero with
+/// every motor slamming 0..1 lifts MEAN thrust from the 0.294 hover point
+/// to ~0.5, and the aircraft climbs away at 15 m/s.
+///
+/// So the honest instability indicator here is air_frac, the fraction of
+/// ticks with a motor on a rail. It sat at 97-98% across the entire wind
+/// axis while att_rms looked healthy. At the GA-fitted gains
+/// (RATE_KP=0.009 RATE_KD=0.00015) the same axis gives air_frac 0.0%,
+/// alt_rms 0.10 m instead of 27 m, and no failures at any wind speed.
 pub fn run_case(
     h: &HarnessCfg,
     tun: &Tunables,
@@ -879,6 +905,10 @@ pub fn run_case(
                     roll: sim.state.roll,
                     roll_rate: sim.state.roll_rate,
                     pid_roll: pid_output[0],
+                    pitch: sim.state.pitch,
+                    yaw: sim.state.yaw,
+                    motor_min: motors.iter().cloned().fold(f32::INFINITY, f32::min),
+                    motor_max: motors.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
                 });
             }
         }

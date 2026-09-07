@@ -246,6 +246,16 @@ fn tunables() -> Tunables {
     // --pid swaps the attitude MPC for classic angle mode, to ask whether
     // the MPC earns its compute. ANGLE_KP / ANGLE_MAX_DPS tune it, because
     // comparing a tuned MPC against an untuned PID would prove nothing.
+    // RATE_KP / RATE_KD override the inner-loop gains. The GA fitted
+    // roughly 0.009 / 0.00015 against the firmware's 0.020 / 0.001, and
+    // without a knob there is no way to ask the sweep whether a given
+    // symptom is the gains or something else.
+    if let Some(v) = std::env::var("RATE_KP").ok().and_then(|v| v.parse().ok()) {
+        t.rate.kp = v;
+    }
+    if let Some(v) = std::env::var("RATE_KD").ok().and_then(|v| v.parse().ok()) {
+        t.rate.kd = v;
+    }
     if let Some(v) = std::env::var("POS_MAX_TILT_DEG").ok().and_then(|v| v.parse().ok()) {
         t.pos_max_tilt_deg = v;
     }
@@ -350,12 +360,19 @@ fn main() {
     // point for "why did this case fail", which the summary cannot answer.
     if std::env::args().any(|a| a == "--trace") {
         let cfg = Degradation::none();
-        let (h, tun) = harness_cfg(&cfg, rates, dual);
+        let (mut h, tun) = harness_cfg(&cfg, rates, dual);
+        // POS_HOLD=1 traces the position-hold configuration, which is the
+        // only one the wind axis runs and the only one that shows the
+        // low-wind altitude failure. Without this the trace could not
+        // reach the case being diagnosed at all.
+        if std::env::var("POS_HOLD").is_ok() {
+            h.pos_hold = true;
+        }
         let mut show = |p: fc_rusty::sim::harness::TracePoint| {
             println!(
-                "{:6.3} alt={:8.3} vz_up={:8.3} thr_dmd={:6.3} msum/4={:6.3} roll={:7.3} rollrate={:8.2} pid_roll={:7.3}",
-                p.t, p.alt, p.vz_up, p.thrust_demand, p.motor_mean,
-                p.roll, p.roll_rate, p.pid_roll
+                "{:6.3} alt={:8.3} vz_up={:7.2} thr={:5.3} m[{:5.3}..{:5.3}] rpy={:7.2}/{:7.2}/{:7.2} rollrate={:8.2} pid_roll={:7.3}",
+                p.t, p.alt, p.vz_up, p.thrust_demand, p.motor_min, p.motor_max,
+                p.roll, p.pitch, p.yaw, p.roll_rate, p.pid_roll
             );
         };
         let m = run_case(&h, &tun, cfg, 1, Some(&mut show));
