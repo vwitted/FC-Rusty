@@ -428,6 +428,11 @@ pub struct NavInputs {
     /// Outer-loop period, seconds.
     pub dt: f32,
     pub hover_throttle: f32,
+    /// `gps_accel::GpsAccelEstimator::is_fresh()` -- whether the attitude
+    /// estimator currently has a GPS-derived acceleration to subtract from
+    /// the accelerometer. Gates the position controller's tilt limit; see
+    /// `PositionGains::max_tilt_rad_degraded`.
+    pub gps_accel_fresh: bool,
 }
 
 /// State carried between ticks. Borrowed mutably by `nav_step`.
@@ -572,6 +577,15 @@ fn rescue_levelling(inp: &NavInputs, st: &mut NavState) -> (bool, Option<NavEven
 pub fn nav_step(inp: &NavInputs, st: &mut NavState) -> NavOutputs {
     const DEG2RAD: f32 = core::f32::consts::PI / 180.0;
     let dt = inp.dt;
+
+    // ---- Tilt authority gate ----
+    //
+    // Unconditionally, before the mode match: the position controller is
+    // reached from three arms and the limit must not depend on which one
+    // ran, nor on whether any of them ran at all. A mode that does not use
+    // the position loop still has to keep the slew honest, or the limit
+    // would jump to 45 deg on the first tick after switching back in.
+    st.pos_ctrl.set_compensation(inp.gps_accel_fresh, dt);
 
     // ---- Heading hold ----
     //
@@ -846,6 +860,7 @@ mod tests {
             pos_est: None,
             dt: DT,
             hover_throttle: HOVER,
+            gps_accel_fresh: true,
         }
     }
 
@@ -992,6 +1007,66 @@ mod tests {
         });
         let out = nav_step(&inp, &mut st);
         assert!(out.desired_roll_rad > 0.0, "roll right to fly east; got {}", out.desired_roll_rad);
+    }
+
+    // ---- Tilt authority gate ----
+
+    /// Gains whose fallback is actually lower than the ceiling. The
+    /// shipped default has them equal -- the gate is inert until someone
+    /// decides otherwise -- so these two tests would pass without a gate
+    /// at all if they used it. See PositionGains::max_tilt_rad_degraded.
+    const DEGRADED_RAD: f32 = 15.0 * core::f32::consts::PI / 180.0;
+
+    fn gated_state() -> NavState {
+        let mut st = state();
+        st.pos_ctrl = PositionController::new(PositionGains {
+            max_tilt_rad_degraded: DEGRADED_RAD,
+            ..PositionGains::default()
+        });
+        st
+    }
+
+    /// The gate has to be threaded all the way through nav_step, not just
+    /// exist on the controller. A saturating position error with the GPS
+    /// acceleration reference stale must come out at the degraded limit.
+    #[test]
+    fn stale_gps_accel_holds_the_position_loop_at_the_low_tilt_limit() {
+        let mut st = gated_state();
+        let mut inp = inputs(FlightMode::GpsHome);
+        inp.gps_accel_fresh = false;
+        inp.pos_est = Some(PosEstimate { position_ned: [-500.0, 0.0, 0.0], ..est() });
+        // Many ticks: the point is that it never climbs, not that it
+        // starts low.
+        let mut out = nav_step(&inp, &mut st);
+        for _ in 0..500 {
+            out = nav_step(&inp, &mut st);
+        }
+        assert!(
+            (out.desired_pitch_rad.abs() - DEGRADED_RAD).abs() < 1e-5,
+            "pitch {} rad, expected the {} rad fallback",
+            out.desired_pitch_rad,
+            DEGRADED_RAD
+        );
+    }
+
+    /// ...and with it fresh, the same demand reaches the full limit.
+    #[test]
+    fn fresh_gps_accel_restores_full_tilt_authority() {
+        let mut st = gated_state();
+        let mut inp = inputs(FlightMode::GpsHome);
+        inp.gps_accel_fresh = true;
+        inp.pos_est = Some(PosEstimate { position_ned: [-500.0, 0.0, 0.0], ..est() });
+        let mut out = nav_step(&inp, &mut st);
+        for _ in 0..500 {
+            out = nav_step(&inp, &mut st);
+        }
+        let full = PositionGains::default().max_tilt_rad;
+        assert!(
+            (out.desired_pitch_rad.abs() - full).abs() < 1e-5,
+            "pitch {} rad, expected the {} rad limit",
+            out.desired_pitch_rad,
+            full
+        );
     }
 
     // ---- The rescue ladder ----

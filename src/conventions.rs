@@ -330,6 +330,7 @@ mod tests {
                 pos_est: None,
                 dt: 0.01,
                 hover_throttle: 0.294,
+                gps_accel_fresh: true,
             },
             &mut st,
         );

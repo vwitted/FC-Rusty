@@ -254,6 +254,19 @@ static YAW_COG: Signal<CriticalSectionRawMutex, f32> = Signal::new();
 /// is R(q)·f_body + g, and subtracting THAT cancels to exactly the
 /// predicted gravity, silently disabling the update. See gps_accel.rs.
 static GPS_ACCEL_NED: Signal<CriticalSectionRawMutex, [f32; 2]> = Signal::new();
+/// Whether GPS_ACCEL_NED is currently backed by fresh fixes:
+/// pos_kf_task -> control loop.
+///
+/// Separate from the Signal above, and an atomic rather than a Signal,
+/// because the two have opposite consumption semantics. The MEKF wants the
+/// value once per publication; the control loop wants the CURRENT state on
+/// every one of its own ticks, and a Signal that has already been taken
+/// reads as absent, which here would mean "GPS lost".
+///
+/// Gates the position controller's tilt limit. See gps_accel.rs and
+/// control::position::PositionGains::max_tilt_rad_degraded.
+static GPS_ACCEL_FRESH: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 /// Boot-loaded calibration: main → mekf task.
 static STORED_CAL: Signal<CriticalSectionRawMutex, persist::record::Config> = Signal::new();
 /// Cal-feedback LED phase: mekf task → blink task. Watch so the renderer
@@ -1318,6 +1331,10 @@ async fn pos_kf_task() {
         // sees the decay rather than holding a stale value of its own.
         gps_accel.tick(PERIOD_MS as f32 * 1e-3);
         GPS_ACCEL_NED.signal(gps_accel.accel_ned());
+        GPS_ACCEL_FRESH.store(
+            gps_accel.is_fresh(),
+            core::sync::atomic::Ordering::Relaxed,
+        );
 
         // ---- Pull latest IMU for predict ----
         if let Some(imu) = IMU_DATA_FOR_KF.try_take() {
@@ -2220,6 +2237,8 @@ async fn navigation_task() {
                         pos_est: last_pos_est,
                         dt: dt_outer,
                         hover_throttle,
+                        gps_accel_fresh: GPS_ACCEL_FRESH
+                            .load(core::sync::atomic::Ordering::Relaxed),
                     },
                     &mut nav,
                 );

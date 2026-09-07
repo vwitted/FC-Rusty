@@ -36,7 +36,7 @@ use fc_rusty::control::pid::{PidGains, PidLimits};
 use fc_rusty::sim::degrade::{ChannelFault, Degradation};
 use fc_rusty::sim::dual_imu::DualImuConfig;
 use fc_rusty::sim::harness::{
-    run_case, AttitudeStep, HarnessCfg, Metrics, Rates, Tunables,
+    run_case, AttitudeStep, HarnessCfg, Metrics, Tunables,
 };
 use fc_rusty::sim::sensors::Rng;
 use fc_rusty::sim::QuadParams;
@@ -103,6 +103,10 @@ fn to_tunables(g: &[f32; N_GENES]) -> Tunables {
         gyro_fc_hz: GENES[5].decode(g[5]),
         // Fixed on purpose -- see the header.
         alt: AltitudeGains { kp: 0.15, kd: 0.1, ki: 0.05 },
+        // Everything the search does not tune comes from the firmware
+        // baseline, so a field added later joins the fixed set rather than
+        // silently becoming a zero.
+        ..Tunables::firmware()
     }
 }
 
@@ -324,8 +328,6 @@ fn main() {
         plant.inertia = [v, v, v * 2.0];
     }
     let h = HarnessCfg {
-        rates: Rates::FIRMWARE,
-        plant,
         total_s: FLIGHT_S,
         target_alt: 5.0,
         // A raised-cosine gust rather than a state poke: the search should
@@ -334,6 +336,10 @@ fn main() {
         dual: false,
         dual_cfg: DualImuConfig::none(),
         cmd: AttitudeStep::NONE, // per-case; see evaluate()
+        // Same reason as to_tunables: inherit the rest, so the scenario the
+        // search optimises against does not quietly change shape whenever
+        // the harness grows a knob.
+        ..HarnessCfg::firmware_rates(plant)
     };
 
     let train = training_set();

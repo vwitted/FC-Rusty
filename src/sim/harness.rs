@@ -195,10 +195,16 @@ pub struct Tunables {
     /// Compensation removes the CRASH at high tilt entirely and cuts
     /// attitude error at 45 deg by about two thirds. So the cost that
     /// justified 15 deg is mostly gone, and raising the limit becomes
-    /// defensible -- but only WHILE COMPENSATION IS LIVE, since it depends
-    /// on GPS. gps_accel::GpsAccelEstimator::is_fresh is the natural gate:
-    /// high tilt when the acceleration reference is available, 15 deg when
-    /// it is not, with the existing fade smoothing the transition.
+    /// defensible.
+    ///
+    /// The obvious follow-on -- gate the high limit on
+    /// gps_accel::GpsAccelEstimator::is_fresh, fall back to 15 deg when it
+    /// is stale -- was then built (`--tilt-gate`, HarnessCfg::pos_tilt_gate)
+    /// and MEASURED, and it does not pay. Over 30 s flights the fallback
+    /// saves the 33 m/s case, where uncompensated 45 deg diverges, and
+    /// loses the aircraft outright at 20 and 25 m/s, where 45 deg holds
+    /// station and 15 deg drifts away 8/8. It is off by default; the
+    /// numbers are on control::position::PositionGains::max_tilt_rad_degraded.
     ///
     /// A duration budget ("30 deg for 3 s") was considered and rejected for
     /// the sustained case: holding against wind needs high tilt
@@ -219,7 +225,14 @@ impl Tunables {
             limits: PidLimits { integral_max: 0.3, output_max: 0.5, d_lpf_tau_s: 0.008 },
             gyro_fc_hz: 150.0,
             attitude: AttitudeMode::Mpc,
-            pos_max_tilt_deg: 15.0,
+            // Read from the firmware's own default rather than restated.
+            // It was restated, as 15.0, and went stale the moment 6dbb5f8
+            // raised the real default to 45 -- so every sweep since has
+            // reported "firmware baseline" while flying a tilt limit the
+            // firmware does not use. A doc comment saying "exactly what
+            // main.rs flies today" cannot be allowed to depend on someone
+            // remembering to update a second copy.
+            pos_max_tilt_deg: PositionGains::default().max_tilt_rad / DEG2RAD,
             mpc_cmd_bound_dps: 0.0,
             alt: AltitudeGains { kp: 0.15, kd: 0.1, ki: 0.05 },
         }
@@ -385,6 +398,18 @@ pub struct HarnessCfg {
     /// authority, compensation alone is the difference between recovering
     /// from 60 deg and diverging at it.
     pub compensate_from_gps: bool,
+    /// Fly the firmware's real tilt-authority gate rather than the swept
+    /// limit unconditionally.
+    ///
+    /// Off by default, and `tilt_gains` explains why: with it on, POS_TILT
+    /// stops being the tilt the aircraft flies at and becomes only a
+    /// ceiling, so the tilt axis of a sweep silently collapses onto
+    /// `max_tilt_rad_degraded` whenever GPS compensation is absent.
+    ///
+    /// Turn it on to measure the gate itself -- that is, to ask whether
+    /// the fallback recovers the safety the uncompensated high-tilt
+    /// configuration threw away.
+    pub pos_tilt_gate: bool,
 }
 
 impl HarnessCfg {
@@ -407,6 +432,7 @@ impl HarnessCfg {
             compensate_accel: false,
             compensate_from_estimate: false,
             compensate_from_gps: false,
+            pos_tilt_gate: false,
         }
     }
 }
@@ -427,6 +453,34 @@ pub struct TracePoint {
 /// Fly one case and score it.
 ///
 /// `trace` is called once per outer tick when present. The sim never prints.
+/// Position gains at a chosen tilt limit, with the compensation gate made
+/// INERT -- both limits set to the swept value.
+///
+/// Deliberate, and the alternative is a trap. The firmware pairs a high
+/// limit with a 15 deg fallback for when the GPS acceleration reference
+/// goes stale (PositionGains::max_tilt_rad_degraded). Left in place here,
+/// every run with `compensate_from_gps: false` would fly at 15 deg no
+/// matter what POS_TILT said: the tilt axis of the sweep would quietly
+/// stop varying tilt, and the uncompensated column of the table on
+/// `pos_max_tilt_deg` -- the column that MOTIVATED the gate -- could never
+/// be measured again.
+///
+/// So the sweep measures tilt, the gate's own behaviour is covered by unit
+/// tests in control::position, and the two do not contaminate each other.
+/// Note the consequence for reading that table: the high-tilt,
+/// no-compensation cell (45 deg crashing at 33 m/s) is a configuration the
+/// firmware can no longer enter. That is the whole point of the gate.
+fn tilt_gains(max_tilt_deg: f32, gated: bool) -> PositionGains {
+    let max_tilt_rad = max_tilt_deg * DEG2RAD;
+    // 15 deg explicitly, NOT PositionGains::default().max_tilt_rad_degraded
+    // -- that now equals the ceiling, so reading it here would make
+    // --tilt-gate silently do nothing and the flag would measure a
+    // no-op. The firmware default is a decision; this is the candidate
+    // being tested against it.
+    let max_tilt_rad_degraded = if gated { 15.0 * DEG2RAD } else { max_tilt_rad };
+    PositionGains { max_tilt_rad, max_tilt_rad_degraded, ..PositionGains::default() }
+}
+
 pub fn run_case(
     h: &HarnessCfg,
     tun: &Tunables,
@@ -478,19 +532,14 @@ pub fn run_case(
     let mut commanded = false;
     // Runs at the outer rate, which is what main.rs does: pos_ctrl.update
     // sits inside the MPC_PERIOD_US ticker, i.e. 100 Hz.
-    let pos_ctrl = PositionController::new(PositionGains {
-            max_tilt_rad: tun.pos_max_tilt_deg * DEG2RAD,
-            ..PositionGains::default()
-        });
+    let mut pos_ctrl =
+        PositionController::new(tilt_gains(tun.pos_max_tilt_deg, h.pos_tilt_gate));
     // Firmware mode logic, when driving it. Its own alt/pos controllers
     // live inside, so the harness's are unused in that path.
     let mut nav_state = h.firmware_mode.map(|_| {
         let mut ns = NavState::new(
             AltitudeController::new(tun.alt, hover_throttle),
-            PositionController::new(PositionGains {
-            max_tilt_rad: tun.pos_max_tilt_deg * DEG2RAD,
-            ..PositionGains::default()
-        }),
+            PositionController::new(tilt_gains(tun.pos_max_tilt_deg, h.pos_tilt_gate)),
             hover_throttle,
         );
         ns.alt_target = h.target_alt;
@@ -704,6 +753,14 @@ pub fn run_case(
             let alt = -sim.state.z;
             let vz_up = -sim.state.vz;
             let dt_outer = r.dt * r.outer_div as f32;
+            // Same condition as GpsAccelEstimator::is_fresh: two fixes
+            // seen, and the last within gps_accel::STALE_AFTER_S. The
+            // harness runs its own differentiator rather than the
+            // firmware's, so the predicate is restated rather than called.
+            // False whenever `compensate_from_gps` is off, because then
+            // there is no receiver at all.
+            let gps_accel_fresh =
+                last_gps_vel.is_some() && since_fix <= crate::gps_accel::STALE_AFTER_S;
 
             if let Some(mode) = h.firmware_mode {
                 // Drive the FIRMWARE's mode logic. The estimate is built
@@ -732,6 +789,7 @@ pub fn run_case(
                         pos_est: Some(est),
                         dt: dt_outer,
                         hover_throttle,
+                        gps_accel_fresh,
                     },
                     nav_state.as_mut().unwrap(),
                 );
@@ -750,6 +808,12 @@ pub fn run_case(
             // Position PD -> tilt reference -> MPC. The firmware's own
             // cascade, with the origin as the target.
             if h.pos_hold {
+                // The gate, which in the firmware nav_step applies for us.
+                // This path drives the controller directly, so without
+                // this call the limit would sit at its construction value
+                // for the whole run -- which is the DEGRADED one, silently
+                // pinning every pos_hold run to the fallback.
+                pos_ctrl.set_compensation(gps_accel_fresh, dt_outer);
                 let out = pos_ctrl.update(
                     [sim.state.x, sim.state.y],
                     [sim.state.vx, sim.state.vy],

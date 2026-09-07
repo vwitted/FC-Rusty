@@ -106,6 +106,11 @@ fn main() {
         kp: 0.5,
         kd: 1.0,
         max_tilt_rad: 10.0 * DEG2RAD,
+        // Same value: this example is about the homing signs, not the
+        // authority gate, and a controller that starts degraded and never
+        // hears from a GPS accel estimator would sit at the fallback for
+        // the whole run.
+        max_tilt_rad_degraded: 10.0 * DEG2RAD,
     };
     let pos_ctrl = PositionController::new(pos_gains);
     let mut desired_roll_rad = 0.0f32;

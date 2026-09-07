@@ -226,6 +226,10 @@ fn harness_cfg(cfg: &Degradation, r: Rates, dual: bool) -> (HarnessCfg, Tunables
             || std::env::args().any(|a| a == "--compensate-gps"),
         compensate_from_estimate: std::env::args().any(|a| a == "--compensate-circular"),
         compensate_from_gps: std::env::args().any(|a| a == "--compensate-gps"),
+        // --tilt-gate flies the firmware's real fallback: POS_MAX_TILT_DEG
+        // becomes a ceiling available only while the GPS acceleration
+        // reference is fresh. See HarnessCfg::pos_tilt_gate.
+        pos_tilt_gate: std::env::args().any(|a| a == "--tilt-gate"),
     };
     (h, tunables())
 }
