@@ -678,12 +678,14 @@ async fn blink_task(mut led: embassy_stm32::gpio::Output<'static>) {
 /// Whichever magnetometer is actually fitted.
 ///
 /// Three are supported and they are not alternatives in the "pick one in
-/// a config" sense -- they live on different boards. The LIS2MDL is the
-/// breakout on the FC; the Radiolink SE100 GPS module carries EITHER a
-/// QMC5883L or an HMC5883L depending on production run, and the two are
-/// externally identical. Any of them may be plugged in on a given day, so
-/// the honest thing is to ask the bus rather than to carry a build flag
-/// someone will forget to flip.
+/// a config" sense -- they live on different boards, all of them wired
+/// to the FC's SDA/SCL pads rather than mounted on it (the DAKEFPV H743
+/// has no onboard compass). The LIS2MDL is a standalone breakout; the
+/// Radiolink SE100 GPS module carries EITHER a QMC5883L or an HMC5883L
+/// depending on production run, and the two are externally identical.
+/// Any of them may be plugged in on a given day, so the honest thing is
+/// to ask the bus rather than to carry a build flag someone will forget
+/// to flip.
 ///
 /// Downstream sees only `MagSample`, so nothing past this enum knows or
 /// cares which part answered.
@@ -753,12 +755,13 @@ fn scan_bus(i2c: &mut MagBus<'_>) -> BusScan {
 impl Compass {
     /// Scan the bus, then try a driver for each address that answered.
     ///
-    /// Order is deliberate: whatever is at 0x1E (the LIS2MDL soldered to
-    /// the FC, or an HMC5883L) is tried before the QMC5883L at 0x0D, so
-    /// if a fixed part and a cabled one are both present the fixed one
-    /// wins. A part on a GPS mast has a better magnetic environment but
-    /// an unknown orientation, which is the opposite trade and not one to
-    /// make silently.
+    /// Order: whatever is at 0x1E (a LIS2MDL breakout, or an HMC5883L)
+    /// is tried before the QMC5883L at 0x0D. This is a convention, not a
+    /// physical argument -- every candidate is on a cable, so if two are
+    /// connected at once the LIS2MDL wins by address order alone. The
+    /// intended flight fit is the SE100's compass, for its distance from
+    /// the power wiring; if a LIS2MDL is ever left connected alongside
+    /// it, this order is what needs revisiting.
     ///
     /// At 0x1E the two candidates are told apart by read-only identity
     /// registers before either driver writes anything: LIS2MDL WHO_AM_I
