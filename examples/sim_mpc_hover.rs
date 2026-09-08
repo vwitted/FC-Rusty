@@ -23,7 +23,7 @@ const RAD2DEG: f32 = 180.0 / PI;
 
 fn main() {
     let params = QuadParams::default();
-    let hover_throttle = (params.mass * 9.81) / params.max_thrust;
+    let hover_throttle = params.hover_throttle();
 
     println!("=== Quadcopter Hover Simulation (MPC + PID + Alt Hold) ===");
     println!("Mass: {}kg, Max thrust: {}N", params.mass, params.max_thrust);

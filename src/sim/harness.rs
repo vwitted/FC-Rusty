@@ -497,16 +497,34 @@ fn tilt_gains(max_tilt_deg: f32, gated: bool) -> PositionGains {
 /// inner loop goes into a full-scale limit cycle after any disturbance,
 /// oscillating far faster than the outer tick this traces. It is close to
 /// invisible in attitude -- the oscillation is symmetric, so the mean
-/// torque is ~0 and att_rms stays around 1.5 deg, which reads as excellent
-/// control -- but airmode rectifies it: holding the floor above zero with
-/// every motor slamming 0..1 lifts MEAN thrust from the 0.294 hover point
-/// to ~0.5, and the aircraft climbs away at 15 m/s.
+/// torque is ~0 and att_rms stays low, which reads as excellent control --
+/// while every motor is slamming between its rails and there is no
+/// authority left for anything else.
 ///
 /// So the honest instability indicator here is air_frac, the fraction of
-/// ticks with a motor on a rail. It sat at 97-98% across the entire wind
-/// axis while att_rms looked healthy. At the GA-fitted gains
-/// (RATE_KP=0.009 RATE_KD=0.00015) the same axis gives air_frac 0.0%,
-/// alt_rms 0.10 m instead of 27 m, and no failures at any wind speed.
+/// ticks with a motor on a rail. It sits at 95-98% across the entire wind
+/// axis while att_rms looks healthy. At the GA-fitted gains
+/// (RATE_KP=0.009 RATE_KD=0.00015) the disturbance is absorbed cleanly,
+/// motors sit at the hover command, and altitude holds exactly.
+///
+/// AMENDMENT (2026-09-08). 227a9a7 described the altitude symptom as a
+/// CLIMB -- "airmode lifts mean thrust from the 0.294 hover point to ~0.5
+/// and the aircraft flies away at 15 m/s". The limit cycle was real and
+/// still is; the climb was an artefact of the sim's own thrust curve.
+///
+/// With thrust linear in throttle, hover sat at command 0.294, so a PID
+/// output of +/-0.5 drove motors to -0.2..0.79 and airmode's floor-shift
+/// lifted the mean to ~0.49 -- a large relative increase, hence a climb.
+/// Now that thrust is rotor speed squared, hover is command 0.542, the
+/// same +/-0.5 gives 0.04..1.04, the floor shift is almost nothing and
+/// the clipping happens at the TOP instead. The aircraft descends and
+/// crashes rather than climbing away.
+///
+/// The load-bearing half of that commit stands: the firmware rate gains
+/// limit-cycle after any disturbance and the fitted gains do not. Only
+/// the SIGN of the altitude error was model-induced. It also explains why
+/// the wind axis used to fail at 0-5 m/s and not at 10-33: drag damped
+/// the climb. Those rows now pass.
 pub fn run_case(
     h: &HarnessCfg,
     tun: &Tunables,
@@ -515,7 +533,7 @@ pub fn run_case(
     mut trace: Option<&mut dyn FnMut(TracePoint)>,
 ) -> Metrics {
     let r = h.rates;
-    let hover_throttle = (h.plant.mass * 9.81) / h.plant.max_thrust;
+    let hover_throttle = h.plant.hover_throttle();
     let mut sim = QuadSim::new_hovering(h.plant, h.target_alt);
     let upset = h.initial_attitude_deg != [0.0; 3] || h.initial_rates_dps != [0.0; 3];
     if h.initial_rates_dps != [0.0; 3] {

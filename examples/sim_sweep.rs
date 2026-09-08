@@ -93,14 +93,20 @@ fn plant_params() -> QuadParams {
     // Trap worth guarding: AltitudeController clamps to min_thrust = 0.1, so
     // once max_thrust is high enough that hover sits below that floor, the
     // controller CANNOT command hover and the aircraft climbs no matter how
-    // stable the attitude loop is. At 60 N hover is 0.098 -- every run reads
-    // as a flyaway, and it means nothing. Fails loudly rather than quietly
-    // producing a table of artefacts.
-    let hover = p.mass * 9.81 / p.max_thrust;
+    // stable the attitude loop is -- every run reads as a flyaway and it
+    // means nothing. Fails loudly rather than quietly producing a table of
+    // artefacts.
+    //
+    // Much harder to hit since the thrust curve became quadratic: the
+    // hover COMMAND is now the square root of the thrust fraction, so 60 N
+    // gives 0.31 where it used to give 0.098. The guard stays because the
+    // failure it catches is silent, and it now reads the curve from
+    // QuadParams rather than restating it.
+    let hover = p.hover_throttle();
     assert!(
         hover > 0.12,
-        "max_thrust {} N puts hover throttle at {:.3}, at or under the          AltitudeController's 0.1 floor -- every run would be a false flyaway",
-        p.max_thrust, hover
+        "max_thrust {} N ({:.1}:1 thrust-to-weight) puts hover throttle at {:.3}, at or under the AltitudeController's 0.1 floor -- every run would be a false flyaway",
+        p.max_thrust, p.thrust_to_weight(), hover
     );
     p
 }

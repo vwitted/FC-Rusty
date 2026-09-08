@@ -103,7 +103,7 @@ mod tests {
     #[test]
     fn nose_up_pitch_accelerates_south() {
         let p = QuadParams::default();
-        let hover = (p.mass * 9.81) / p.max_thrust;
+        let hover = p.hover_throttle();
         let mut sim = QuadSim::new(p, QuadState::hovering(50.0));
         sim.set_attitude_deg(0.0, 20.0, 0.0); // nose up
         for _ in 0..400 {
@@ -115,7 +115,7 @@ mod tests {
     #[test]
     fn right_wing_down_roll_accelerates_east() {
         let p = QuadParams::default();
-        let hover = (p.mass * 9.81) / p.max_thrust;
+        let hover = p.hover_throttle();
         let mut sim = QuadSim::new(p, QuadState::hovering(50.0));
         sim.set_attitude_deg(20.0, 0.0, 0.0); // right wing down
         for _ in 0..400 {

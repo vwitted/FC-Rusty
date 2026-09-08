@@ -51,7 +51,7 @@ fn wrap_angle(a: f32) -> f32 {
 
 fn main() {
     let params = QuadParams::default();
-    let hover_throttle = (params.mass * 9.81) / params.max_thrust;
+    let hover_throttle = params.hover_throttle();
 
     // ---- Start 20 m north, 10 m east of home, at 5 m altitude --------
     let start_x = 20.0;  // north
@@ -78,7 +78,7 @@ fn main() {
     // ---- Physics sim --------------------------------------------------
     // Pre-set motor state to hover throttle so it doesn't drop on frame 1.
     let mut sim = QuadSim {
-        motor_state: [hover_throttle; 4],
+        rotor_speed: [hover_throttle; 4],
         state: initial_state,
         params,
         last_accel_world: [0.0; 3],

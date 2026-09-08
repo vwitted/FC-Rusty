@@ -14,47 +14,45 @@
 //!
 //! # The domain the fit runs in
 //!
-//! `QuadSim` models `motor_state` as a first-order lag toward the
-//! commanded value, and then maps it LINEARLY to thrust
-//! (`motor_state * max_thrust / 4`). So the sim's `motor_tau` is the time
-//! constant of THRUST, not of rotational speed.
+//! `QuadSim` lags ROTOR SPEED with `motor_tau` and squares it for thrust
+//! (`QuadParams::thrust_frac`). So `motor_tau` is the motor's own
+//! mechanical time constant and `tau_omega_s` below is exactly it: one
+//! number, direction-independent, straight into the sim.
 //!
-//! Those are not the same number, and the difference matters in the
-//! unsafe direction. Thrust goes as the square of rotor speed, so if
-//! omega is first-order with time constant tau_omega, thrust is not
-//! first-order at all -- and on a step UP it lags omega rather than
-//! leading it. For a 2x speed step, at t = tau_omega:
+//! It was not always that simple, and the history is the reason both time
+//! constants are still reported.
 //!
-//!     omega   63% complete (first-order, by definition)
-//!     thrust  55% complete
+//! The sim used to lag THRUST and map it linearly. Thrust goes as the
+//! square of rotor speed, so a first-order model of thrust has no single
+//! time constant -- fitting one gives a different answer depending on
+//! which way the step went. Measured on synthetic data with a known
+//! tau_omega of 30 ms:
 //!
-//! because thrust's initial fractional slope is 2*w0/(w0+w_inf) of
-//! omega's -- two thirds, for that step. Fitting rotational speed and
-//! calling the answer `motor_tau` therefore hands the sim motors FASTER
-//! than the real ones, which flatters exactly the stability margin
-//! currently under investigation.
+//!     step up    tau_thrust ~= 33 ms   (omega 63% complete at t=tau,
+//!     step down  tau_thrust ~= 21 ms    thrust only 55%)
 //!
-//! (I had this backwards when writing the module and the synthetic-data
-//! test caught it. The reasoning that thrust "responds sooner because it
-//! is a steeper function" is wrong: near the start omega is at its
-//! SMALLEST, so d(omega^2)/dt = 2*omega*d(omega)/dt is suppressed
-//! exactly where the response is being established.)
+//! while tau_omega came back within 0.2 ms in every single row. That
+//! asymmetry was the model showing through as a number that would not sit
+//! still, and it forced a conservative choice: report the accelerating
+//! figure, because a rate loop arrests a rotation by ADDING thrust.
 //!
-//! So the fit runs on a thrust proxy, `omega^2`, and that is the number
-//! to put in `QuadParams::motor_tau`. Both are reported, because the
-//! ratio between them is itself a check that the capture is sane.
+//! Squaring in the sim removed the need for that choice. `tau_thrust_s`
+//! is kept because the RATIO between the two is a cheap check that the
+//! capture is sane -- it should be near 1.1-1.2 on a step up and below 1
+//! on a step down, and if it is not, something about the data is wrong.
 
 use crate::plant_log::PlantSample;
 
 /// Result of fitting one motor across one commanded step.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StepFit {
-    /// Time constant of the THRUST proxy, seconds. This is the one that
-    /// corresponds to `QuadParams::motor_tau`.
+    /// Time constant of the THRUST proxy, seconds. A diagnostic, not a
+    /// parameter: it is not the same number on a step up as on a step
+    /// down, because thrust is not first-order. See the module docs.
     pub tau_thrust_s: f32,
-    /// Time constant of rotational speed, seconds. Reported for
-    /// comparison only; SHORTER than `tau_thrust_s` on a step up. Using
-    /// it as `motor_tau` would make the sim optimistic.
+    /// Time constant of rotational speed, seconds. THIS is
+    /// `QuadParams::motor_tau` -- the sim lags rotor speed and squares
+    /// it, so this is the physical constant it wants.
     pub tau_omega_s: f32,
     /// Steady eRPM before and after the step.
     pub erpm_from: f32,
@@ -354,17 +352,17 @@ pub fn summarise_by(
     Some(TauSummary { mean_s: sum / n as f32, min_s: min, max_s: max, n })
 }
 
-/// The value to put in `QuadParams::motor_tau`: the thrust time constant
-/// on steps UP.
+/// The value to put in `QuadParams::motor_tau`: the rotor-speed time
+/// constant, over steps in both directions.
 ///
-/// Of the available numbers this is the conservative one. A rate loop
-/// arrests a rotation by adding thrust on one side, and the lag that
-/// limits it is the accelerating lag -- the longer of the two. Handing
-/// the sim the down-step figure, or the average, models motors that
-/// respond to a correction faster than the real ones do, and flatters
-/// exactly the stability margin the sim is being used to judge.
+/// Both directions because it is the same number in both -- that is what
+/// makes it the right one. This used to return the accelerating THRUST
+/// constant, which was the conservative pick among several answers that
+/// should have been one answer. The sim now squares rotor speed rather
+/// than lagging thrust, so the ambiguity is gone and the honest thing is
+/// the physical constant.
 pub fn summarise(fits: &[StepFit], max_residual_frac: f32) -> Option<TauSummary> {
-    summarise_by(fits, max_residual_frac, Dir::Up, |f| f.tau_thrust_s)
+    summarise_by(fits, max_residual_frac, Dir::Both, |f| f.tau_omega_s)
 }
 
 #[cfg(test)]
@@ -594,13 +592,14 @@ mod tests {
     }
 
     #[test]
-    fn the_recommended_tau_is_the_up_step_one() {
-        // summarise() must not quietly average the two directions: the
-        // average is shorter than the up-step figure and would model
-        // motors that answer a correction faster than they do.
+    fn the_recommended_tau_is_the_rotor_speed_one_over_both_directions() {
+        // summarise() feeds QuadParams::motor_tau, and the sim lags rotor
+        // speed. Returning a thrust constant here would put a
+        // direction-dependent number into a field that has to be one
+        // value.
         let base = StepFit {
-            tau_thrust_s: 0.030,
-            tau_omega_s: 0.026,
+            tau_thrust_s: 0.033,
+            tau_omega_s: 0.030,
             erpm_from: 1.0,
             erpm_to: 2.0,
             cmd_from: 0.08,
@@ -608,17 +607,19 @@ mod tests {
             residual_frac: 0.01,
             n: 100,
         };
-        let down = StepFit { tau_thrust_s: 0.020, cmd_from: 0.20, cmd_to: 0.08, ..base };
+        let down = StepFit { tau_thrust_s: 0.021, cmd_from: 0.20, cmd_to: 0.08, ..base };
         let s = summarise(&[base, down], 0.05).unwrap();
-        assert_eq!(s.n, 1, "only the up step counts");
+        assert_eq!(s.n, 2, "both directions count for the speed constant");
         assert!((s.mean_s - 0.030).abs() < 1e-6, "got {}", s.mean_s);
+        // ...and it must not have picked up the thrust figures, which
+        // differ from each other by 50%.
+        assert!((s.min_s - s.max_s).abs() < 1e-6, "speed tau should not vary by direction");
 
-        // And the direction filter works the other way too.
+        // The direction filters still work, for the diagnostic view.
+        let u = summarise_by(&[base, down], 0.05, Dir::Up, |f| f.tau_thrust_s).unwrap();
         let d = summarise_by(&[base, down], 0.05, Dir::Down, |f| f.tau_thrust_s).unwrap();
-        assert!((d.mean_s - 0.020).abs() < 1e-6);
-        let b = summarise_by(&[base, down], 0.05, Dir::Both, |f| f.tau_omega_s).unwrap();
-        assert_eq!(b.n, 2);
-        assert!((b.mean_s - 0.026).abs() < 1e-6);
+        assert!((u.mean_s - 0.033).abs() < 1e-6);
+        assert!((d.mean_s - 0.021).abs() < 1e-6);
     }
 
     #[test]
@@ -633,12 +634,11 @@ mod tests {
             residual_frac: 0.01,
             n: 100,
         };
-        let bad = StepFit { tau_thrust_s: 0.5, residual_frac: 0.4, ..good };
-        // Both are up-steps (0.1 -> 0.2), so only the residual separates
-        // them here.
+        let bad = StepFit { tau_omega_s: 0.5, residual_frac: 0.4, ..good };
+        // Only the residual separates them; summarise reads tau_omega_s.
         let sum = summarise(&[good, bad], 0.05).unwrap();
         assert_eq!(sum.n, 1);
-        assert!((sum.mean_s - 0.02).abs() < 1e-6);
+        assert!((sum.mean_s - 0.04).abs() < 1e-6, "got {}", sum.mean_s);
         // And if everything is rejected, say so rather than returning a
         // confident average of nothing.
         assert!(summarise(&[bad], 0.05).is_none());

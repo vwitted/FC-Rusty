@@ -53,6 +53,41 @@ pub struct QuadParams {
     pub wind_ned: [f32; 3],
 }
 
+impl QuadParams {
+    /// Thrust as a fraction of this motor's maximum, for a normalised
+    /// rotor speed.
+    ///
+    /// The single definition of the throttle-to-thrust curve. It was
+    /// implicit and linear in four separate places before, which is how
+    /// it came to be wrong in all of them at once.
+    pub fn thrust_frac(&self, rotor_speed: f32) -> f32 {
+        let s = rotor_speed.clamp(0.0, 1.0);
+        s * s
+    }
+
+    /// Normalised rotor speed -- i.e. the throttle command -- that holds
+    /// hover.
+    ///
+    /// The inverse of `thrust_frac` at the thrust-to-weight point. Note
+    /// this is NOT `mass * g / max_thrust` any more; that is the thrust
+    /// FRACTION, and the command is its square root. At the default
+    /// 3.4:1 thrust-to-weight the fraction is 0.294 and the command is
+    /// 0.542.
+    ///
+    /// Clamped: a plant that cannot lift itself would otherwise return a
+    /// speed above 1.0 and silently model a motor commanded past full.
+    pub fn hover_throttle(&self) -> f32 {
+        let frac = (self.mass * 9.81 / self.max_thrust).clamp(0.0, 1.0);
+        libm::sqrtf(frac)
+    }
+
+    /// Thrust-to-weight ratio. Reported by sweeps because it is the
+    /// number that actually characterises the airframe's authority.
+    pub fn thrust_to_weight(&self) -> f32 {
+        self.max_thrust / (self.mass * 9.81)
+    }
+}
+
 impl Default for QuadParams {
     /// Reasonable defaults for a 5" racing quad (~600g)
     fn default() -> Self {
@@ -176,7 +211,10 @@ pub struct QuadSim {
     pub state: QuadState,
     /// Actual motor output after ESC+motor lag (0.0–1.0 per motor).
     /// Commands are filtered through a first-order lag before producing thrust.
-    pub motor_state: [f32; 4],
+    /// Normalised rotor speed per motor, 0..=1. NOT thrust: thrust is
+    /// this squared (see `QuadParams::thrust_frac`). Lags the commanded
+    /// value with `motor_tau`.
+    pub rotor_speed: [f32; 4],
     /// Kinematic acceleration in world NED frame [ax, ay, az] (m/s²).
     /// Saved at the end of every `step()` so sensor simulators and the
     /// state estimator can consume it as ground truth.
@@ -194,17 +232,18 @@ impl QuadSim {
         Self {
             params,
             state: initial_state,
-            motor_state: [0.0; 4],
+            rotor_speed: [0.0; 4],
             last_accel_world: [0.0, 0.0, 0.0],
         }
     }
 
-    /// Create a sim pre-initialized for hover (motor state at hover throttle).
+    /// Create a sim pre-initialised for hover: rotor speed already at the
+    /// value that holds altitude, so the first step is an equilibrium.
     pub fn new_hovering(params: QuadParams, altitude: f32) -> Self {
-        let hover = (params.mass * 9.81) / params.max_thrust;
+        let hover = params.hover_throttle();
         Self {
             state: QuadState::hovering(altitude),
-            motor_state: [hover; 4],
+            rotor_speed: [hover; 4],
             params,
             // In hover the net specific force in world NED is zero
             // (thrust exactly cancels gravity). Kinematic accel is 0,0,0.
@@ -239,25 +278,44 @@ impl QuadSim {
     pub fn step(&mut self, motors: &MotorForces, dt: f32) {
         let p = &self.params;
 
-        // ---- Motor dynamics: first-order lag ----
-        // motor_actual += (motor_cmd - motor_actual) * (dt / tau)
-        // This models the combined ESC processing + motor/prop spin-up time.
-        // alpha = dt/tau, clamped to 1.0 for stability if dt > tau.
+        // ---- Motor dynamics: first-order lag on ROTOR SPEED ----
+        //
+        // The lag is applied to speed and thrust is its square, rather
+        // than lagging thrust directly.
+        //
+        // This used to lag thrust and map it linearly, which made
+        // `motor_tau` a quantity with no physical referent: rotor speed is
+        // what has a first-order response (it is a torque balance against
+        // rotor inertia), and thrust is proportional to speed SQUARED. A
+        // first-order model of thrust therefore has no single time
+        // constant -- fitting one to real data gives ~30 ms on a step up
+        // and ~21 ms on the step back down for the same motor, because
+        // "the first-order time constant of a squared first-order
+        // response" depends on where the step starts and which way it
+        // goes. See plant_fit.rs.
+        //
+        // With the square here, `motor_tau` is the motor's own mechanical
+        // time constant: one number, measurable from a bench capture,
+        // direction-independent.
+        //
+        // The simplification was reasonable while the sim was a rough
+        // check on firmware that did not exist yet. It stopped being
+        // reasonable once the sim became the thing deciding rate gains,
+        // because the throttle-to-thrust curve is what sets loop gain.
         let alpha = (dt / p.motor_tau).min(1.0);
         for i in 0..4 {
             let cmd = motors.motors[i].clamp(0.0, 1.0);
-            self.motor_state[i] += (cmd - self.motor_state[i]) * alpha;
+            self.rotor_speed[i] += (cmd - self.rotor_speed[i]) * alpha;
         }
 
         // ---- Convert actual motor output to forces and torques ----
 
-        // Each motor's thrust in Newtons (uses filtered motor state, not raw command)
-        let thrust_per_motor: [f32; 4] = [
-            self.motor_state[0] * p.max_thrust / 4.0,
-            self.motor_state[1] * p.max_thrust / 4.0,
-            self.motor_state[2] * p.max_thrust / 4.0,
-            self.motor_state[3] * p.max_thrust / 4.0,
-        ];
+        // Thrust in Newtons. Square of normalised rotor speed, so full
+        // speed gives max_thrust/4 and the curve through the middle is
+        // quadratic -- which is why hover sits near 54% throttle at this
+        // thrust-to-weight rather than 29%.
+        let thrust_per_motor: [f32; 4] =
+            core::array::from_fn(|i| p.thrust_frac(self.rotor_speed[i]) * p.max_thrust / 4.0);
 
         // Total thrust (acts along body Z axis, which is "up" in body frame)
         let total_thrust: f32 = thrust_per_motor.iter().sum();
@@ -498,7 +556,7 @@ mod tests {
         // At hover, total thrust = weight = mass * g
         // Per motor normalised = (mass * g) / max_thrust
         let params = QuadParams::default();
-        let hover_throttle = (params.mass * 9.81) / params.max_thrust;
+        let hover_throttle = params.hover_throttle();
 
         // Use new_hovering so motor state starts at hover throttle
         // (otherwise motor lag causes initial altitude drop)
@@ -531,14 +589,27 @@ mod tests {
             motors: [0.2, 0.2, 0.4, 0.4],
         };
 
-        // Run for 0.5 seconds
-        for _ in 0..100 {
+        // 0.1 s only. This used to run for 0.5 s and assert on the ANGLE,
+        // which is a trap: nothing damps this roll, so the aircraft
+        // reaches ~750 deg/s and passes 180 deg at about 0.45 s, at which
+        // point the Euler angle wraps and reads NEGATIVE. The test then
+        // fails while the sim is behaving correctly, and it only ever
+        // passed because the old thrust curve happened to leave it just
+        // short of the wrap.
+        //
+        // The rate cannot wrap, so it is the honest thing to assert on.
+        for _ in 0..20 {
             sim.step(&roll_right, 0.005);
         }
 
-        // Should have developed a positive roll rate and roll angle
         assert!(
-            sim.state.roll > 1.0,
+            sim.state.roll_rate > 10.0,
+            "differential thrust must produce a positive roll RATE: {} deg/s",
+            sim.state.roll_rate
+        );
+        // And the angle, over a window short enough that it cannot wrap.
+        assert!(
+            sim.state.roll > 0.1 && sim.state.roll < 180.0,
             "should have rolled: roll={}°",
             sim.state.roll
         );
@@ -558,7 +629,7 @@ mod tests {
         for _ in 0..6 {
             sim.step(&full, 0.005);
         }
-        let reached = sim.motor_state[0];
+        let reached = sim.rotor_speed[0];
         assert!(
             reached > 0.55 && reached < 0.75,
             "after 1τ should be ~63%, got {:.1}%",
@@ -570,9 +641,9 @@ mod tests {
             sim.step(&full, 0.005);
         }
         assert!(
-            sim.motor_state[0] > 0.99,
+            sim.rotor_speed[0] > 0.99,
             "after 5τ should be ~100%, got {:.1}%",
-            sim.motor_state[0] * 100.0
+            sim.rotor_speed[0] * 100.0
         );
     }
 
@@ -610,7 +681,7 @@ mod tests {
     fn hover_is_still_an_exact_equilibrium() {
         let p = hover_params();
         let mut sim = QuadSim::new_hovering(p, 5.0);
-        let hover = (p.mass * 9.81) / p.max_thrust;
+        let hover = p.hover_throttle();
         for _ in 0..8000 {
             sim.step(&MotorForces { motors: [hover; 4] }, 1.0 / 8000.0);
         }
@@ -624,7 +695,7 @@ mod tests {
     #[test]
     fn yaw_rotates_the_thrust_vector_into_the_world_frame() {
         let p = hover_params();
-        let hover = (p.mass * 9.81) / p.max_thrust;
+        let hover = p.hover_throttle();
 
         let mut level = QuadSim::new(p, QuadState::hovering(20.0));
         level.set_attitude_deg(0.0, -15.0, 0.0);
@@ -668,7 +739,7 @@ mod tests {
     fn wind_pushes_a_hovering_quad_downwind() {
         let mut p = hover_params();
         p.wind_ned = [8.0, 0.0, 0.0];
-        let hover = (p.mass * 9.81) / p.max_thrust;
+        let hover = p.hover_throttle();
         let mut sim = QuadSim::new_hovering(p, 20.0);
         for _ in 0..2000 {
             sim.step(&MotorForces { motors: [hover; 4] }, 1.0 / 400.0);
@@ -724,7 +795,7 @@ mod tests {
     fn a_full_barrel_roll_stays_finite_and_returns_to_level() {
         let p = hover_params();
         let mut sim = QuadSim::new(p, QuadState::hovering(100.0));
-        let hover = (p.mass * 9.81) / p.max_thrust;
+        let hover = p.hover_throttle();
         // 360 deg/s for exactly one second.
         sim.state.roll_rate = 360.0;
         let dt = 1.0 / 8000.0;
@@ -747,7 +818,7 @@ mod tests {
     fn pitching_through_vertical_keeps_the_quaternion_unit() {
         let p = hover_params();
         let mut sim = QuadSim::new(p, QuadState::hovering(200.0));
-        let hover = (p.mass * 9.81) / p.max_thrust;
+        let hover = p.hover_throttle();
         sim.state.pitch_rate = 180.0; // straight up and over
         let dt = 1.0 / 8000.0;
         for _ in 0..8000 {
@@ -763,7 +834,7 @@ mod tests {
     #[test]
     fn inverted_thrust_accelerates_downward_faster_than_gravity() {
         let p = hover_params();
-        let hover = (p.mass * 9.81) / p.max_thrust;
+        let hover = p.hover_throttle();
 
         let mut inverted = QuadSim::new(p, QuadState::hovering(500.0));
         inverted.set_attitude_deg(180.0, 0.0, 0.0);

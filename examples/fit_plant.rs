@@ -123,27 +123,26 @@ fn main() {
         let om = summarise_by(&fits, MAX_RESIDUAL, Dir::Both, |f| f.tau_omega_s);
         let up = summarise_by(&fits, MAX_RESIDUAL, Dir::Up, |f| f.tau_thrust_s);
         let dn = summarise_by(&fits, MAX_RESIDUAL, Dir::Down, |f| f.tau_thrust_s);
-        if let Some(o) = om {
-            println!(
-                "  tau_omega  = {:.1} ms  (spread {:.1}..{:.1}, {} steps) <- the motor's own constant",
-                o.mean_s * 1e3, o.min_s * 1e3, o.max_s * 1e3, o.n
-            );
-        }
-        match (up, dn) {
-            (Some(u), Some(d)) => {
-                per_motor_tau[m] = u.mean_s;
+        match om {
+            Some(o) => {
+                per_motor_tau[m] = o.mean_s;
                 println!(
-                    "  tau_thrust = {:.1} ms accelerating, {:.1} ms decelerating",
-                    u.mean_s * 1e3,
-                    d.mean_s * 1e3
+                    "  motor_tau = {:.1} ms  (spread {:.1}..{:.1} over {} steps, both directions)",
+                    o.mean_s * 1e3, o.min_s * 1e3, o.max_s * 1e3, o.n
                 );
-                println!("  motor_tau  = {:.1} ms  (the accelerating figure)", u.mean_s * 1e3);
             }
-            (Some(u), None) => {
-                per_motor_tau[m] = u.mean_s;
-                println!("  motor_tau  = {:.1} ms  (no usable down-steps)", u.mean_s * 1e3);
-            }
-            _ => println!("  no accepted accelerating step — cannot set motor_tau"),
+            None => println!("  every step rejected — response is not first-order"),
+        }
+        // Thrust constants are a sanity check now, not a parameter. They
+        // SHOULD differ by direction; if they do not, the capture is
+        // suspect. See plant_fit's module docs.
+        if let (Some(u), Some(d)) = (up, dn) {
+            println!(
+                "    (thrust-domain check: {:.1} ms up / {:.1} ms down, ratio {:.2} — expect >1)",
+                u.mean_s * 1e3,
+                d.mean_s * 1e3,
+                u.mean_s / d.mean_s,
+            );
         }
         println!();
         all_fits.extend(fits);
@@ -157,19 +156,14 @@ fn main() {
         }
         Some(s) => {
             println!(
-                "motor_tau = {:.4} s   ({:.1} ms, from {} accelerating steps across all motors)",
+                "motor_tau = {:.4} s   ({:.1} ms, from {} steps across all motors)",
                 s.mean_s,
                 s.mean_s * 1e3,
                 s.n
             );
             println!("  sim default is 0.03 s — see QuadParams::motor_tau");
-            if let Some(o) = summarise_by(&all_fits, MAX_RESIDUAL, Dir::Both, |f| f.tau_omega_s) {
-                println!(
-                    "  (rotor-speed constant is {:.1} ms; thrust is speed squared, so the two\n\
-                   \x20  differ and only the speed one is direction-independent)",
-                    o.mean_s * 1e3
-                );
-            }
+            println!("  This is the rotor-speed constant, which is what QuadSim lags;");
+            println!("  it squares speed for thrust, so this is direction-independent.");
 
             // Motor-to-motor spread is worth more than the mean here. The
             // mean is what the sim wants; the spread is what tells you a
