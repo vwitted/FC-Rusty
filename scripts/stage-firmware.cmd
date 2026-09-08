@@ -1,66 +1,41 @@
 @echo off
 setlocal
 
-rem stage-firmware.cmd - build both firmware variants and put them where
-rem the Renode harness reads them.
+rem stage-firmware.cmd - Windows wrapper around scripts/stage-firmware.sh.
 rem
-rem Four of the five Renode checks need a staged ELF and none of them build
-rem it, so this was a manual build-and-copy dance repeated every time the
-rem firmware changed. It is exactly the step that gets skipped: on
-rem 2026-09-08 the staged motor-test ELF was two weeks old, so the DShot
-rem checks had been passing against a build that predated the plant-capture
-rem work entirely. A stale ELF does not fail, it reports on the wrong
-rem firmware -- see the FC_BUILD_STAMP note in motor_test.rs for the same
-rem hazard biting on a bench.
+rem Locates Git Bash and hands off, so the build-and-copy logic exists in
+rem ONE place. What gets duplicated here is only the Git Bash discovery,
+rem which is about where Git happens to be installed and does not change;
+rem the build steps, which do change, are not duplicated. Same split as
+rem test-host.cmd and the workspace's run-tests.cmd.
 rem
-rem Order matters: motor-test is built FIRST and flight SECOND, so the
-rem repo's own target/ tree is left holding the flight build. Both variants
-rem write to the same cargo output path, and leaving motor-test there means
-rem the next manual copy silently stages the wrong one.
+rem `bash` on PATH under PowerShell is WSL (C:\WINDOWS\system32\bash.exe),
+rem a separate Linux environment with no Rust toolchain and no Renode.
 rem
 rem   scripts\stage-firmware.cmd
 
-set "REPO=%~dp0.."
-set "WORKSPACE=%REPO%\.."
-set "OUT=%REPO%\target\thumbv7em-none-eabihf\release\fc-firmware"
-set "DEST=%WORKSPACE%\target\thumbv7em-none-eabihf\release"
+set "SCRIPT_DIR=%~dp0"
+set "GIT_BASH="
 
-if not exist "%DEST%" (
-    echo !! Renode harness staging directory not found:
-    echo    %DEST%
-    echo    These builds are only needed by the Renode checks, which live in
-    echo    the workspace containing this checkout and are not part of this
-    echo    repository. Nothing to stage.
-    exit /b 2
-)
+if exist "%ProgramFiles%\Git\bin\bash.exe" set "GIT_BASH=%ProgramFiles%\Git\bin\bash.exe"
+if not defined GIT_BASH if exist "%ProgramFiles(x86)%\Git\bin\bash.exe" set "GIT_BASH=%ProgramFiles(x86)%\Git\bin\bash.exe"
+if not defined GIT_BASH if exist "%LOCALAPPDATA%\Programs\Git\bin\bash.exe" set "GIT_BASH=%LOCALAPPDATA%\Programs\Git\bin\bash.exe"
 
-pushd "%REPO%" || exit /b 1
+if not defined GIT_BASH for /f "delims=" %%G in ('where git 2^>nul') do call :derive "%%G"
 
-echo ==^> building motor-test firmware
-cargo build --release --features motor-test
-if errorlevel 1 goto :fail
-copy /y "%OUT%" "%DEST%\fc-firmware-motortest" >nul
-if errorlevel 1 goto :fail
+if not defined GIT_BASH goto :nobash
 
-echo ==^> building flight firmware
-cargo build --release
-if errorlevel 1 goto :fail
-copy /y "%OUT%" "%DEST%\fc-firmware" >nul
-if errorlevel 1 goto :fail
+"%GIT_BASH%" "%SCRIPT_DIR%stage-firmware.sh" %*
+exit /b %ERRORLEVEL%
 
-rem The workspace root keeps a second copy of the flight ELF, and the root
-rem CLAUDE.md states the two are byte-identical. Keep that true here rather
-rem than leaving it to be noticed later.
-copy /y "%OUT%" "%WORKSPACE%\fc-firmware" >nul
-if errorlevel 1 goto :fail
+:derive
+if defined GIT_BASH goto :eof
+set "CANDIDATE=%~dp1..\bin\bash.exe"
+for %%F in ("%CANDIDATE%") do set "CANDIDATE=%%~fF"
+if exist "%CANDIDATE%" set "GIT_BASH=%CANDIDATE%"
+goto :eof
 
-popd
-echo.
-echo staged: fc-firmware ^(flight^), fc-firmware-motortest ^(bench^)
-echo run the checks with scripts\test-^<name^>.cmd, or tests\run-tests.cmd
-exit /b 0
-
-:fail
-popd
-echo !! staging failed
+:nobash
+echo !! could not find Git Bash ^(bash.exe^).
+echo    Install Git for Windows, or run scripts/stage-firmware.sh from Git Bash.
 exit /b 1
