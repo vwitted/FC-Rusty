@@ -61,6 +61,7 @@ mod drivers {
     pub mod dshot_frame;
     pub mod icm42688;
     pub mod ism6hg256x;
+    pub mod hmc5883l;
     pub mod lis2mdl;
     pub mod mag;
     pub mod qmc5883l;
@@ -129,6 +130,7 @@ use control::position::{PositionController, PositionGains};
 use drivers::baro::{self, BaroSample};
 use drivers::crsf::RcChannels;
 use drivers::dshot_bb_decode::BbTelemetry;
+use drivers::hmc5883l::Hmc5883l;
 use drivers::lis2mdl::Lis2mdl;
 use drivers::mag::{MagError, MagSample, Orientation as MagOrientation};
 use drivers::qmc5883l::Qmc5883l;
@@ -238,7 +240,7 @@ static BARO_DATA: Signal<CriticalSectionRawMutex, BaroSample> = Signal::new();
 
 /// Latest LIS2MDL magnetometer sample (body-frame, oriented). Signalled
 /// by the baro task at 100 Hz (the chip's continuous-mode ODR — the
-/// LIS2MDL shares the I2C1 bus with the baro and is owned by the same
+/// The magnetometer shares the I2C2 bus with the baro and is owned by the same
 /// task so no bus arbitration is needed). Consumed by `mekf_task`
 /// where it feeds `AttitudeMekf::update_mag`, making yaw observable.
 /// Absent when the breakout failed to init — `mekf_task` simply runs
@@ -577,7 +579,10 @@ async fn main(spawner: Spawner) {
         }
     }
 
-    // ---- Baro on I2C1 (DPS310 or BMP280, auto-detected) ----
+    // ---- Baro + mag on I2C2 (SPL06/DPS310/BMP280 auto-detected) ----
+    // The board's ONLY I2C bus. Betaflight's DAKEFPVH743 target defines
+    // just I2C2 (PB10/PB11) and puts both BARO_I2C_INSTANCE and
+    // MAG_I2C_INSTANCE on it, so the SDA/SCL pads are this bus.
     // SCL=PB10, SDA=PB11. Blocking mode.
     //
     // The task owns the raw peripherals (not a pre-built I2c) so it can
@@ -672,70 +677,175 @@ async fn blink_task(mut led: embassy_stm32::gpio::Output<'static>) {
 // ---- Persist Task ----
 /// Whichever magnetometer is actually fitted.
 ///
-/// Two are supported and they are not alternatives in the "pick one in a
-/// config" sense -- they live on different boards. The LIS2MDL is the
-/// breakout on the FC; the QMC5883L is inside the Radiolink SE100 GPS
-/// module. Either, both or neither may be plugged in on a given day, and
-/// the addresses do not collide (0x1E vs 0x0D), so the honest thing is to
-/// ask the bus rather than to carry a build flag someone will forget to
-/// flip.
+/// Three are supported and they are not alternatives in the "pick one in
+/// a config" sense -- they live on different boards. The LIS2MDL is the
+/// breakout on the FC; the Radiolink SE100 GPS module carries EITHER a
+/// QMC5883L or an HMC5883L depending on production run, and the two are
+/// externally identical. Any of them may be plugged in on a given day, so
+/// the honest thing is to ask the bus rather than to carry a build flag
+/// someone will forget to flip.
 ///
 /// Downstream sees only `MagSample`, so nothing past this enum knows or
 /// cares which part answered.
 enum Compass {
     Lis2mdl(Lis2mdl),
+    Hmc5883l(Hmc5883l),
     Qmc5883l(Qmc5883l),
 }
 
-/// The shared I2C1 handle as the baro/mag task owns it: blocking master.
+/// The shared I2C2 handle as the baro/mag task owns it: blocking master.
 type MagBus<'a> = embassy_stm32::i2c::I2c<'a, embassy_stm32::mode::Blocking, embassy_stm32::i2c::Master>;
 
+/// Which 7-bit addresses acknowledged during a bus scan.
+///
+/// Sixteen is far more than one FC bus will ever carry; the cap exists
+/// so a shorted SDA (every address "answers") cannot overrun anything.
+struct BusScan {
+    addrs: [u8; 16],
+    n: usize,
+    /// A non-NACK error (timeout, arbitration loss) stopped the scan
+    /// early. The bus itself is unhealthy and `addrs` is partial.
+    fault: bool,
+}
+
+impl BusScan {
+    fn addrs(&self) -> &[u8] {
+        &self.addrs[..self.n]
+    }
+}
+
+/// Knock on every valid 7-bit address and record who answers.
+///
+/// This is the agnostic half of mag detection. The three supported parts
+/// sit at two addresses, the SE100 has changed part across revisions
+/// without changing its label, and a probe that only tries the addresses
+/// it expects reports "no magnetometer" for a live part at 0x0E just as
+/// confidently as for an empty connector. Logging the ACK list first
+/// means a wrong guess is diagnosable from the log alone.
+///
+/// One-byte reads, not zero-length writes: embassy's v2 I2C rejects
+/// zero-length transfers, and a single register read is harmless to
+/// every part known to sit on this bus (the baro's pointer, the QMC's
+/// data register, the HMC's pointer -- all of which init rewrites).
+fn scan_bus(i2c: &mut MagBus<'_>) -> BusScan {
+    use embassy_stm32::i2c::Error as I2cError;
+    let mut out = BusScan { addrs: [0; 16], n: 0, fault: false };
+    // 0x00-0x07 and 0x78-0x7F are reserved (general call, 10-bit, etc.).
+    for addr in 0x08u8..=0x77 {
+        let mut b = [0u8; 1];
+        match i2c.blocking_read(addr, &mut b) {
+            Ok(()) => {
+                if out.n < out.addrs.len() {
+                    out.addrs[out.n] = addr;
+                    out.n += 1;
+                }
+            }
+            Err(I2cError::Nack) => {}
+            Err(_) => {
+                out.fault = true;
+                break;
+            }
+        }
+    }
+    out
+}
+
 impl Compass {
-    /// Try each supported part in turn; return the first that answers.
+    /// Scan the bus, then try a driver for each address that answered.
     ///
-    /// Order is deliberate: the LIS2MDL is soldered to the FC and the
-    /// QMC5883L arrives on a cable, so if both are present the fixed one
+    /// Order is deliberate: whatever is at 0x1E (the LIS2MDL soldered to
+    /// the FC, or an HMC5883L) is tried before the QMC5883L at 0x0D, so
+    /// if a fixed part and a cabled one are both present the fixed one
     /// wins. A part on a GPS mast has a better magnetic environment but
     /// an unknown orientation, which is the opposite trade and not one to
     /// make silently.
     ///
+    /// At 0x1E the two candidates are told apart by read-only identity
+    /// registers before either driver writes anything: LIS2MDL WHO_AM_I
+    /// (0x4F) == 0x40, HMC5883L ID A..C (0x0A..0x0C) == "H43". Their
+    /// register maps do not overlap, so a mismatch on one is not evidence
+    /// for the other; both are checked and both results are logged.
+    ///
     /// ORIENTATION IS UNVERIFIED FOR THE SE100. Identity is a placeholder
-    /// for both parts: this firmware has never flown, and the mounting of
-    /// the QMC5883L inside the SE100 relative to the airframe has not
-    /// been checked on the bench. A wrong Orientation here does not
-    /// degrade yaw, it inverts or mirrors it. Confirm against the
-    /// magnitude and axis signs logged below before trusting heading.
+    /// for every part: this firmware has never flown, and the mounting of
+    /// the compass inside the SE100 relative to the airframe has not been
+    /// checked on the bench. A wrong Orientation here does not degrade
+    /// yaw, it inverts or mirrors it. Confirm against the magnitude and
+    /// axis signs logged below before trusting heading.
     async fn probe(i2c: &mut MagBus<'_>) -> Option<Self> {
-        match Lis2mdl::init(i2c, MagOrientation::Identity).await {
-            Ok(d) => {
-                defmt::info!("Magnetometer: LIS2MDL online @ 100 Hz (I2C 0x1E)");
-                return Some(Self::Lis2mdl(d));
-            }
-            Err(e) => defmt::info!("Magnetometer: no LIS2MDL ({:?}), trying QMC5883L", e),
+        use drivers::mag::{describe_addr, LIS2MDL_OR_HMC5883L_ADDR, QMC5883L_ADDR};
+
+        let scan = scan_bus(i2c);
+        if scan.fault {
+            defmt::warn!("I2C2 scan: bus fault mid-scan (timeout/arbitration); list is partial");
+        }
+        if scan.n == 0 {
+            defmt::warn!("I2C2 scan: nothing acknowledged 0x08-0x77 (not even the baro)");
+        }
+        for &a in scan.addrs() {
+            defmt::info!("I2C2 scan: ACK @ 0x{=u8:02x} ({})", a, describe_addr(a));
         }
 
-        match Qmc5883l::init(i2c, MagOrientation::Identity).await {
-            Ok(d) => {
-                defmt::info!("Magnetometer: QMC5883L online @ 200 Hz (I2C 0x0D, SE100)");
-                let c = Self::Qmc5883l(d);
+        let mut found: Option<Self> = None;
+
+        if scan.addrs().contains(&LIS2MDL_OR_HMC5883L_ADDR) {
+            match Lis2mdl::init(i2c, MagOrientation::Identity).await {
+                Ok(d) => {
+                    defmt::info!("Magnetometer: LIS2MDL online @ 100 Hz (I2C 0x1E)");
+                    found = Some(Self::Lis2mdl(d));
+                }
+                Err(e) => defmt::info!("Magnetometer: 0x1E is not a LIS2MDL ({:?})", e),
+            }
+            if found.is_none() {
+                match Hmc5883l::init(i2c, MagOrientation::Identity).await {
+                    Ok(d) => {
+                        defmt::info!("Magnetometer: HMC5883L online @ 75 Hz (I2C 0x1E, SE100)");
+                        found = Some(Self::Hmc5883l(d));
+                    }
+                    Err(e) => {
+                        let id = Hmc5883l::read_id(i2c).unwrap_or([0; 3]);
+                        defmt::info!(
+                            "Magnetometer: 0x1E is not an HMC5883L either ({:?}; ID regs 0x{=u8:02x} 0x{=u8:02x} 0x{=u8:02x}, want 48 34 33)",
+                            e, id[0], id[1], id[2],
+                        );
+                    }
+                }
+            }
+        }
+
+        if found.is_none() && scan.addrs().contains(&QMC5883L_ADDR) {
+            match Qmc5883l::init(i2c, MagOrientation::Identity).await {
+                Ok(d) => {
+                    defmt::info!("Magnetometer: QMC5883L online @ 200 Hz (I2C 0x0D, SE100)");
+                    found = Some(Self::Qmc5883l(d));
+                }
+                Err(e) => defmt::info!("Magnetometer: 0x0D answered but QMC5883L init failed ({:?})", e),
+            }
+        }
+
+        match found {
+            Some(c) => {
                 // One reading at init, purely so bring-up has a number to
                 // judge. Earth's field is 25-65 uT everywhere on the
                 // surface; anything outside that is a scale or wiring
                 // fault, and it is far cheaper to see it here than to
                 // discover it as a slow yaw error in flight.
-                if let Ok(s) = c.read(i2c) {
-                    let v = s.ut();
-                    defmt::info!(
-                        "Magnetometer: |B| = {=f32} uT, body [{=f32}, {=f32}, {=f32}] uT (expect 25-65 uT)",
-                        s.magnitude_ut(), v[0], v[1], v[2],
-                    );
+                match c.read(i2c) {
+                    Ok(s) => {
+                        let v = s.ut();
+                        defmt::info!(
+                            "Magnetometer: |B| = {=f32} uT, body [{=f32}, {=f32}, {=f32}] uT (expect 25-65 uT)",
+                            s.magnitude_ut(), v[0], v[1], v[2],
+                        );
+                    }
+                    Err(e) => defmt::warn!("Magnetometer: first read failed ({:?})", e),
                 }
                 Some(c)
             }
-            Err(e) => {
+            None => {
                 defmt::warn!(
-                    "Magnetometer: none found ({:?}) — continuing without mag (yaw will drift)",
-                    e,
+                    "Magnetometer: none found among {} ACKing address(es) — continuing without mag (yaw will drift)",
+                    scan.n,
                 );
                 None
             }
@@ -745,6 +855,7 @@ impl Compass {
     fn read(&self, i2c: &mut MagBus<'_>) -> Result<MagSample, MagError> {
         match self {
             Self::Lis2mdl(d) => d.read(i2c),
+            Self::Hmc5883l(d) => d.read(i2c),
             Self::Qmc5883l(d) => d.read(i2c),
         }
     }
@@ -1935,14 +2046,14 @@ async fn pos_kf_task() {
 }
 
 // ---- Baro Task (Phase 4) ----
-// Owns I2C1 + SCL/SDA pins directly (not a pre-built I2c) so it can
+// Owns I2C2 + SCL/SDA pins directly (not a pre-built I2c) so it can
 // drop the driver and bitbang SCL to unstick the bus when the STM32
 // I2C peripheral latches BUSY/ARLO on some platforms.
 // If it times out at the 25 Hz tick rate, we use a recovery sequence.
 // timeouts at the 25 Hz tick rate (≈25 errs/s), no reads.
 //
 // Recovery sequence:
-//   1. Drop the `I2c` — this disconnects pins and disables I2C1 RCC.
+//   1. Drop the `I2c` — this disconnects pins and disables I2C2 RCC.
 //   2. Drive SCL as **open-drain** output (never push-pull!), toggle 9×
 //      at ~100 kHz. Slave finishes whatever partial byte it was holding
 //      SDA low for.
@@ -1970,6 +2081,11 @@ async fn pos_kf_task() {
 const BARO_ERR_STREAK_RECOVERY: u32 = 50; // ~0.4 s at 125 Hz
 const BARO_TIMEOUT_MS: u64 = 5; // shorter wastes less CPU when stuck
 const BARO_MAX_INIT_ATTEMPTS: u32 = 5; // give up after this many detect/init failures
+/// Magnetometer probes before giving up, and the gap between them. Five
+/// probes over eight seconds covers a GPS module that powers up slowly;
+/// each probe is a full 0x08-0x77 scan, cheap because a NACK is immediate.
+const MAG_MAX_PROBES: u32 = 5;
+const MAG_REPROBE_S: u64 = 2;
 
 #[embassy_executor::task]
 async fn baro_task(
@@ -2090,21 +2206,28 @@ async fn baro_task(
         init_failures = 0;
 
         // ---- Magnetometer (same bus, optional) ----
-        // The mag shares I2C1 with the baro. We init it here so it can't
+        // The mag shares I2C2 with the baro. We init it here so it can't
         // get stuck waiting for the bus owner — if absent or DOA, we
         // continue without mag fusion (yaw stays unobservable in the
-        // MEKF, exactly the pre-magnetometer behaviour). Both supported
+        // MEKF, exactly the pre-magnetometer behaviour). All supported
         // parts run continuous conversion after init, so we just poll
         // once per tick (125 Hz) and let the chip's own ODR cap the
         // effective rate.
-        let mag = Compass::probe(&mut i2c).await;
+        //
+        // Re-probed a few times from the read loop if nothing answered:
+        // a compass on the GPS connector is powered through that module
+        // and can come up after this task does.
+        let mut mag = Compass::probe(&mut i2c).await;
+        let mut mag_probes: u32 = 1;
+        let mut last_mag_probe = Instant::now();
 
         // ---- Read loop ----
         // SPL06 configured at 128 Hz; tick at 8 ms (125 Hz) to consume
-        // each new sample without skipping. The LIS2MDL runs at 100 Hz so
-        // polling at 125 Hz yields ~20% duplicate samples; the QMC5883L
-        // runs at 200 Hz so we undersample it instead. Both are harmless
-        // — the MEKF does a try_take and skips when no new data arrived.
+        // each new sample without skipping. The LIS2MDL runs at 100 Hz
+        // and the HMC5883L at 75 Hz, so polling at 125 Hz yields some
+        // duplicate samples; the QMC5883L runs at 200 Hz so we
+        // undersample it instead. All harmless — the MEKF does a try_take
+        // and skips when no new data arrived.
         let mut ticker = Ticker::every(Duration::from_millis(8)); // 125 Hz
         let mut reads: u32 = 0;
         let mut errs: u32 = 0;
@@ -2126,6 +2249,19 @@ async fn baro_task(
                 Err(_) => {
                     errs = errs.wrapping_add(1);
                     streak = streak.saturating_add(1);
+                }
+            }
+
+            if mag.is_none()
+                && mag_probes < MAG_MAX_PROBES
+                && Instant::now() - last_mag_probe >= Duration::from_secs(MAG_REPROBE_S)
+            {
+                mag_probes += 1;
+                defmt::info!("Magnetometer: re-probing ({}/{})", mag_probes, MAG_MAX_PROBES);
+                mag = Compass::probe(&mut i2c).await;
+                last_mag_probe = Instant::now();
+                if mag.is_none() && mag_probes >= MAG_MAX_PROBES {
+                    defmt::warn!("Magnetometer: giving up after {} probes", MAG_MAX_PROBES);
                 }
             }
 

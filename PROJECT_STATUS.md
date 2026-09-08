@@ -22,6 +22,7 @@ material hardware or design change lands (see `CLAUDE.md`).
 | SPI1 + PA4             | ICM-42688P IMU1 (onboard)         | ✅ verified — 8 kHz reads, MEKF fusing         |
 | SPI4 + PB1             | ICM-42688P IMU2 (onboard)         | ✅ verified — 8 kHz reads, averaged with IMU1  |
 | I2C2 (PB10/PB11)       | SPL06 barometer (onboard)         | ✅ proper driver — 128 Hz, correct calibration              |
+| I2C2 (PB10/PB11)       | Magnetometer, external (SDA/SCL pads; SE100 GPS carries QMC5883L *or* HMC5883L) | 🟡 2026-09-08: bench probe found nothing at 0x0D; probe rewritten to scan 0x08–0x77 and identify by ID regs, HMC5883L driver added. Not yet re-tested on the bench. |
 | PA0/PA1/PA2/PA3 (GPIO) | DShot600 bit-banged, motors M1–M4 | ✅ bidir verified 2026-08-08 — decoded eRPM on M1/M2/M3; M4 replies outside the capture window (ESC-side, open). TIM1 is a pacer only; DMA2_CH2 drives BSRR / samples IDR |
 | PD10                   | Status LED (active low)           | ✅ heartbeat blink task                        |
 | USB-C                  | DFU flashing                      | ✅ verified — no SWD on this board             |

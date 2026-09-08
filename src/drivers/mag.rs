@@ -1,7 +1,8 @@
 // mag.rs — the parts of a magnetometer driver that are not chip-specific.
 //
-// Two magnetometers now feed the same pipeline: the LIS2MDL (STMicro,
-// 0x1E) and the QMC5883L (QST, 0x0D) on the Radiolink SE100 GPS module.
+// Three magnetometers now feed the same pipeline: the LIS2MDL (STMicro,
+// 0x1E), and whichever of the QMC5883L (QST, 0x0D) or HMC5883L
+// (Honeywell, 0x1E) a given Radiolink SE100 GPS module carries.
 // Everything downstream of the driver -- MAG_DATA, MagCalibrator,
 // AttitudeMekf::update_mag -- consumes `MagSample::ut()` and has no
 // business knowing which part produced it.
@@ -9,7 +10,8 @@
 // So the sample type carries its own scale rather than reading a
 // per-chip constant. That is the whole difference between the two
 // drivers as far as the fusion code is concerned: 0.15 uT/LSB for the
-// LIS2MDL, 0.0333 uT/LSB for the QMC5883L at +/-8 G.
+// LIS2MDL, 0.0333 uT/LSB for the QMC5883L at +/-8 G, 0.122 uT/LSB for
+// the HMC5883L at +/-1.9 G.
 //
 // Host-testable: nothing here touches embassy or I2C.
 
@@ -115,6 +117,36 @@ pub enum MagError {
     /// indistinguishable from an idle bus, and a readback is the only
     /// honest presence test.
     NotResponding,
+    /// The part reported a saturated axis. The sample is meaningless,
+    /// not merely large, and must not be fused. See `hmc5883l`: the
+    /// HMC5883L signals this with -4096 in the axis itself.
+    Overflow,
+}
+
+// ---- Bus scan support ----
+
+/// Every 7-bit address a magnetometer this firmware knows about answers
+/// at, with the parts that share it. Two parts at one address is the
+/// normal case, not the exception: 0x1E is both the LIS2MDL and the
+/// HMC5883L, whose register maps have nothing in common.
+pub const LIS2MDL_OR_HMC5883L_ADDR: u8 = 0x1E;
+pub const QMC5883L_ADDR: u8 = 0x0D;
+
+/// Name whatever is expected at an address, for the scan log. The scan
+/// exists because the SE100's compass has changed part twice across
+/// revisions, and a probe that only knocks on the doors it expects tells
+/// you nothing when the part is behind a different one.
+pub const fn describe_addr(addr: u8) -> &'static str {
+    match addr {
+        QMC5883L_ADDR => "QMC5883L",
+        LIS2MDL_OR_HMC5883L_ADDR => "LIS2MDL or HMC5883L",
+        0x0E => "IST8310",
+        0x30 | 0x31 => "MMC5983 / RM3100",
+        0x76 | 0x77 => "baro (SPL06 / DPS310 / BMP280)",
+        0x28..=0x2F => "BNO055 / AK09916 range",
+        0x68 | 0x69 => "MPU/ICM IMU or DS3231",
+        _ => "unknown",
+    }
 }
 
 #[cfg(test)]

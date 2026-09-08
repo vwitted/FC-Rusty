@@ -51,11 +51,12 @@ pub mod drivers {
     pub mod orientation;
     pub mod nmea;
     // Host-testable halves of the magnetometer stack. The I2C
-    // transactions inside qmc5883l are behind `firmware`; the register
+    // transactions inside qmc5883l/hmc5883l are behind `firmware`; the register
     // packing and sample decoding are not, and those are the parts that
     // are worth testing against the datasheet.
     pub mod mag;
     pub mod qmc5883l;
+    pub mod hmc5883l;
     // The UBX parser is pure too, and the M8030 on the SE100 speaks it.
     pub mod ubx;
     pub mod gps_adapt;

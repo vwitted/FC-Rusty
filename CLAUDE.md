@@ -152,7 +152,10 @@ Flashing needs `dfu-util` and `lsusb`, so it is a Debian job; only
 - `src/estimation.rs` — 6-state PosKF.
 - `src/attitude_mekf.rs` — quaternion MEKF (gyro-bias state).
 - `src/drivers/` — ICM-42688P, DPS310, CRSF, NMEA, WT901B (fallback),
-  DShot. The DShot driver is `dshot_bitbang.rs` (TIM1-paced DMA to
+  DShot. Magnetometers: `lis2mdl.rs`, `qmc5883l.rs`, `hmc5883l.rs` share
+  `mag.rs`; the SE100 GPS carries either 5883 variant and they differ in
+  address, register map, axis order and endianness, so `Compass::probe`
+  in main.rs scans the bus and identifies by ID register, never by guess. The DShot driver is `dshot_bitbang.rs` (TIM1-paced DMA to
   GPIOA BSRR/IDR) with `dshot_bb_frame.rs` building the BSRR words and
   `dshot_bb_decode.rs` decoding the bidir reply; `dshot_frame.rs` is
   the shared 16-bit frame encoder.
