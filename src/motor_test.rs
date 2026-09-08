@@ -19,6 +19,13 @@ pub struct MotorTestConfig {
     /// Run the plant-characterisation step profile instead of holding a
     /// constant throttle, capture the response, and dump it afterwards.
     ///
+    /// Set by the `PLANT_CAPTURE=1` build environment variable. NOT
+    /// `PROFILE`: flash-motor-test.sh uses a shell variable of that name
+    /// for the cargo profile, and assigning to an already-exported name
+    /// keeps it exported, so `PROFILE=1 scripts/flash-motor-test.sh`
+    /// arrived at cargo as PROFILE=release and quietly turned the capture
+    /// OFF -- while the operator had put props on for it.
+    ///
     /// Ignores `motor_pct` entirely: the profile drives all four motors
     /// together from `plant_capture::PROFILE`, so a capture is the same
     /// experiment every time and the four fits are comparable.
@@ -59,8 +66,8 @@ fn parse_config(
         .and_then(|s| s.trim().parse::<u8>().ok())
         .unwrap_or(DEFAULT_LOOP_KHZ)
         .clamp(MIN_LOOP_KHZ, MAX_LOOP_KHZ);
-    // Opt-in only. An unset PROFILE must never start a scripted run that
-    // ramps the motors on its own.
+    // Opt-in only. An unset PLANT_CAPTURE must never start a scripted run
+    // that ramps the motors on its own.
     let profile = matches!(profile.map(|s| s.trim()), Some("1"));
     MotorTestConfig {
         motor_pct,
@@ -139,7 +146,7 @@ pub fn resolve_config() -> MotorTestConfig {
         ],
         option_env!("BIDIR"),
         option_env!("LOOP_KHZ"),
-        option_env!("PROFILE"),
+        option_env!("PLANT_CAPTURE"),
     )
 }
 
@@ -290,14 +297,17 @@ mod tests {
 
     #[test]
     fn profile_is_opt_in_and_only_on_an_exact_one() {
-        // An unset or fat-fingered PROFILE must not start a scripted run
-        // that ramps the motors by itself. Anything but "1" is off.
+        // An unset or fat-fingered PLANT_CAPTURE must not start a scripted
+        // run that ramps the motors by itself. Anything but "1" is off.
+        //
+        // The "release" case is not hypothetical: PROFILE was the original
+        // name and flash-motor-test.sh clobbered it with exactly that.
         assert!(!parse_config([None; 4], None, None, None).profile);
         assert!(parse_config([None; 4], None, None, Some("1")).profile);
-        for junk in ["0", "", "yes", "true", "2", " "] {
+        for junk in ["0", "", "yes", "true", "2", " ", "release", "debug"] {
             assert!(
                 !parse_config([None; 4], None, None, Some(junk)).profile,
-                "PROFILE={junk:?} must not enable the profile"
+                "PLANT_CAPTURE={junk:?} must not enable the profile"
             );
         }
         // Whitespace around a real 1 is still a 1 -- shell quoting adds it.

@@ -8,7 +8,7 @@
 // `capture.log` is whatever defmt-print emitted while the motor-test
 // firmware dumped its capture:
 //
-//   PROFILE=1 BIDIR=1 cargo build --release --features motor-test
+//   PLANT_CAPTURE=1 BIDIR=1 cargo build --release --features motor-test
 //   ...flash, then...
 //   <serial reader> | defmt-print -e target/.../fc-firmware | tee capture.log
 //

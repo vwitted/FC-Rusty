@@ -31,11 +31,17 @@ fn emit_motor_test_env_deps() {
         "LOOP_KHZ",
         "DEADTIME_US",
         "RX_SAMPLES",
-        // Without this, changing PROFILE between builds leaves the old
-        // option_env! baked in and you flash a binary that does the
+        // Without this, changing PLANT_CAPTURE between builds leaves the
+        // old option_env! baked in and you flash a binary that does the
         // opposite of what the command line said -- which on a bench with
         // props on is not a cosmetic problem.
-        "PROFILE",
+        //
+        // NOT named PROFILE. scripts/flash-motor-test.sh has a shell
+        // variable of that name for the cargo profile, and a plain
+        // assignment to an already-exported name keeps it exported --
+        // so `PROFILE=1 scripts/flash-motor-test.sh` reached cargo as
+        // PROFILE=release and silently disabled the capture. Verified.
+        "PLANT_CAPTURE",
     ] {
         println!("cargo:rerun-if-env-changed={var}");
     }

@@ -36,7 +36,9 @@
 //!
 //! Everything here except the `hw` module is pure and host-tested.
 
-use crate::plant_log::{PlantSample, RECORD_LEN};
+// PlantSample is only needed by the hardware half and the tests; a
+// host build without `firmware` has neither, so it is imported there.
+use crate::plant_log::RECORD_LEN;
 
 /// Flash-relative offset of the log region: bank 2 base, 0x08100000 minus
 /// FLASH_BASE 0x08000000. Matches `BLACKBOX` in memory.x.
@@ -134,6 +136,7 @@ pub use hw::Blackbox;
 #[cfg(feature = "firmware")]
 mod hw {
     use super::*;
+    use crate::plant_log::PlantSample;
     use embassy_stm32::flash::{Blocking, Flash};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,6 +234,7 @@ mod hw {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plant_log::PlantSample;
 
     fn blank() -> [u8; RECORD_LEN] {
         [0xFF; RECORD_LEN]

@@ -23,6 +23,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+: "${FEATURES:=}"
+
 PROFILE="release"
 PROFILE_FLAG="--release"
 for arg in "$@"; do
@@ -33,11 +35,21 @@ for arg in "$@"; do
   esac
 done
 
+# Extra cargo features on top of `firmware`, comma-separated.
+#
+# An env var rather than a flag, because the arg parser above rejects
+# anything it does not recognise and that is worth keeping -- a typo in a
+# flash command should not silently flash something else. The wrapper
+# scripts (blackbox-record.sh, blackbox-dump.sh) set this.
+#
+#   FEATURES=blackbox scripts/flash-dfu.sh
+FEATURES="firmware${FEATURES:+,$FEATURES}"
+
 ELF="target/thumbv7em-none-eabihf/${PROFILE}/fc-firmware"
 BIN="target/thumbv7em-none-eabihf/${PROFILE}/fc-firmware.bin"
 
-echo "==> cargo objcopy (${PROFILE})"
-cargo objcopy ${PROFILE_FLAG} --features firmware --bin fc-firmware -- -O binary "${BIN}"
+echo "==> cargo objcopy (${PROFILE}, features: ${FEATURES})"
+cargo objcopy ${PROFILE_FLAG} --features "${FEATURES}" --bin fc-firmware -- -O binary "${BIN}"
 
 if ! lsusb | grep -q "0483:df11"; then
   echo
