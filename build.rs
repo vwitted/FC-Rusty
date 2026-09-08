@@ -31,6 +31,11 @@ fn emit_motor_test_env_deps() {
         "LOOP_KHZ",
         "DEADTIME_US",
         "RX_SAMPLES",
+        // Without this, changing PROFILE between builds leaves the old
+        // option_env! baked in and you flash a binary that does the
+        // opposite of what the command line said -- which on a bench with
+        // props on is not a cosmetic problem.
+        "PROFILE",
     ] {
         println!("cargo:rerun-if-env-changed={var}");
     }

@@ -20,7 +20,7 @@
 
 #![allow(dead_code)]
 
-use super::mag::{MagError, MagSample, Orientation};
+use super::mag::{MagSample, Orientation};
 
 // ---- I2C address ----
 
@@ -184,6 +184,8 @@ pub use hw::Qmc5883l;
 #[cfg(feature = "firmware")]
 mod hw {
     use super::*;
+    // Only the hardware half returns errors; the decode path cannot fail.
+    use super::super::mag::MagError;
     use embassy_stm32::i2c::{Error as I2cError, I2c, Master};
     use embassy_stm32::mode::Blocking;
     use embassy_time::{Duration, Timer};

@@ -92,6 +92,19 @@ mod rc_task;
 #[cfg(feature = "motor-test")]
 mod motor_test;
 
+// Plant characterisation. The record format and the profile are pure and
+// host-tested (they are in lib.rs unconditionally, which is where their
+// tests run); only the bench build links them, so the flight image does
+// not carry a 48 KB capture buffer it never fills.
+//
+// Ungate these when flight logging to flash lands -- that is the case
+// that needs a PlantSample written from the armed loop, and
+// plant_log::RECORD_LEN is already one H7 flash word for it.
+#[cfg(feature = "motor-test")]
+mod plant_capture;
+#[cfg(feature = "motor-test")]
+mod plant_log;
+
 mod persist {
     pub mod record;
     pub mod flash;
