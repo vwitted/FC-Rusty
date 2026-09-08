@@ -1,0 +1,19 @@
+# Line endings.
+#
+# This repo is developed on Windows with core.autocrlf=true, which converts
+# LF to CRLF on checkout. For shell scripts that is not cosmetic: Git Bash
+# tolerates a CRLF script, but real Linux bash does not, and this project
+# has a WSL Debian install one command away. Measured, not assumed —
+# `wsl bash -n scripts/flash-dfu.sh` on the CRLF working copy gave:
+#
+#     syntax error near unexpected token `$'do\r''
+#
+# while the same file ran fine under Git Bash. So the breakage is silent
+# until someone runs a script from WSL or CI, which is exactly when they
+# least want to be debugging line endings.
+#
+# Scoped to the two extensions that care rather than a blanket
+# `* text=auto`, which would renormalise every file in the repo and bury a
+# real change in a whitespace diff.
+*.sh text eol=lf
+*.cmd text eol=crlf
