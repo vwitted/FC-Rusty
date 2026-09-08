@@ -112,7 +112,7 @@ pub fn find_steps(
             let mut j = i + 1;
             while j < samples.len()
                 && (samples[j].cmd_f32(motor) - now).abs() < MIN_STEP
-                && samples[j].t_ms.wrapping_sub(t0) <= max_window_ms
+                && samples[j].t_ms.wrapping_sub(t0) <= max_window_ms as u32
             {
                 j += 1;
             }
@@ -380,16 +380,16 @@ mod tests {
         e_to: f32,
         quantise: bool,
     ) -> std::vec::Vec<PlantSample> {
-        let dt_ms = (1000.0 / hz) as u16;
+        let dt_ms = (1000.0 / hz) as u32;
         let mut out = std::vec::Vec::new();
-        let mut t: u16 = 0;
+        let mut t: u32 = 0;
         // Steady before the step.
-        while t < hold_ms {
+        while t < hold_ms as u32 {
             out.push(mk(t, 0.10, e_from, quantise));
             t += dt_ms;
         }
         let t_step = t;
-        while t < hold_ms * 2 {
+        while t < hold_ms as u32 * 2 {
             let dt = (t - t_step) as f32 * 1e-3;
             let e = e_to + (e_from - e_to) * (-dt / tau_omega).exp();
             out.push(mk(t, 0.20, e, quantise));
@@ -398,7 +398,7 @@ mod tests {
         out
     }
 
-    fn mk(t_ms: u16, cmd: f32, erpm: f32, quantise: bool) -> PlantSample {
+    fn mk(t_ms: u32, cmd: f32, erpm: f32, quantise: bool) -> PlantSample {
         let period = 60_000_000.0 / erpm;
         let p = if quantise { period as u16 } else { period.round() as u16 };
         PlantSample {

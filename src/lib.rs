@@ -39,6 +39,7 @@ pub mod control {
 // Plant characterisation: the record format a capture writes, and the
 // fit that turns one into QuadParams. Both pure and host-tested; the
 // capture that produces the data lives in the motor-test firmware.
+pub mod blackbox;
 pub mod plant_capture;
 pub mod plant_fit;
 pub mod plant_log;

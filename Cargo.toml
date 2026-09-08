@@ -78,6 +78,22 @@ motor-test = []
 # motor-test loop.
 dshot-rx-probe = []
 
+# Flight blackbox: log the plant to flash bank 2 during flight.
+#
+# Off by default. It costs a flash write per logged sample and a 8 KB
+# staging channel, and a flight build that logs when nobody asked is a
+# flight build doing unrequested work in the control path.
+#
+# The log survives a reflash (DFU writes bank 1 only), which is what makes
+# the workflow possible: fly with `blackbox`, then flash `blackbox-dump`
+# and read back the flight you just did.
+blackbox = []
+
+# Read the blackbox out over defmt and erase it. Does NOT fly: it dumps at
+# boot and then halts, because a dump holds interrupts off for minutes and
+# an aircraft must not be armed while that happens.
+blackbox-dump = []
+
 # Bench-only self-test for the persist flash store (sub-project A).
 # On boot: logs the pre-write read, then writes a known marker Config.
 # Power-cycle and re-flash-free reboot should then read the marker back,

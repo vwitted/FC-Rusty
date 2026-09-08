@@ -415,7 +415,7 @@ async fn run_profile(
                     _ => NO_TELEMETRY,
                 });
                 cap.push(PlantSample {
-                    t_ms: t_ms as u16,
+                    t_ms,
                     cmd: [plant_capture::cmd_units(pct); 4],
                     period_us,
                     // No IMU in this build; see PlantSample::gyro_dps10.
@@ -467,7 +467,7 @@ async fn run_profile(
 
     for s in cap.as_slice().iter() {
         defmt::info!(
-            "PLANT,{=u16},{=u16},{=u16},{=u16},{=u16},{=u16},{=u16},{=u16},{=u16},{=i16},{=i16},{=i16}",
+            "PLANT,{=u32},{=u16},{=u16},{=u16},{=u16},{=u16},{=u16},{=u16},{=u16},{=i16},{=i16},{=i16}",
             s.t_ms,
             s.cmd[0], s.cmd[1], s.cmd[2], s.cmd[3],
             s.period_us[0], s.period_us[1], s.period_us[2], s.period_us[3],

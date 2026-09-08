@@ -102,8 +102,12 @@ mod motor_test;
 // plant_log::RECORD_LEN is already one H7 flash word for it.
 #[cfg(feature = "motor-test")]
 mod plant_capture;
-#[cfg(feature = "motor-test")]
+// The record format is shared by the bench capture and the flight
+// blackbox, so it is linked by whichever of them is enabled.
+#[cfg(any(feature = "motor-test", feature = "blackbox", feature = "blackbox-dump"))]
 mod plant_log;
+#[cfg(any(feature = "blackbox", feature = "blackbox-dump"))]
+mod blackbox;
 
 mod persist {
     pub mod record;
@@ -286,6 +290,31 @@ static GPS_ACCEL_NED: Signal<CriticalSectionRawMutex, [f32; 2]> = Signal::new();
 /// control::position::PositionGains::max_tilt_rad_degraded.
 static GPS_ACCEL_FRESH: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+/// Flight samples awaiting a flash write: control loop → persist task.
+///
+/// A bounded channel, and the control loop uses `try_send` so a slow or
+/// full flash never stalls the 8 kHz loop -- the whole point of staging
+/// in RAM. Overruns are counted and reported rather than silently
+/// dropping samples, because a log with invisible holes in it fits a
+/// wrong model just as confidently as a complete one.
+///
+/// 256 records is 8 KB, half a second of buffer at the default 200 Hz.
+/// Flash programs a 32-byte word in ~90 us, so the drain is ~350 KB/s
+/// against 6.4 KB/s of inflow; the margin is for erase-induced stalls
+/// elsewhere, not for steady state.
+#[cfg(feature = "blackbox")]
+static BLACKBOX_LOG: embassy_sync::channel::Channel<
+    CriticalSectionRawMutex,
+    plant_log::PlantSample,
+    256,
+> = embassy_sync::channel::Channel::new();
+
+/// Samples the control loop could not hand over because the channel was
+/// full. Reported with the telemetry summary.
+#[cfg(feature = "blackbox")]
+static BLACKBOX_DROPPED: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 /// Boot-loaded calibration: main → mekf task.
 static STORED_CAL: Signal<CriticalSectionRawMutex, persist::record::Config> = Signal::new();
 /// Cal-feedback LED phase: mekf task → blink task. Watch so the renderer
@@ -390,6 +419,49 @@ async fn main(spawner: Spawner) {
         config.mag_hard_iron_ut[1],
         config.mag_hard_iron_ut[2],
     );
+    // ---- Blackbox dump ----
+    // Before anything else is spawned. The dump writes tens of thousands
+    // of lines through a logger that busy-waits inside a critical
+    // section, so nothing else can usefully run during it -- and an
+    // aircraft must not be armable while interrupts are held off for
+    // minutes. It halts afterwards rather than continuing to boot.
+    #[cfg(feature = "blackbox-dump")]
+    {
+        let mut bb = blackbox::Blackbox::open(&mut cfg_flash);
+        let used = bb.used();
+        if used == 0 {
+            defmt::info!("blackbox: empty — nothing to dump");
+        } else {
+            defmt::info!("PLANT_HEADER,{=str}", plant_log::CSV_HEADER);
+            for i in 0..used {
+                match bb.read(&mut cfg_flash, i) {
+                    Ok(s) => defmt::info!(
+                        "PLANT,{=u32},{=u16},{=u16},{=u16},{=u16},{=u16},{=u16},{=u16},{=u16},{=i16},{=i16},{=i16}",
+                        s.t_ms,
+                        s.cmd[0], s.cmd[1], s.cmd[2], s.cmd[3],
+                        s.period_us[0], s.period_us[1], s.period_us[2], s.period_us[3],
+                        s.gyro_dps10[0], s.gyro_dps10[1], s.gyro_dps10[2],
+                    ),
+                    Err(e) => defmt::error!("blackbox: read failed at {=usize}: {:?}", i, e),
+                }
+            }
+            defmt::info!("PLANT_END ({=usize} records)", used);
+        }
+
+        // Erase only after the dump has been fully transmitted. flush()
+        // matters: defmt buffers, and erasing while the tail of the log
+        // is still in flight would destroy data that never arrived.
+        defmt::flush();
+        match bb.erase_all(&mut cfg_flash) {
+            Ok(()) => defmt::info!("blackbox: erased, ready to record"),
+            Err(e) => defmt::error!("blackbox: erase failed {:?} — log NOT cleared", e),
+        }
+        defmt::info!("blackbox-dump build: halting. Flash a flight build to fly.");
+        loop {
+            embassy_time::Timer::after(embassy_time::Duration::from_secs(60)).await;
+        }
+    }
+
     #[cfg(feature = "persist-selftest")]
     {
         // Two-boot protocol:
@@ -685,11 +757,51 @@ impl Compass {
 async fn persist_task(
     mut flash: embassy_stm32::flash::Flash<'static, embassy_stm32::flash::Blocking>,
 ) {
+    // The blackbox drains here rather than in its own task because this
+    // task already owns the flash handle, and two owners of a blocking
+    // flash driver is not a thing that can be made safe by being careful.
+    //
+    // The two users cannot collide: a cal save only happens disarmed and
+    // blackbox writes only happen armed.
+    #[cfg(feature = "blackbox")]
+    let mut bb = blackbox::Blackbox::open(&mut flash);
+    #[cfg(feature = "blackbox")]
+    let mut write_errors: u32 = 0;
+
     loop {
-        let cfg = CAL_SAVE.wait().await;
-        match persist::flash::write(&mut flash, &cfg) {
-            Ok(()) => defmt::info!("persist: CAL SAVED to flash"),
-            Err(e) => defmt::error!("persist: cal save failed {:?}", e),
+        #[cfg(not(feature = "blackbox"))]
+        {
+            let cfg = CAL_SAVE.wait().await;
+            match persist::flash::write(&mut flash, &cfg) {
+                Ok(()) => defmt::info!("persist: CAL SAVED to flash"),
+                Err(e) => defmt::error!("persist: cal save failed {:?}", e),
+            }
+        }
+        #[cfg(feature = "blackbox")]
+        {
+            use embassy_futures::select::{select, Either};
+            match select(CAL_SAVE.wait(), BLACKBOX_LOG.receive()).await {
+                Either::First(cfg) => match persist::flash::write(&mut flash, &cfg) {
+                    Ok(()) => defmt::info!("persist: CAL SAVED to flash"),
+                    Err(e) => defmt::error!("persist: cal save failed {:?}", e),
+                },
+                Either::Second(sample) => {
+                    if let Err(e) = bb.append(&mut flash, &sample) {
+                        // Log once, not per sample: a full log or a dead
+                        // sector would otherwise emit thousands of lines
+                        // through a blocking logger, which is a far worse
+                        // problem than the one being reported.
+                        write_errors = write_errors.wrapping_add(1);
+                        if write_errors == 1 {
+                            defmt::warn!(
+                                "blackbox: write stopped after {=usize} records ({:?})",
+                                bb.used(),
+                                e,
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -2547,6 +2659,15 @@ async fn navigation_task() {
 // Reads the latest target rates and thrust from the outer loop, runs
 // the rate PID, and pushes commands to the ESCs via DShot.
 
+/// Control-loop frames between blackbox samples.
+///
+/// Derived from the loop rate rather than restated, so changing one does
+/// not silently change the logged rate. Counted against `telem_frames`,
+/// which is already incrementing once per frame -- a second counter would
+/// be a second thing to get wrong.
+#[cfg(feature = "blackbox")]
+const BLACKBOX_DECIM: u32 = blackbox::decimation(8000, blackbox::DEFAULT_RATE_HZ);
+
 /// Frames between bidir-telemetry health reports. 8000 at 8 kHz is 1 Hz.
 ///
 /// Counted in frames rather than timed, so the report is also a check on
@@ -2596,6 +2717,16 @@ async fn control_loop(mut dshot: DshotBitbang<'static>) -> ! {
     let mut telem_nosig = [0u32; 4];
     let mut telem_bad = [0u32; 4];
     let mut telem_last_period = [0u32; 4];
+    // Wall-clock start of the current report window, so the report can
+    // state the loop's MEASURED rate rather than its nominal one.
+    //
+    // This exists because the blackbox writes flash from persist_task,
+    // and embassy's executor is cooperative and single-threaded: this
+    // loop is awaited on the same executor, so every flash program blocks
+    // it for the duration of the write. Whether that matters is a
+    // question about real hardware timing, and the honest way to answer
+    // it is to print the number and look.
+    let mut telem_window_start = Instant::now();
 
     loop {
         // Wait for the next 8 kHz IMU sample
@@ -2690,7 +2821,50 @@ async fn control_loop(mut dshot: DshotBitbang<'static>) -> ! {
                         }
                     }
                 }
+                // ---- Blackbox ----
+                // Decimated, and only while armed: a log of the aircraft
+                // sitting on the bench is 143 s of flash burned before
+                // takeoff, and the region cannot be partially reused.
+                //
+                // try_send, never await. This is the 8 kHz loop; blocking
+                // it on a flash write would be exactly the mistake the
+                // staging channel exists to avoid.
+                #[cfg(feature = "blackbox")]
+                {
+                    use core::sync::atomic::Ordering;
+                    if telem_frames.is_multiple_of(BLACKBOX_DECIM) {
+                        let sample = plant_log::PlantSample {
+                            t_ms: Instant::now().as_millis() as u32,
+                            cmd: core::array::from_fn(|i| {
+                                (motor_outputs.motors[i].clamp(0.0, 1.0)
+                                    * plant_log::CMD_SCALE) as u16
+                            }),
+                            period_us: core::array::from_fn(|i| match telemetry[i] {
+                                BbTelemetry::Erpm { period_us }
+                                    if period_us > 0 && period_us <= u16::MAX as u32 =>
+                                {
+                                    period_us as u16
+                                }
+                                _ => plant_log::NO_TELEMETRY,
+                            }),
+                            gyro_dps10: core::array::from_fn(|i| {
+                                (imu.gyro[i] * plant_log::GYRO_SCALE) as i16
+                            }),
+                        };
+                        if BLACKBOX_LOG.try_send(sample).is_err() {
+                            BLACKBOX_DROPPED.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+
                 if telem_frames >= TELEM_REPORT_FRAMES {
+                    let window_us = (Instant::now() - telem_window_start).as_micros().max(1);
+                    let loop_hz = (telem_frames as u64 * 1_000_000 / window_us) as u32;
+                    telem_window_start = Instant::now();
+                    defmt::info!(
+                        "control loop {=u32} Hz measured (nominal 8000)",
+                        loop_hz,
+                    );
                     defmt::info!(
                         "DShot RX {=u32} frames: ok[{=u32},{=u32},{=u32},{=u32}] nosig[{=u32},{=u32},{=u32},{=u32}] bad[{=u32},{=u32},{=u32},{=u32}] period_us[{=u32},{=u32},{=u32},{=u32}]",
                         telem_frames,
@@ -2700,6 +2874,17 @@ async fn control_loop(mut dshot: DshotBitbang<'static>) -> ! {
                         telem_last_period[0], telem_last_period[1],
                         telem_last_period[2], telem_last_period[3],
                     );
+                    #[cfg(feature = "blackbox")]
+                    {
+                        use core::sync::atomic::Ordering;
+                        let d = BLACKBOX_DROPPED.swap(0, Ordering::Relaxed);
+                        if d > 0 {
+                            defmt::warn!(
+                                "blackbox: {=u32} samples dropped this second — flash is not keeping up",
+                                d,
+                            );
+                        }
+                    }
                     telem_frames = 0;
                     telem_ok = [0; 4];
                     telem_nosig = [0; 4];

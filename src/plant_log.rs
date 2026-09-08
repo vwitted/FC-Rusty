@@ -45,7 +45,13 @@ pub const NO_TELEMETRY: u16 = 0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PlantSample {
     /// Milliseconds since capture started.
-    pub t_ms: u16,
+    ///
+    /// u32, not u16. A bench capture is under four seconds and u16 was
+    /// ample for it, but the same record now goes to the flash blackbox
+    /// during flight, where 65.5 s is a short hop and a wrapped timestamp
+    /// fits a plausible-looking, wrong time constant without ever looking
+    /// broken.
+    pub t_ms: u32,
     /// Per-motor normalised throttle command, scaled by `CMD_SCALE`.
     pub cmd: [u16; 4],
     /// Per-motor eRPM period in microseconds, straight from the DShot
@@ -69,18 +75,18 @@ impl PlantSample {
     /// 32 bytes on it would cost real capture time for very little.
     pub fn encode(&self) -> [u8; RECORD_LEN] {
         let mut b = [0u8; RECORD_LEN];
-        b[0..2].copy_from_slice(&self.t_ms.to_le_bytes());
+        b[0..4].copy_from_slice(&self.t_ms.to_le_bytes());
         for i in 0..4 {
-            b[2 + i * 2..4 + i * 2].copy_from_slice(&self.cmd[i].to_le_bytes());
-            b[10 + i * 2..12 + i * 2].copy_from_slice(&self.period_us[i].to_le_bytes());
+            b[4 + i * 2..6 + i * 2].copy_from_slice(&self.cmd[i].to_le_bytes());
+            b[12 + i * 2..14 + i * 2].copy_from_slice(&self.period_us[i].to_le_bytes());
         }
         for i in 0..3 {
-            b[18 + i * 2..20 + i * 2].copy_from_slice(&self.gyro_dps10[i].to_le_bytes());
+            b[20 + i * 2..22 + i * 2].copy_from_slice(&self.gyro_dps10[i].to_le_bytes());
         }
-        // 24..32 reserved. Left zero so a later field can be added without
-        // changing RECORD_LEN, and so an all-zero record (erased flash
-        // reads as 0xFF, not 0x00, so this is distinguishable) stays
-        // meaningful.
+        // 26..32 reserved. Left ZERO, which matters: erased flash reads as
+        // 0xFF, so an all-0xFF record is "never written" and an all-zero
+        // tail is "written by a version that did not use these bytes".
+        // The blackbox's append-point scan depends on that distinction.
         b
     }
 
@@ -88,10 +94,10 @@ impl PlantSample {
         let u16_at = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
         let i16_at = |i: usize| i16::from_le_bytes([b[i], b[i + 1]]);
         Self {
-            t_ms: u16_at(0),
-            cmd: core::array::from_fn(|i| u16_at(2 + i * 2)),
-            period_us: core::array::from_fn(|i| u16_at(10 + i * 2)),
-            gyro_dps10: core::array::from_fn(|i| i16_at(18 + i * 2)),
+            t_ms: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            cmd: core::array::from_fn(|i| u16_at(4 + i * 2)),
+            period_us: core::array::from_fn(|i| u16_at(12 + i * 2)),
+            gyro_dps10: core::array::from_fn(|i| i16_at(20 + i * 2)),
         }
     }
 
@@ -150,9 +156,8 @@ pub fn parse_csv_line(line: &str) -> Option<PlantSample> {
     if it.next()?.trim() != CSV_TAG {
         return None;
     }
+    let t_ms = it.next()?.trim().parse::<u32>().ok()?;
     let mut next_u16 = || -> Option<u16> { it.next()?.trim().parse::<u16>().ok() };
-
-    let t_ms = next_u16()?;
     let mut cmd = [0u16; 4];
     for c in cmd.iter_mut() {
         *c = next_u16()?;
@@ -188,6 +193,15 @@ mod tests {
     }
 
     #[test]
+    fn a_long_flight_does_not_wrap_the_timestamp() {
+        // The reason t_ms is u32. At u16 this would have wrapped after
+        // 65.5 s and produced a log that fits a wrong answer silently.
+        let ten_minutes_ms = 10 * 60 * 1000u32;
+        let s = PlantSample { t_ms: ten_minutes_ms, ..PlantSample::default() };
+        assert_eq!(PlantSample::decode(&s.encode()).t_ms, ten_minutes_ms);
+    }
+
+    #[test]
     fn record_is_one_flash_word() {
         // Not cosmetic: the H7 programs flash in 32-byte words, so a
         // record of any other size either wastes a word or straddles two,
@@ -210,7 +224,7 @@ mod tests {
         // timestamp -- and a log with wrong timestamps fits a wrong tau
         // without ever looking broken.
         let mut s = PlantSample::default();
-        s.t_ms = 0xFFFF;
+        s.t_ms = 0xFFFF_FFFF;
         let d = PlantSample::decode(&s.encode());
         assert_eq!(d.cmd, [0; 4]);
         assert_eq!(d.period_us, [0; 4]);
