@@ -1,8 +1,9 @@
 // mag.rs — the parts of a magnetometer driver that are not chip-specific.
 //
-// Three magnetometers now feed the same pipeline: the LIS2MDL (STMicro,
-// 0x1E), and whichever of the QMC5883L (QST, 0x0D) or HMC5883L
-// (Honeywell, 0x1E) a given Radiolink SE100 GPS module carries.
+// Four magnetometers now feed the same pipeline: the LIS2MDL (STMicro,
+// 0x1E), and whichever of the QMC5883L (QST, 0x0D), HMC5883L (Honeywell,
+// 0x1E) or IST8310 (iSentek, 0x0C-0x0F) a given Radiolink SE100 GPS
+// module carries -- the V2 has the IST8310, found at 0x0E on the bench.
 // Everything downstream of the driver -- MAG_DATA, MagCalibrator,
 // AttitudeMekf::update_mag -- consumes `MagSample::ut()` and has no
 // business knowing which part produced it.
@@ -11,7 +12,7 @@
 // per-chip constant. That is the whole difference between the two
 // drivers as far as the fusion code is concerned: 0.15 uT/LSB for the
 // LIS2MDL, 0.0333 uT/LSB for the QMC5883L at +/-8 G, 0.122 uT/LSB for
-// the HMC5883L at +/-1.9 G.
+// the HMC5883L at +/-1.9 G, 0.3 uT/LSB for the IST8310.
 //
 // Host-testable: nothing here touches embassy or I2C.
 
@@ -128,9 +129,12 @@ pub enum MagError {
 /// Every 7-bit address a magnetometer this firmware knows about answers
 /// at, with the parts that share it. Two parts at one address is the
 /// normal case, not the exception: 0x1E is both the LIS2MDL and the
-/// HMC5883L, whose register maps have nothing in common.
+/// HMC5883L, whose register maps have nothing in common, and 0x0D is
+/// both the QMC5883L and one of the IST8310's four pin-selected
+/// addresses.
 pub const LIS2MDL_OR_HMC5883L_ADDR: u8 = 0x1E;
 pub const QMC5883L_ADDR: u8 = 0x0D;
+pub const IST8310_ADDRS: [u8; 4] = [0x0C, 0x0D, 0x0E, 0x0F];
 
 /// Name whatever is expected at an address, for the scan log. The scan
 /// exists because the SE100's compass has changed part twice across
@@ -138,9 +142,9 @@ pub const QMC5883L_ADDR: u8 = 0x0D;
 /// you nothing when the part is behind a different one.
 pub const fn describe_addr(addr: u8) -> &'static str {
     match addr {
-        QMC5883L_ADDR => "QMC5883L",
+        QMC5883L_ADDR => "QMC5883L or IST8310",
         LIS2MDL_OR_HMC5883L_ADDR => "LIS2MDL or HMC5883L",
-        0x0E => "IST8310",
+        0x0C | 0x0E | 0x0F => "IST8310",
         0x30 | 0x31 => "MMC5983 / RM3100",
         0x76 | 0x77 => "baro (SPL06 / DPS310 / BMP280)",
         0x28..=0x2F => "BNO055 / AK09916 range",

@@ -57,6 +57,7 @@ pub mod drivers {
     pub mod mag;
     pub mod qmc5883l;
     pub mod hmc5883l;
+    pub mod ist8310;
     // The UBX parser is pure too, and the M8030 on the SE100 speaks it.
     pub mod ubx;
     pub mod gps_adapt;

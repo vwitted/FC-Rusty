@@ -62,6 +62,7 @@ mod drivers {
     pub mod icm42688;
     pub mod ism6hg256x;
     pub mod hmc5883l;
+    pub mod ist8310;
     pub mod lis2mdl;
     pub mod mag;
     pub mod qmc5883l;
@@ -131,6 +132,7 @@ use drivers::baro::{self, BaroSample};
 use drivers::crsf::RcChannels;
 use drivers::dshot_bb_decode::BbTelemetry;
 use drivers::hmc5883l::Hmc5883l;
+use drivers::ist8310::Ist8310;
 use drivers::lis2mdl::Lis2mdl;
 use drivers::mag::{MagError, MagSample, Orientation as MagOrientation};
 use drivers::qmc5883l::Qmc5883l;
@@ -677,15 +679,15 @@ async fn blink_task(mut led: embassy_stm32::gpio::Output<'static>) {
 // ---- Persist Task ----
 /// Whichever magnetometer is actually fitted.
 ///
-/// Three are supported and they are not alternatives in the "pick one in
+/// Four are supported and they are not alternatives in the "pick one in
 /// a config" sense -- they live on different boards, all of them wired
 /// to the FC's SDA/SCL pads rather than mounted on it (the DAKEFPV H743
 /// has no onboard compass). The LIS2MDL is a standalone breakout; the
-/// Radiolink SE100 GPS module carries EITHER a QMC5883L or an HMC5883L
-/// depending on production run, and the two are externally identical.
-/// Any of them may be plugged in on a given day, so the honest thing is
-/// to ask the bus rather than to carry a build flag someone will forget
-/// to flip.
+/// Radiolink SE100 GPS module carries a QMC5883L, an HMC5883L or (V2,
+/// the one on the bench) an IST8310 depending on revision, and they are
+/// externally identical. Any of them may be plugged in on a given day, so
+/// the honest thing is to ask the bus rather than to carry a build flag
+/// someone will forget to flip.
 ///
 /// Downstream sees only `MagSample`, so nothing past this enum knows or
 /// cares which part answered.
@@ -693,6 +695,7 @@ enum Compass {
     Lis2mdl(Lis2mdl),
     Hmc5883l(Hmc5883l),
     Qmc5883l(Qmc5883l),
+    Ist8310(Ist8310),
 }
 
 /// The shared I2C2 handle as the baro/mag task owns it: blocking master.
@@ -756,7 +759,8 @@ impl Compass {
     /// Scan the bus, then try a driver for each address that answered.
     ///
     /// Order: whatever is at 0x1E (a LIS2MDL breakout, or an HMC5883L)
-    /// is tried before the QMC5883L at 0x0D. This is a convention, not a
+    /// is tried before the SE100 parts (QMC5883L at 0x0D, IST8310 at
+    /// 0x0C-0x0F). This is a convention, not a
     /// physical argument -- every candidate is on a cable, so if two are
     /// connected at once the LIS2MDL wins by address order alone. The
     /// intended flight fit is the SE100's compass, for its distance from
@@ -767,7 +771,11 @@ impl Compass {
     /// registers before either driver writes anything: LIS2MDL WHO_AM_I
     /// (0x4F) == 0x40, HMC5883L ID A..C (0x0A..0x0C) == "H43". Their
     /// register maps do not overlap, so a mismatch on one is not evidence
-    /// for the other; both are checked and both results are logged.
+    /// for the other; both are checked and both results are logged. The
+    /// same at 0x0D, shared by the QMC5883L and one IST8310 address
+    /// option: the IST8310 has a WHO_AM_I (0x00 == 0x10), the QMC does
+    /// not, so the QMC's write-readback presence test runs first and the
+    /// IST8310's ID read second.
     ///
     /// ORIENTATION IS UNVERIFIED FOR THE SE100. Identity is a placeholder
     /// for every part: this firmware has never flown, and the mounting of
@@ -776,7 +784,7 @@ impl Compass {
     /// yaw, it inverts or mirrors it. Confirm against the magnitude and
     /// axis signs logged below before trusting heading.
     async fn probe(i2c: &mut MagBus<'_>) -> Option<Self> {
-        use drivers::mag::{describe_addr, LIS2MDL_OR_HMC5883L_ADDR, QMC5883L_ADDR};
+        use drivers::mag::{describe_addr, IST8310_ADDRS, LIS2MDL_OR_HMC5883L_ADDR, QMC5883L_ADDR};
 
         let scan = scan_bus(i2c);
         if scan.fault {
@@ -822,7 +830,29 @@ impl Compass {
                     defmt::info!("Magnetometer: QMC5883L online @ 200 Hz (I2C 0x0D, SE100)");
                     found = Some(Self::Qmc5883l(d));
                 }
-                Err(e) => defmt::info!("Magnetometer: 0x0D answered but QMC5883L init failed ({:?})", e),
+                Err(e) => defmt::info!("Magnetometer: 0x0D is not a QMC5883L ({:?}), trying IST8310", e),
+            }
+        }
+
+        if found.is_none() {
+            for &addr in scan.addrs() {
+                if !IST8310_ADDRS.contains(&addr) {
+                    continue;
+                }
+                match Ist8310::init(i2c, addr, MagOrientation::Identity).await {
+                    Ok(d) => {
+                        defmt::info!(
+                            "Magnetometer: IST8310 online, single-shot polled @ 125 Hz (I2C 0x{=u8:02x}, SE100 V2)",
+                            addr,
+                        );
+                        found = Some(Self::Ist8310(d));
+                        break;
+                    }
+                    Err(e) => defmt::info!(
+                        "Magnetometer: 0x{=u8:02x} is not an IST8310 ({:?}; WHO_AM_I wants 0x10)",
+                        addr, e,
+                    ),
+                }
             }
         }
 
@@ -834,13 +864,14 @@ impl Compass {
                 // fault, and it is far cheaper to see it here than to
                 // discover it as a slow yaw error in flight.
                 match c.read(i2c) {
-                    Ok(s) => {
+                    Ok(Some(s)) => {
                         let v = s.ut();
                         defmt::info!(
                             "Magnetometer: |B| = {=f32} uT, body [{=f32}, {=f32}, {=f32}] uT (expect 25-65 uT)",
                             s.magnitude_ut(), v[0], v[1], v[2],
                         );
                     }
+                    Ok(None) => defmt::info!("Magnetometer: first sample not ready yet"),
                     Err(e) => defmt::warn!("Magnetometer: first read failed ({:?})", e),
                 }
                 Some(c)
@@ -855,11 +886,15 @@ impl Compass {
         }
     }
 
-    fn read(&self, i2c: &mut MagBus<'_>) -> Result<MagSample, MagError> {
+    /// `Ok(None)` is "no new sample yet", which only the single-shot
+    /// IST8310 produces; the continuous-mode parts always have something
+    /// in their data registers.
+    fn read(&self, i2c: &mut MagBus<'_>) -> Result<Option<MagSample>, MagError> {
         match self {
-            Self::Lis2mdl(d) => d.read(i2c),
-            Self::Hmc5883l(d) => d.read(i2c),
-            Self::Qmc5883l(d) => d.read(i2c),
+            Self::Lis2mdl(d) => d.read(i2c).map(Some),
+            Self::Hmc5883l(d) => d.read(i2c).map(Some),
+            Self::Qmc5883l(d) => d.read(i2c).map(Some),
+            Self::Ist8310(d) => d.read(i2c),
         }
     }
 }
@@ -2212,10 +2247,10 @@ async fn baro_task(
         // The mag shares I2C2 with the baro. We init it here so it can't
         // get stuck waiting for the bus owner — if absent or DOA, we
         // continue without mag fusion (yaw stays unobservable in the
-        // MEKF, exactly the pre-magnetometer behaviour). All supported
-        // parts run continuous conversion after init, so we just poll
-        // once per tick (125 Hz) and let the chip's own ODR cap the
-        // effective rate.
+        // MEKF, exactly the pre-magnetometer behaviour). We poll once per
+        // tick (125 Hz); the continuous-mode parts' own ODR caps the
+        // effective rate, and the single-shot IST8310 is re-triggered
+        // from each poll.
         //
         // Re-probed a few times from the read loop if nothing answered:
         // a compass on the GPS connector is powered through that module
@@ -2229,8 +2264,11 @@ async fn baro_task(
         // each new sample without skipping. The LIS2MDL runs at 100 Hz
         // and the HMC5883L at 75 Hz, so polling at 125 Hz yields some
         // duplicate samples; the QMC5883L runs at 200 Hz so we
-        // undersample it instead. All harmless — the MEKF does a try_take
-        // and skips when no new data arrived.
+        // undersample it instead. The IST8310 has no continuous mode:
+        // each poll collects the last single-shot result and triggers
+        // the next, so it samples AT the poll rate (6 ms conversion fits
+        // the 8 ms tick). All harmless — the MEKF does a try_take and
+        // skips when no new data arrived.
         let mut ticker = Ticker::every(Duration::from_millis(8)); // 125 Hz
         let mut reads: u32 = 0;
         let mut errs: u32 = 0;
@@ -2274,10 +2312,11 @@ async fn baro_task(
             // read forcing a baro bus reset.
             if let Some(m) = mag.as_ref() {
                 match m.read(&mut i2c) {
-                    Ok(s) => {
+                    Ok(Some(s)) => {
                         MAG_DATA.signal(s);
                         mag_reads = mag_reads.wrapping_add(1);
                     }
+                    Ok(None) => {} // single-shot part still converting
                     Err(_) => {
                         mag_errs = mag_errs.wrapping_add(1);
                     }
