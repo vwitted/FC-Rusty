@@ -1,19 +1,34 @@
-# Line endings.
+# Line endings, as repo policy rather than per-user config.
 #
-# This repo is developed on Windows with core.autocrlf=true, which converts
-# LF to CRLF on checkout. For shell scripts that is not cosmetic: Git Bash
-# tolerates a CRLF script, but real Linux bash does not, and this project
-# has a WSL Debian install one command away. Measured, not assumed —
-# `wsl bash -n scripts/flash-dfu.sh` on the CRLF working copy gave:
+# `core.autocrlf` already does the "LF in the repo, native in the working
+# tree" dance, and it is set to true on the Windows machine here. The
+# problem with relying on it is that it is LOCAL CONFIG: it applies to
+# whoever happens to have set it, and not to a fresh clone, a colleague,
+# or CI. These attributes are checked in, so they apply to everyone.
 #
-#     syntax error near unexpected token `$'do\r''
+# `text=auto` is the checked-in equivalent of autocrlf: normalise to LF on
+# commit, convert to the platform's native ending on checkout. Adding it
+# here changed no file content — the index was already 100% LF — so it
+# costs nothing and removes the dependence on a local setting.
 #
-# while the same file ran fine under Git Bash. So the breakage is silent
-# until someone runs a script from WSL or CI, which is exactly when they
-# least want to be debugging line endings.
+# The eol= overrides below are the part that matters, because for these
+# two extensions "native to the platform" is the wrong answer:
 #
-# Scoped to the two extensions that care rather than a blanket
-# `* text=auto`, which would renormalise every file in the repo and bury a
-# real change in a whitespace diff.
+#   *.sh   Must stay LF even on Windows. Git Bash tolerates a CRLF script,
+#          which is why scripts/flash-dfu.sh sat in the working tree with
+#          CRLF and ran fine for months. Real Linux bash does not, and on
+#          this machine WSL is one command away reading the same files
+#          through /mnt/c. Measured:
+#
+#              wsl bash -n scripts/flash-dfu.sh
+#              syntax error near unexpected token `$'do\r''
+#
+#          Note this never affected a Linux CLONE: the index is LF, so a
+#          checkout on Debian has always been correct. The breakage is
+#          specific to running the WINDOWS working tree from WSL.
+#
+#   *.cmd  Batch is happier with CRLF, and unlike the above it is only
+#          ever run by cmd.exe, so there is no cross-platform case.
+* text=auto
 *.sh text eol=lf
 *.cmd text eol=crlf
