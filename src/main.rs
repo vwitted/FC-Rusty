@@ -2274,6 +2274,9 @@ async fn baro_task(
         let mut errs: u32 = 0;
         let mut mag_reads: u32 = 0;
         let mut mag_errs: u32 = 0;
+        // Ticks where the single-shot part had no result yet. Should be
+        // ~0; anything near the poll rate means it is never completing.
+        let mut mag_wait: u32 = 0;
         let mut streak: u32 = 0;
         let mut last_report = Instant::now();
         let mut last_sample: Option<(BaroSample, Instant)> = None;
@@ -2318,7 +2321,7 @@ async fn baro_task(
                         last_mag = Some(s);
                         mag_reads = mag_reads.wrapping_add(1);
                     }
-                    Ok(None) => {} // single-shot part still converting
+                    Ok(None) => mag_wait = mag_wait.wrapping_add(1), // single-shot part still converting
                     Err(_) => {
                         mag_errs = mag_errs.wrapping_add(1);
                     }
@@ -2330,19 +2333,20 @@ async fn baro_task(
                     (0, Some((s, t))) => {
                         let age_ms = (Instant::now() - t).as_millis() as u32;
                         defmt::info!(
-                            "Baro 0 reads/s, {} errs — bus stuck (last P={=f32}Pa T={=f32}C age={=u32}ms); mag {}/s, {} errs",
+                            "Baro 0 reads/s, {} errs — bus stuck (last P={=f32}Pa T={=f32}C age={=u32}ms); mag {}/s, {} errs, {} not-ready",
                             errs,
                             s.pressure_pa,
                             s.temperature_c,
                             age_ms,
                             mag_reads,
                             mag_errs,
+                            mag_wait,
                         );
                     }
                     (0, None) => {
                         defmt::info!(
-                            "Baro 0 reads/s, {} errs — bus stuck (no sample yet); mag {}/s, {} errs",
-                            errs, mag_reads, mag_errs,
+                            "Baro 0 reads/s, {} errs — bus stuck (no sample yet); mag {}/s, {} errs, {} not-ready",
+                            errs, mag_reads, mag_errs, mag_wait,
                         );
                     }
                     _ => {
@@ -2350,13 +2354,14 @@ async fn baro_task(
                             .map(|(s, _)| (s.pressure_pa, s.temperature_c))
                             .unwrap_or((0.0, 0.0));
                         defmt::info!(
-                            "Baro {} reads/s, {} errs — P={=f32}Pa T={=f32}C; mag {}/s, {} errs",
+                            "Baro {} reads/s, {} errs — P={=f32}Pa T={=f32}C; mag {}/s, {} errs, {} not-ready",
                             reads,
                             errs,
                             p,
                             t,
                             mag_reads,
                             mag_errs,
+                            mag_wait,
                         );
                     }
                 }
@@ -2376,6 +2381,7 @@ async fn baro_task(
                 errs = 0;
                 mag_reads = 0;
                 mag_errs = 0;
+                mag_wait = 0;
                 last_report = Instant::now();
             }
 

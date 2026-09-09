@@ -250,21 +250,30 @@ mod hw {
         /// yet, which is not an error; at a 125 Hz poll with a 6 ms
         /// conversion it should be rare.
         ///
-        /// One 7-byte burst from STAT1 through DATAZH, so the DRDY bit
-        /// and the data it describes come from the same transaction
-        /// (PX4 does the same). Reading the data registers clears DRDY.
+        /// Exactly the datasheet's section 3.3 sequence, as three
+        /// transactions: read STAT1; read 0x03..0x08; write CNTL1. The
+        /// first version of this driver read STAT1 and the data in ONE
+        /// 7-byte burst, copying PX4 -- and on the bench (2026-09-09)
+        /// that returned the init-time sample forever, DRDY always set,
+        /// 124 reads/s, 0 errors, no change through 30 s upside down.
+        /// The datasheet ties clearing DRDY to a read of "any of the
+        /// measurement data registers", and evidently a burst that only
+        /// passes through them by auto-increment does not count on this
+        /// silicon. Betaflight and ArduPilot both read the data as its
+        /// own transaction; so does this now.
         pub fn read(
             &self,
             i2c: &mut I2c<'_, Blocking, Master>,
         ) -> Result<Option<MagSample>, MagError> {
-            let mut buf = [0u8; 7];
-            i2c.blocking_write_read(self.addr, &[REG_STAT1], &mut buf).map_err(map_err)?;
-            if buf[0] & STAT1_DRDY == 0 {
+            let mut stat = [0u8; 1];
+            i2c.blocking_write_read(self.addr, &[REG_STAT1], &mut stat).map_err(map_err)?;
+            if stat[0] & STAT1_DRDY == 0 {
                 // Still converting; do not re-trigger, that would restart
                 // it and we would never see a result.
                 return Ok(None);
             }
-            let data = [buf[1], buf[2], buf[3], buf[4], buf[5], buf[6]];
+            let mut data = [0u8; 6];
+            i2c.blocking_write_read(self.addr, &[REG_DATA_XL], &mut data).map_err(map_err)?;
             self.trigger(i2c)?;
             Ok(Some(decode_sample(data, self.orientation)))
         }

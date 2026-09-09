@@ -5,7 +5,7 @@ working on FC-Rusty. Keep this - and other repo docs - short, concise and reason
 state belongs in Claude's memory, not here.
 
 ## Environment
-This machine is Linux. Native UNIX/POSIX shell commands are available. The default shell is Bash.
+This machine is Windows. Use PowerShell-compatible commands, not Git Bash heredocs or POSIX globs. When writing multi-line files, use the Write tool instead of `cat <<EOF`. Quote and escape Windows paths (`C:\Users\...`) explicitly, and never rely on shell glob expansion for `--exclude`/upload path arguments.
 
 ## Conventions
  Always state and verify conventions, including both firmware-based conventions (like idle high vs. low), and physics/conceptual conventions (body vs. world frame) before implementing dev work. 

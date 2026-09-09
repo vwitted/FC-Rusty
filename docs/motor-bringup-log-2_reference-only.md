@@ -1,4 +1,6 @@
 
+## For reference only - Issue resolved.
+
 ## Journal — 2026-07-26: bidirectional DShot bring-up - RESOLVED
 
 Long bench session on the DAKEFPV H743 chasing why bidirectional DShot
