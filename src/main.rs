@@ -2277,6 +2277,7 @@ async fn baro_task(
         let mut streak: u32 = 0;
         let mut last_report = Instant::now();
         let mut last_sample: Option<(BaroSample, Instant)> = None;
+        let mut last_mag: Option<MagSample> = None;
 
         let recover = loop {
             ticker.next().await;
@@ -2314,6 +2315,7 @@ async fn baro_task(
                 match m.read(&mut i2c) {
                     Ok(Some(s)) => {
                         MAG_DATA.signal(s);
+                        last_mag = Some(s);
                         mag_reads = mag_reads.wrapping_add(1);
                     }
                     Ok(None) => {} // single-shot part still converting
@@ -2357,6 +2359,18 @@ async fn baro_task(
                             mag_errs,
                         );
                     }
+                }
+                // Bring-up instrumentation: the field itself, once a
+                // second. Init prints it once, which is not enough to
+                // move the module around and watch |B| settle towards
+                // Earth's ~50 uT, or to flip it and watch Z change sign
+                // -- the two tests that decide scale and handedness.
+                if let Some(m) = last_mag {
+                    let v = m.ut();
+                    defmt::info!(
+                        "Mag |B|={=f32} uT body [{=f32}, {=f32}, {=f32}] uT",
+                        m.magnitude_ut(), v[0], v[1], v[2],
+                    );
                 }
                 reads = 0;
                 errs = 0;
