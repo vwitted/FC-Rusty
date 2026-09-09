@@ -1,0 +1,29 @@
+0.109680 INFO  GPS task spawned (probing for UBX, NMEA fallback)
+0.116333 INFO  PosKF task started (100 Hz predict; baro + GPS fusion)
+0.117095 INFO  Baro probe @ 0x76: reg0xD0=Some(0), reg0x0D=Some(16)
+0.118469 INFO  Baro detected: SPL06 (Spl06 { addr: 118 })0.170837 INFO  I2C2 scan: ACK @ 0x76 (baro (SPL06 / DPS310 / BMP280))0.236297 INFO  Magnetometer: IST8310 online, single-shot polled @ 125 Hz (I2C 0x0e, SE100 V2)
+0.237243 INFO  Magnetometer: |B| = 110.17028 uT, body [80.700005, 26.400002, -70.200005] uT (expect 25-65 uT)0.109680 INFO  GPS task spawned (probing for UBX, NMEA fallback)
+0.116333 INFO  PosKF task started (100 Hz predict; baro + GPS fusion)
+0.117095 INFO  Baro probe @ 0x76: reg0xD0=Some(0), reg0x0D=Some(16)
+0.118469 INFO  Baro detected: SPL06 (Spl06 { addr: 118 })0.170837 INFO  I2C2 scan: ACK @ 0x76 (baro (SPL06 / DPS310 / BMP280))0.236297 INFO  Magnetometer: IST8310 online, single-shot polled @ 125 Hz (I2C 0x0e, SE100 V2)
+0.237243 INFO  Magnetometer: |B| = 109.879074 uT, body [80.4, 26.1, -70.200005] uT (expect 25-65 uT)1.120544 INFO  PosKF: alt=0.2086733m vz=0.29832834m/s | N=-0.02253682m E=-0.0003556959m | baro_fresh=true p_ref_at_arm=false home=false | 87 baro/s | gps 0sig 0pos 0vel /s
+1.199249 INFO  GPS: nothing at 115200 baud
+1.242980 INFO  Baro 125 reads/s, 0 errs — P=100902.42Pa T=27.287216C; mag 124/s, 0 errs
+1.250061 INFO  GPS: nothing at 9600 baud
+2.130828 INFO  PosKF: alt=0.64711255m vz=0.49800706m/s | N=0.045435015m E=-0.014374285m | baro_fresh=true p_ref_at_arm=false home=false | 100 baro/s | gps 0sig 0pos 0vel /s2.213012 INFO  GPS: module found at 38400 baud speaking NMEA
+2.246246 INFO  Baro 125 reads/s, 0 errs — P=100903.414Pa T=27.701797C; mag 123/s, 0 errs
+2.517303 INFO  GPS: NAV-PVT enabled at 100 ms solution rate
+2.517974 INFO  GPS task started (UBX preferred, NMEA fallback)3.139343 INFO  PosKF: alt=0.5811729m vz=0.25894496m/s | N=0.32606024m E=-0.03895224m | baro_fresh=true p_ref_at_arm=false home=false | 100 baro/s | gps 0sig 0pos 0vel /s
+3.249511 INFO  Baro 125 reads/s, 0 errs — P=100903.195Pa T=28.00827C; mag 124/s, 0 errs
+3.399017 INFO  GPS: NAV-PVT stream alive at 115200 baud — UBX in use4.150177 INFO  PosKF: alt=0.36447334m vz=0.07442519m/s | N=0.6319752m E=-0.07016687m | baro_fresh=true p_ref_at_arm=false home=false | 100 baro/s | gps 1sig 0pos 0vel /s
+4.252777 INFO  Baro 125 reads/s, 0 errs — P=100906.45Pa T=28.342514C; mag 124/s, 0 errs5.161163 INFO  PosKF: alt=0.36438742m vz=0.15442146m/s | N=0.8884937m E=-0.10649536m | baro_fresh=true p_ref_at_arm=false home=false | 100 baro/s | gps 0sig 0pos 0vel /s
+5.256042 INFO  Baro 125 reads/s, 0 errs — P=100898.15Pa T=28.342514C; mag 124/s, 0 errs6.172149 INFO  PosKF: alt=0.45459047m vz=0.19600727m/s | N=1.076503m E=-0.14623506m | baro_fresh=true p_ref_at_arm=false home=false | 100 baro/s | gps 0sig 0pos 0vel /s
+6.259307 INFO  Baro 125 reads/s, 0 errs — P=100899.586Pa T=28.60138C; mag 123/s, 0 errs7.183135 INFO  PosKF: alt=0.25211352m vz=0.03615055m/s | N=1.1924752m E=-0.18841486m | baro_fresh=true p_ref_at_arm=false home=false | 100 baro/s | gps 1sig 0pos 0vel /s
+7.262542 INFO  Baro 125 reads/s, 0 errs — P=100900.68Pa T=28.800735C; mag 124/s, 0 errs
+7.600830 INFO  GPS [UBX]: 3 navpvt / 0 sentences, mode=1 sats=0 dop=99.99 lat=0.0 lon=0.0 alt=-17.0m8.194152 INFO  PosKF: alt=0.24488242m vz=0.1161357m/s | N=1.2390711m E=-0.23210423m | baro_fresh=true p_ref_at_arm=false home=false | 99 baro/s | gps 1sig 0pos 0vel /s
+8.265838 INFO  Baro 125 reads/s, 0 errs — P=100901.57Pa T=28.960419C; mag 123/s, 0 errs9.205139 INFO  PosKF: alt=0.4728317m vz=0.25352612m/s | N=1.2186314m E=-0.27714962m | baro_fresh=true p_ref_at_arm=false home=false | 101 baro/s | gps 0sig 0pos 0vel /s
+9.269073 INFO  Baro 125 reads/s, 0 errs — P=100897.6Pa T=28.960419C; mag 123/s, 0 errs10.216186 INFO  PosKF: alt=0.37245417m vz=0.12858868m/s | N=1.1333697m E=-0.32316723m | baro_fresh=true p_ref_at_arm=false home=false | 101 baro/s | gps 0sig 0pos 0vel /s
+10.272369 INFO  Baro 125 reads/s, 0 errs — P=100903.984Pa T=29.286728C; mag 124/s, 0 errs11.227478 INFO  PosKF: alt=0.35608977m vz=0.11341152m/s | N=0.9863914m E=-0.36945027m | baro_fresh=true p_ref_at_arm=false home=false | 100 baro/s | gps 1sig 0pos 0vel /s
+11.275634 INFO  Baro 125 reads/s, 0 errs — P=100900.56Pa T=29.398804C; mag 123/s, 0 errs12.238067 INFO  PosKF: alt=0.22499388m vz=0.04973617m/s | N=0.7797762m E=-0.41527006m | baro_fresh=true p_ref_at_arm=false home=false | 100 baro/s | gps 1sig 0pos 0vel /s
+12.278900 INFO  Baro 125 reads/s, 0 errs — P=100905.05Pa T=29.545593C; mag 123/s, 0 errs
+12.693115 INFO  GPS [UBX]: 6 navpvt / 0 sentences, mode=1 sats=0 dop=99.99 lat=0.0 lon=0.0 alt=-17.0m
