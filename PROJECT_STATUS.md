@@ -23,7 +23,7 @@ d`).
 | SPI1 + PA4             | ICM-42688P IMU1 (onboard)         | ✅ verified — 8 kHz reads, MEKF fusing         |
 | SPI4 + PB1             | ICM-42688P IMU2 (onboard)         | ✅ verified — 8 kHz reads, averaged with IMU1  |
 | I2C2 (PB10/PB11)       | SPL06 barometer (onboard)         | ✅ proper driver — 128 Hz, correct calibration              |
-| I2C2 (PB10/PB11)       | Magnetometer, external (SDA/SCL pads; SE100 V2 GPS = IST8310 @ 0x0E; older SE100s QMC5883L/HMC5883L; LIS2MDL breakout also supported) | 🟡 2026-09-08: bus scan on the bench found 0x0E; IST8310 driver (single-shot, Z-flipped to right-handed) added, not yet confirmed reading. Orientation unverified for every part. |
+| I2C2 (PB10/PB11)       | Magnetometer, external (SDA/SCL pads; SE100 V2 GPS = IST8310 @ 0x0E; older SE100s QMC5883L/HMC5883L; LIS2MDL breakout also supported) | ✅ 2026-09-09: IST8310 reading on the bench, 123/s, 0 errs, values track motion (after `7be18ed` — a 7-byte STAT1+data burst froze the sample; datasheet order of separate reads fixes it). Raw field shows large hard iron (\|B\| 80–110 uT, X ~70–88 in every orientation). NEXT: hard-iron cal on the bench, then north/yaw test for handedness + Orientation (still Identity, unverified). Notes in docs/mag-orientation.txt. |
 | PA0/PA1/PA2/PA3 (GPIO) | DShot600 bit-banged, motors M1–M4 | ✅ bidir verified 2026-08-08 — decoded eRPM on M1/M2/M3; M4 replies outside the capture window (ESC-side, open). TIM1 is a pacer only; DMA2_CH2 drives BSRR / samples IDR |
 | PD10                   | Status LED (active low)           | ✅ heartbeat blink task                        |
 | USB-C                  | DFU flashing                      | ✅ verified — no SWD on this board             |
