@@ -1,8 +1,9 @@
 // sim.rs — Simple quadrotor physics simulation
 //
 // A 6DOF rigid body model of a quadcopter with first-order motor
-// dynamics. Motor commands pass through a low-pass filter (τ ≈ 30ms)
-// before producing thrust, modelling ESC + motor inertia lag.
+// dynamics. Rotor speed follows the motor command through a first-order
+// lag (QuadParams::motor_tau, measured at 36 ms) and thrust is
+// proportional to its square, modelling ESC and motor/prop inertia.
 //
 // Quadratic aerodynamic drag on airspeed relative to the wind; no ground
 // effect. Motor lag makes PID tuning transfer more realistically to real
@@ -37,9 +38,14 @@ pub struct QuadParams {
     /// Torque-to-thrust ratio for yaw (motor reaction torque)
     /// Typical value: ~0.01-0.02
     pub yaw_torque_coeff: f32,
-    /// Motor time constant in seconds (first-order lag).
-    /// Models ESC response + motor/prop inertia.
-    /// Typical: 20-50ms for racing quads, 50-100ms for heavy lifters.
+    /// Motor time constant in seconds: first-order lag on rotor speed,
+    /// covering ESC response and motor/prop inertia.
+    ///
+    /// Measured on this airframe's motors and props, props on (bench
+    /// capture 2026-09-12, docs/plant-capture-2026-09-12.log): 36 ms mean
+    /// over 29 steps. Spin-up 40.8 ms, spin-down 32.1 ms; per motor
+    /// 29.6-41.5 ms, front pair slower than rear. The sim applies the one
+    /// mean value to every motor in both directions.
     pub motor_tau: f32,
     /// Quadratic drag coefficient, kg/m: accel = -(drag_k/mass)*|v_rel|*v_rel.
     /// Lumps 0.5*rho*Cd*A into one isotropic number -- a real airframe
@@ -97,7 +103,7 @@ impl Default for QuadParams {
             arm_length: 0.12,
             max_thrust: 20.0, // ~3:1 thrust-to-weight ratio
             yaw_torque_coeff: 0.015,
-            motor_tau: 0.03, // 30ms — typical racing quad ESC+motor
+            motor_tau: 0.036, // measured; see the field doc
             drag_k: 0.0065,  // ~30 m/s terminal velocity at 0.6 kg
             wind_ned: [0.0; 3],
         }
@@ -288,8 +294,9 @@ impl QuadSim {
         // what has a first-order response (it is a torque balance against
         // rotor inertia), and thrust is proportional to speed SQUARED. A
         // first-order model of thrust therefore has no single time
-        // constant -- fitting one to real data gives ~30 ms on a step up
-        // and ~21 ms on the step back down for the same motor, because
+        // constant -- on the 2026-09-12 bench capture a thrust-domain fit
+        // gives about 47 ms on a step up and 27 ms on the step back down
+        // for the same motors, because
         // "the first-order time constant of a squared first-order
         // response" depends on where the step starts and which way it
         // goes. See plant_fit.rs.
@@ -617,17 +624,20 @@ mod tests {
 
     #[test]
     fn test_motor_lag() {
-        // Motor state should lag behind commands by ~tau
-        let params = QuadParams::default(); // tau=0.03
+        // Rotor speed lags the command with time constant motor_tau. The
+        // step size derives from the parameter, so the test follows a
+        // change to the measured value instead of restating it.
+        let params = QuadParams::default();
+        let dt = params.motor_tau / 6.0; // six steps per time constant
         let mut sim = QuadSim::new(params, QuadState::hovering(10.0));
 
         // Command full throttle — motor state starts at 0
         let full = MotorForces { motors: [1.0; 4] };
 
-        // After one time constant (30ms = 6 steps at 200Hz),
-        // first-order response should reach ~63% of target
+        // After one time constant the first-order response should reach
+        // about 63% of target.
         for _ in 0..6 {
-            sim.step(&full, 0.005);
+            sim.step(&full, dt);
         }
         let reached = sim.rotor_speed[0];
         assert!(
@@ -636,9 +646,9 @@ mod tests {
             reached * 100.0
         );
 
-        // After 5τ (150ms = 30 steps), should be >99%
+        // After 5 time constants (30 steps), should be >99%
         for _ in 0..24 {
-            sim.step(&full, 0.005);
+            sim.step(&full, dt);
         }
         assert!(
             sim.rotor_speed[0] > 0.99,

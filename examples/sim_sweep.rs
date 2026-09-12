@@ -70,12 +70,11 @@ const GYRO_FLOOR_DPS: f32 = 1.0;
 /// Plant parameters, overridable for sensitivity checks.
 ///
 /// QuadParams::default() is labelled "reasonable defaults for a 5in racing
-/// quad" -- plausible textbook values, not measurements of this airframe.
-/// Two of them bear directly on any stability result: motor_tau sets the
-/// loop's dominant phase lag (30 ms puts its corner at 5.3 Hz), and
-/// max_thrust sets loop gain. motor_tau's own comment gives a RANGE
-/// (20-50 ms), not a value, so the honest thing is to sweep it rather than
-/// trust it.
+/// quad" -- plausible textbook values, not measurements of this airframe,
+/// with one exception: motor_tau is a bench measurement (36 ms, corner at
+/// 4.4 Hz; see QuadParams::motor_tau). It sets the loop's dominant phase
+/// lag, and max_thrust sets loop gain. max_thrust and inertia remain
+/// unmeasured, so sweep them rather than trust them.
 fn plant_params() -> QuadParams {
     let mut p = QuadParams::default();
     if let Some(v) = std::env::var("PLANT_TAU").ok().and_then(|v| v.parse().ok()) {
