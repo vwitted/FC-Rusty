@@ -125,7 +125,7 @@ impl PlantSample {
 
     /// Mechanical RPM, given the motor's pole-pair count.
     ///
-    /// A 12N14P outrunner -- which is what a 5" quad motor almost always
+    /// A 12N14P outrunner -- which is what a 5-7" quad motor almost always
     /// is -- has 7 pole pairs. Note this scale factor CANCELS in a time
     /// constant, so getting it wrong costs nothing in `motor_tau`; it
     /// only matters for reporting absolute RPM and for thrust curves.
@@ -249,7 +249,7 @@ mod tests {
     fn erpm_matches_the_dshot_definition() {
         // The reply is the period of one electrical revolution in us.
         // 1000 us -> 60000 eRPM; at 7 pole pairs that is ~8571 mechanical
-        // RPM, a plausible 5" hover figure.
+        // RPM, a plausible hover figure.
         let mut s = PlantSample::default();
         s.period_us = [1000, 0, 0, 0];
         assert!((s.erpm(0).unwrap() - 60_000.0).abs() < 1.0);

@@ -95,7 +95,11 @@ impl QuadParams {
 }
 
 impl Default for QuadParams {
-    /// Reasonable defaults for a 5" racing quad (~600g)
+    /// Defaults for a 5" racing quad (~600 g). NOT this airframe, which is
+    /// a 7": its mass, inertia, arm length and thrust are unmeasured, and
+    /// only `motor_tau` below is a measurement of it. Replacing the rest
+    /// with a second set of guesses would move every sim result and force a
+    /// baseline re-bless, so it waits for real figures.
     fn default() -> Self {
         Self {
             mass: 0.6,

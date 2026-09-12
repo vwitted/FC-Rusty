@@ -317,7 +317,7 @@ fn main() {
 
     // PLANT_THRUST/PLANT_INERTIA: check a candidate against a plant that is
     // wrong in the direction the real one probably is. The default 20 N is
-    // 3:1 thrust-to-weight; a real 5in racer is 6-10:1, i.e. MORE control
+    // 3:1 thrust-to-weight; a real 5in racer is 6-10:1, and this airframe is a 7in, i.e. MORE control
     // authority and so more loop gain. Gains that only work at 3:1 would not
     // transfer, and that is the whole risk of tuning in sim.
     let mut plant = QuadParams::default();

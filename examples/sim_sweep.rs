@@ -71,7 +71,7 @@ const GYRO_FLOOR_DPS: f32 = 1.0;
 ///
 /// QuadParams::default() is labelled "reasonable defaults for a 5in racing
 /// quad" -- plausible textbook values, not measurements of this airframe,
-/// with one exception: motor_tau is a bench measurement (36 ms, corner at
+/// which is a 7in, with one exception: motor_tau is a bench measurement (36 ms, corner at
 /// 4.4 Hz; see QuadParams::motor_tau). It sets the loop's dominant phase
 /// lag, and max_thrust sets loop gain. max_thrust and inertia remain
 /// unmeasured, so sweep them rather than trust them.
@@ -82,6 +82,16 @@ fn plant_params() -> QuadParams {
     }
     if let Some(v) = std::env::var("PLANT_THRUST").ok().and_then(|v| v.parse().ok()) {
         p.max_thrust = v;
+    }
+    // Mass and arm length matter as much as inertia and were not
+    // overridable, which mattered once the airframe turned out to be a 7in
+    // rather than the 5in the defaults describe. Loop gain scales with arm
+    // length (torque per unit thrust) and inversely with inertia.
+    if let Some(v) = std::env::var("PLANT_MASS").ok().and_then(|v| v.parse().ok()) {
+        p.mass = v;
+    }
+    if let Some(v) = std::env::var("PLANT_ARM").ok().and_then(|v| v.parse().ok()) {
+        p.arm_length = v;
     }
     if let Some(v) = std::env::var("PLANT_INERTIA").ok().and_then(|v| v.parse().ok()) {
         p.inertia = [v, v, v * 2.0];
