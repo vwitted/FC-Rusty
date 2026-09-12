@@ -146,10 +146,21 @@ d`).
 
    Two caveats. The rate loop runs on filtered gyro in both `main.rs` and
    the harness, so no estimator is in this path and `--estimator` changes
-   nothing. And the result rests on unmeasured plant values: it disappears
-   at an inertia of 0.008 kg·m² against the modelled 0.004, and worsens
-   with more thrust authority. Inertia needs a flight log. Evidence in
-   commits e7f614f and 0e17a9e.
+   nothing. And the modelled plant is a 5in default, not this 7in
+   airframe. At estimated 7in figures (mass 1.2-1.5 kg, arm 0.19-0.22 m,
+   inertia 0.010-0.020 kg·m², thrust 55-70 N) the limit cycle persists at
+   41 Hz with a LARGER amplitude, 7.2-10.4 dps against 6.7, and a motor on
+   a rail for 88-95% of steps. An earlier note here said inertia above
+   0.008 kg·m² removes it; that held only at 5in arm length and thrust,
+   which scale loop gain up alongside inertia.
+
+   On the estimated 7in plant the levers that work are the GA gains
+   (kp 0.009, kd 0.00015), shortening the D-term filter (2 ms leaves a
+   2.2 dps oscillation; off removes it), or raising the gyro cutoff
+   (300 Hz drops saturation from 95% to 24%). The gyro filter exists to
+   reject vibration, so that last lever trades against noise on real
+   hardware. Real mass, inertia, arm length and thrust are still
+   unmeasured. Evidence in commits e7f614f, 0e17a9e and 1409259.
 
 ## ****Alpha Complete 03-05-2026****
 
