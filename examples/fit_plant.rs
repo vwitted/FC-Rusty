@@ -17,6 +17,7 @@
 
 use fc_rusty::plant_fit::{find_steps, fit_step, summarise, summarise_by, Dir, Step, StepFit};
 use fc_rusty::plant_log::{parse_csv_line, PlantSample};
+use fc_rusty::sim::QuadParams;
 
 /// Residual above which a step's fit is not trusted. See
 /// `plant_fit::summarise`.
@@ -144,6 +145,18 @@ fn main() {
                 u.mean_s / d.mean_s,
             );
         }
+        // The sim lags rotor speed with one constant in both directions.
+        // This line is the measurement that tests that assumption.
+        let om_up = summarise_by(&fits, MAX_RESIDUAL, Dir::Up, |f| f.tau_omega_s);
+        let om_dn = summarise_by(&fits, MAX_RESIDUAL, Dir::Down, |f| f.tau_omega_s);
+        if let (Some(u), Some(d)) = (om_up, om_dn) {
+            println!(
+                "    (speed-domain: {:.1} ms up / {:.1} ms down, ratio {:.2} — the sim assumes 1.00)",
+                u.mean_s * 1e3,
+                d.mean_s * 1e3,
+                u.mean_s / d.mean_s,
+            );
+        }
         println!();
         all_fits.extend(fits);
     }
@@ -161,9 +174,23 @@ fn main() {
                 s.mean_s * 1e3,
                 s.n
             );
-            println!("  sim default is 0.03 s — see QuadParams::motor_tau");
-            println!("  This is the rotor-speed constant, which is what QuadSim lags;");
-            println!("  it squares speed for thrust, so this is direction-independent.");
+            println!(
+                "  sim default is {} s — see QuadParams::motor_tau",
+                QuadParams::default().motor_tau
+            );
+            if let (Some(u), Some(d)) = (
+                summarise_by(&all_fits, MAX_RESIDUAL, Dir::Up, |f| f.tau_omega_s),
+                summarise_by(&all_fits, MAX_RESIDUAL, Dir::Down, |f| f.tau_omega_s),
+            ) {
+                println!(
+                    "  speed-domain by direction: {:.1} ms up / {:.1} ms down, ratio {:.2}",
+                    u.mean_s * 1e3,
+                    d.mean_s * 1e3,
+                    u.mean_s / d.mean_s,
+                );
+            }
+            println!("  QuadSim lags rotor speed with ONE constant in both directions;");
+            println!("  a ratio away from 1.00 measures how far that model is an approximation.");
 
             // Motor-to-motor spread is worth more than the mean here. The
             // mean is what the sim wants; the spread is what tells you a

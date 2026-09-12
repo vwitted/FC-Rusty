@@ -17,7 +17,14 @@
 //! `QuadSim` lags ROTOR SPEED with `motor_tau` and squares it for thrust
 //! (`QuadParams::thrust_frac`). So `motor_tau` is the motor's own
 //! mechanical time constant and `tau_omega_s` below is exactly it: one
-//! number, direction-independent, straight into the sim.
+//! number, applied by the sim in both directions.
+//!
+//! That symmetry is a model assumption, not a measured fact. The first
+//! props-on bench capture (2026-09-12, docs/plant-capture-2026-09-12.log)
+//! measured spin-up at 40.8 ms and spin-down at 32.1 ms in the speed
+//! domain, a ratio of 1.27, with every motor in the range 1.17-1.31. The
+//! mean over both directions is the best single value; the fit CLI prints
+//! the split so the approximation stays visible.
 //!
 //! It was not always that simple, and the history is the reason both time
 //! constants are still reported.
@@ -355,10 +362,12 @@ pub fn summarise_by(
 /// The value to put in `QuadParams::motor_tau`: the rotor-speed time
 /// constant, over steps in both directions.
 ///
-/// Both directions because it is the same number in both -- that is what
-/// makes it the right one. This used to return the accelerating THRUST
-/// constant, which was the conservative pick among several answers that
-/// should have been one answer. The sim now squares rotor speed rather
+/// Both directions because the sim applies one constant to both. The
+/// model assumes the two are equal; measured, spin-up is about 1.27x
+/// slower (see the module docs), and their mean is the best single value.
+/// This used to return the accelerating THRUST constant, which was the
+/// conservative pick among several answers that should have been one
+/// answer. The sim now squares rotor speed rather
 /// than lagging thrust, so the ambiguity is gone and the honest thing is
 /// the physical constant.
 pub fn summarise(fits: &[StepFit], max_residual_frac: f32) -> Option<TauSummary> {
