@@ -128,14 +128,28 @@ d`).
 
    *(Status Verification: This point remains **TRUE**. While the logic and loop decoupling have been heavily validated in the simulation environments (`sim_gps_rescue`, `sim_hover`), we are still awaiting the delivery of the final target hardware to begin the physical motor bring-up and physical PID tuning.)*
 
-3. **Rate-loop gains before first flight.** The firmware rate gains
-   (kp 0.020, ki 0.005, kd 0.001, carried over from a 200 Hz loop) put the
-   sim's rate loop into a saturated limit cycle after a 10 dps roll poke:
-   PID output at the 0.5 limit, motors pinned at 0 and 1, about 44 Hz,
-   draining collective thrust. Present at every `motor_tau` from 20 to
-   50 ms; the GA gains (kp 0.009, kd 0.00015) remove it. Sim values are
-   directional only (`max_thrust` and inertia unmeasured). Evidence in
-   commit e7f614f.
+3. **Rate-loop gains and filter cutoffs before first flight.** The
+   firmware rate gains (kp 0.020, ki 0.005, kd 0.001, carried over from a
+   200 Hz loop) put the sim's rate loop into a saturated 41 Hz limit cycle
+   after a 10 dps roll poke, measured at the inner rate with
+   `sim_sweep --trace-inner`: PID output averaging 0.44 of its 0.5 limit
+   and a motor on a rail for 95% of steps, which drains collective thrust.
+   Gust shape is irrelevant; a 200 ms raised cosine gives the same result.
+
+   The loop's own filtering sets the frequency, not the motors: 45 to
+   40 Hz across a `motor_tau` range of 20 to 50 ms, against 25 to 50 Hz
+   across a gyro cutoff of 60 to 220 Hz and 20 to 78 Hz across a D-term
+   filter of 32 to 2 ms. More filtering means more phase lag and larger
+   amplitude; 16 ms of D filtering crashes the undegraded case, and
+   removing the D filter stops the oscillation entirely. So do the GA
+   gains (kp 0.009, kd 0.00015).
+
+   Two caveats. The rate loop runs on filtered gyro in both `main.rs` and
+   the harness, so no estimator is in this path and `--estimator` changes
+   nothing. And the result rests on unmeasured plant values: it disappears
+   at an inertia of 0.008 kg·m² against the modelled 0.004, and worsens
+   with more thrust authority. Inertia needs a flight log. Evidence in
+   commits e7f614f and 0e17a9e.
 
 ## ****Alpha Complete 03-05-2026****
 
