@@ -28,7 +28,9 @@ pub struct MotorTestConfig {
     ///
     /// Ignores `motor_pct` entirely: the profile drives all four motors
     /// together from `plant_capture::PROFILE`, so a capture is the same
-    /// experiment every time and the four fits are comparable.
+    /// experiment every time and the four fits are comparable. After the
+    /// dump the run stops sending frames and never enters the
+    /// constant-throttle loop.
     pub profile: bool,
 }
 
@@ -235,6 +237,18 @@ pub async fn run(p: embassy_stm32::Peripherals) -> ! {
 
     if cfg.profile {
         run_profile(&mut dshot, &mut ticker, cfg).await;
+        // A capture build must not continue into the constant-throttle loop
+        // below: that loop drives every motor at `motor_pct` (5% when
+        // unset), and this build runs with props on. On the 2026-09-12
+        // bench run it did continue; the motors stayed still only because
+        // the ESCs had lost signal during the dump and would not re-arm on
+        // a nonzero first frame. No further frames are sent, so the ESCs
+        // remain disarmed; re-arming requires the zero-throttle stream that
+        // only a reboot produces.
+        defmt::warn!("plant capture: complete. DShot output stopped, ESCs disarmed. Disconnect the battery to end the run.");
+        loop {
+            Timer::after(Duration::from_secs(3600)).await;
+        }
     }
 
     defmt::info!("motor-test: driving motors");
