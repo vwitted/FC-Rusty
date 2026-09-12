@@ -305,6 +305,15 @@ pub struct HarnessCfg {
     /// question about position, which is why its wind column was flat.
     /// Mutually exclusive with `cmd`: both drive the MPC reference.
     pub pos_hold: bool,
+    /// Call the trace callback once per INNER step instead of once per
+    /// outer tick.
+    ///
+    /// The outer tick is 100 Hz and aliases anything faster. The rate loop
+    /// runs at 8 kHz, so an oscillation inside it cannot be measured
+    /// through that window: on 2026-09-12 its frequency had to be inferred
+    /// from the ratio of body rate to attitude amplitude. Costs one
+    /// callback per step, so it is for single diagnostic runs, not sweeps.
+    pub trace_every_step: bool,
     /// Run the FIRMWARE's mode logic (control::modes::nav_step) instead of
     /// the harness's own altitude/position handling.
     ///
@@ -419,6 +428,7 @@ impl HarnessCfg {
             plant,
             total_s: 10.0,
             target_alt: 5.0,
+            trace_every_step: false,
             disturb_ms: 0.0,
             dual: false,
             dual_cfg: DualImuConfig::none(),
@@ -629,6 +639,12 @@ pub fn run_case(
 
     for step in 0..steps {
         let t = step as f32 * r.dt;
+
+        // Inner-rate tracing. The outer-tick assignment below samples at
+        // 100 Hz, which cannot represent a rate-loop oscillation.
+        if h.trace_every_step {
+            trace_due = trace.is_some();
+        }
 
         // A direct state poke is an instantaneous step in angular rate, i.e.
         // infinite angular acceleration, flat to Nyquist. Nothing physical

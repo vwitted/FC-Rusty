@@ -212,6 +212,7 @@ fn harness_cfg(cfg: &Degradation, r: Rates, dual: bool) -> (HarnessCfg, Tunables
         plant: plant_params(),
         total_s: total_s(),
         target_alt: TARGET_ALT,
+        trace_every_step: false,
         disturb_ms: disturb_ms(),
         dual,
         dual_cfg: to_dual(cfg),
@@ -260,6 +261,13 @@ fn tunables() -> Tunables {
     }
     if let Some(v) = std::env::var("RATE_KD").ok().and_then(|v| v.parse().ok()) {
         t.rate.kd = v;
+    }
+    // D_LPF_MS overrides the D-term filter constant (PidLimits::d_lpf_tau_s,
+    // 8 ms in the firmware). It is the other phase lag inside the rate loop,
+    // and the 2026-09-12 traces showed the loop's limit-cycle frequency
+    // tracking the GYRO filter closely, so this asks the same of the D one.
+    if let Some(v) = std::env::var("D_LPF_MS").ok().and_then(|v| v.parse::<f32>().ok()) {
+        t.limits.d_lpf_tau_s = v * 1e-3;
     }
     if let Some(v) = std::env::var("POS_MAX_TILT_DEG").ok().and_then(|v| v.parse().ok()) {
         t.pos_max_tilt_deg = v;
@@ -360,6 +368,77 @@ fn main() {
     let dual = std::env::args().any(|a| a == "--dual");
     let rates = if legacy { Rates::LEGACY } else { Rates::FIRMWARE };
     let seeds: u64 = 8;
+
+    // --trace-inner: one undegraded run sampled at the INNER rate, and
+    // summarised rather than printed -- 8 kHz for 10 s is 80k lines. Counts
+    // sign changes of the rate-PID output, which is twice the oscillation
+    // frequency. The point is to separate a plant-frequency limit cycle
+    // from chatter at the sample rate: flipping every step would read as
+    // half the inner rate, not tens of Hz.
+    if std::env::args().any(|a| a == "--trace-inner") {
+        let cfg = Degradation::none();
+        let (mut h, tun) = harness_cfg(&cfg, rates, dual);
+        h.trace_every_step = true;
+        if std::env::var("POS_HOLD").is_ok() {
+            h.pos_hold = true;
+        }
+        let win_s: f32 = std::env::var("TRACE_WIN_S").ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(0.5);
+        let mut rows: Vec<(f32, usize, u32, f32, f32, f32)> = Vec::new();
+        let (mut t0, mut n, mut flips, mut sat) = (0.0f32, 0usize, 0u32, 0usize);
+        let (mut abs_sum, mut sq_sum) = (0.0f64, 0.0f64);
+        let mut last_sign = 0i32;
+        let m = {
+            let mut show = |p: fc_rusty::sim::harness::TracePoint| {
+                if n == 0 {
+                    t0 = p.t;
+                }
+                let s = if p.pid_roll > 0.0 { 1 } else if p.pid_roll < 0.0 { -1 } else { 0 };
+                if s != 0 {
+                    if last_sign != 0 && s != last_sign {
+                        flips += 1;
+                    }
+                    last_sign = s;
+                }
+                abs_sum += p.pid_roll.abs() as f64;
+                sq_sum += (p.roll_rate * p.roll_rate) as f64;
+                if p.motor_min <= 0.001 || p.motor_max >= 0.999 {
+                    sat += 1;
+                }
+                n += 1;
+                if p.t - t0 >= win_s {
+                    rows.push((
+                        t0,
+                        n,
+                        flips,
+                        (abs_sum / n as f64) as f32,
+                        (sq_sum / n as f64).sqrt() as f32,
+                        sat as f32 / n as f32,
+                    ));
+                    t0 = p.t;
+                    n = 0;
+                    flips = 0;
+                    sat = 0;
+                    abs_sum = 0.0;
+                    sq_sum = 0.0;
+                }
+            };
+            run_case(&h, &tun, cfg, 1, Some(&mut show))
+        };
+        println!(
+            "inner-rate trace: {:.0} Hz inner, {:.0} Hz outer, motor_tau {:.1} ms, window {} s",
+            rates.inner_hz(), rates.outer_hz(), h.plant.motor_tau * 1e3, win_s
+        );
+        println!("    t0  samples   flips   est_hz   |pid_roll|  rollrate_rms  sat_frac");
+        for (t, cnt, f, a, rms, sf) in &rows {
+            println!(
+                "{:6.2} {:8} {:7} {:8.1} {:12.4} {:13.2} {:9.2}",
+                t, cnt, f, *f as f32 / (2.0 * win_s), a, rms, sf
+            );
+        }
+        println!("result: {:?}", m.failed_at);
+        return;
+    }
 
     // --trace: one undegraded run, one row per outer tick. Diagnostic entry
     // point for "why did this case fail", which the summary cannot answer.
