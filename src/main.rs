@@ -20,7 +20,7 @@
 //   IMU2 on SPI4 (SCK=PE12, MISO=PE13, MOSI=PE14, CS=PB1) — ROTATION_PITCH_180
 // Both are read at 8 kHz and averaged for √2 noise reduction.
 //
-// Motors (DShot300, bit-banged — TIM1 paces DMA writes to GPIOA's BSRR;
+// Motors (DShot600, bit-banged — TIM1 paces DMA writes to GPIOA's BSRR;
 // the pins are plain GPIO, never in alternate-function mode):
 //   PA0 → M1
 //   PA1 → M2

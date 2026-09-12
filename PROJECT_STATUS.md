@@ -24,7 +24,7 @@ d`).
 | SPI4 + PB1             | ICM-42688P IMU2 (onboard)         | ✅ verified — 8 kHz reads, averaged with IMU1  |
 | I2C2 (PB10/PB11)       | SPL06 barometer (onboard)         | ✅ proper driver — 128 Hz, correct calibration              |
 | I2C2 (PB10/PB11)       | Magnetometer, external (SDA/SCL pads; SE100 V2 GPS = IST8310 @ 0x0E; older SE100s QMC5883L/HMC5883L; LIS2MDL breakout also supported) | ✅ 2026-09-09: IST8310 reading on the bench, 123/s, 0 errs, values track motion (after `7be18ed` — a 7-byte STAT1+data burst froze the sample; datasheet order of separate reads fixes it). Raw field shows large hard iron (\|B\| 80–110 uT, X ~70–88 in every orientation). NEXT: hard-iron cal on the bench, then north/yaw test for handedness + Orientation (still Identity, unverified). Notes in docs/mag-orientation.txt. |
-| PA0/PA1/PA2/PA3 (GPIO) | DShot600 bit-banged, motors M1–M4 | ✅ bidir verified 2026-08-08 — decoded eRPM on M1/M2/M3; M4 replies outside the capture window (ESC-side, open). TIM1 is a pacer only; DMA2_CH2 drives BSRR / samples IDR |
+| PA0/PA1/PA2/PA3 (GPIO) | DShot600 bit-banged, motors M1–M4 | ✅ bidir verified 2026-08-08; all four motors report eRPM since the M4 ESC replacement (plant capture 2026-09-12: telemetry on 99-100% of samples per motor). TIM1 is a pacer only; DMA2_CH2 drives BSRR / samples IDR |
 | PD10                   | Status LED (active low)           | ✅ heartbeat blink task                        |
 | USB-C                  | DFU flashing                      | ✅ verified — no SWD on this board             |
 | UART4 (PD1/PD0)        | DisplayPort / VTX (T4/R4)         | ⚪ not wired                                   |
@@ -386,7 +386,7 @@ All host-tested (`cargo test --lib --no-default-features --target x86_64-unknown
 | ISM6HG256X driver | `drivers/ism6hg256x.rs` | ±16 g / ±4000 dps / 7.68 kHz, SPI; written for Beta breakout, unreferenced |
 | LIS2MDL driver   | `drivers/lis2mdl.rs`     | 3-axis mag, I2C addr 0x1E, 100 Hz HR + LPF + OFF_CANC; wired into baro_task + fused in MEKF for yaw |
 | IMU LPF          | `imu_filter.rs`          | 2nd-order Butterworth biquad bank on the fused dual-IMU stream; 150 Hz gyro / 25 Hz accel default |
-| DShot driver     | `drivers/dshot_bitbang.rs` | TIM1 as pacer only; DMA2_CH2 writes BSRR to GPIOA, reads IDR 3× oversampled. DShot300, bidir working on hardware. Replaced the timer-output-compare driver on 2026-08-08 |
+| DShot driver     | `drivers/dshot_bitbang.rs` | TIM1 as pacer only; DMA2_CH2 writes BSRR to GPIOA, reads IDR 3× oversampled. DShot600, bidir working on hardware. Replaced the timer-output-compare driver on 2026-08-08 |
 | DShot BSRR frame | `drivers/dshot_bb_frame.rs` | Pure builder: 51 BSRR words per frame (16 bits × 3 states + 3 hold); inversion is a half-word swap |
 | DShot GCR decode | `drivers/dshot_bb_decode.rs` | Pure decoder: samples → 21 GCR bits → quintets → eRPM period. No EDT frame-type discrimination yet |
 | DShot frame      | `drivers/dshot_frame.rs` | 16-bit frame encoder, bidir CRC inversion; MSB-first wire unpack |
