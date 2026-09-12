@@ -99,6 +99,11 @@ d`).
 - **Control loop**: Asynchronous dual-loop architecture communicating via lock-free `Watch` channel:
   - **Outer Loop (100 Hz)**: `navigation_task` handles Attitude MPC, altitude hold, position hold, and RC processing.
   - **Inner Loop (8 kHz)**: `control_loop` executes the rate PID and DShot output, fully synchronized to the MEKF gyro predicts without arbitrary timers.
+- **Motor plant**: props-on bench step capture 2026-09-12
+  (`docs/plant-capture-2026-09-12.log`) gives a rotor-speed time constant
+  of 36 ms, now `QuadParams::motor_tau`. Spin-up is 1.27x slower than
+  spin-down, and the front pair (M2, M4, about 40 ms) is slower than the
+  rear pair (M1, M3, about 31 ms); the mixer assumes identical motors.
 
 ---
 
@@ -122,6 +127,15 @@ d`).
    enable the MPC outer loop and tune for transfer from sim.
 
    *(Status Verification: This point remains **TRUE**. While the logic and loop decoupling have been heavily validated in the simulation environments (`sim_gps_rescue`, `sim_hover`), we are still awaiting the delivery of the final target hardware to begin the physical motor bring-up and physical PID tuning.)*
+
+3. **Rate-loop gains before first flight.** The firmware rate gains
+   (kp 0.020, ki 0.005, kd 0.001, carried over from a 200 Hz loop) put the
+   sim's rate loop into a saturated limit cycle after a 10 dps roll poke:
+   PID output at the 0.5 limit, motors pinned at 0 and 1, about 44 Hz,
+   draining collective thrust. Present at every `motor_tau` from 20 to
+   50 ms; the GA gains (kp 0.009, kd 0.00015) remove it. Sim values are
+   directional only (`max_thrust` and inertia unmeasured). Evidence in
+   commit e7f614f.
 
 ## ****Alpha Complete 03-05-2026****
 

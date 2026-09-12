@@ -19,6 +19,10 @@ scripts/blackbox-dump.sh              # then read it back, and it erases
 scripts/plant-fit.sh flight.log
 ```
 
+After the dump the capture build stops DShot output and parks; the ESCs
+stay disarmed until the board is power-cycled. First capture: 2026-09-12,
+`docs/plant-capture-2026-09-12.log`, `motor_tau` 36 ms.
+
 The capture build is selected by `PLANT_CAPTURE=1`, deliberately not
 `PROFILE`: `flash-motor-test.sh` has a shell variable of that name for the
 cargo profile, and assigning to an already-exported name keeps it
