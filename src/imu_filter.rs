@@ -69,11 +69,36 @@ pub struct Biquad {
     y2: f32,
 }
 
+/// Highest cutoff a low-pass is designed for, as a fraction of the sample
+/// rate.
+///
+/// The bilinear prewarp is tan(pi * fc / fs). It is infinite at Nyquist
+/// (fc = fs / 2) and negative beyond it, where it yields an unstable
+/// filter: the legacy 200 Hz sim preset with the firmware's 150 Hz cutoff
+/// went non-finite on every run. Pinning exactly at Nyquist would still hit
+/// the singularity, so the limit sits below it. At 0.45 the prewarp is
+/// about 6.3, a valid if nearly transparent filter.
+pub const MAX_CUTOFF_FRACTION: f32 = 0.45;
+
+/// `fc_hz` limited to `MAX_CUTOFF_FRACTION * fs_hz`.
+pub fn clamp_cutoff_hz(fc_hz: f32, fs_hz: f32) -> f32 {
+    fc_hz.min(MAX_CUTOFF_FRACTION * fs_hz)
+}
+
 impl Biquad {
     /// Build a 2nd-order Butterworth low-pass at cutoff `fc_hz` for a
     /// stream sampled at `fs_hz`. Coefficients via the bilinear
     /// transform (Q = 1/√2 for Butterworth).
+    ///
+    /// The cutoff is limited by `clamp_cutoff_hz`, because a cutoff at or
+    /// above Nyquist has no valid design. A cutoff of zero or below returns
+    /// the identity filter, matching "0 disables" everywhere else; designed
+    /// literally, it would output zero for every input.
     pub fn new_lowpass_butterworth(fc_hz: f32, fs_hz: f32) -> Self {
+        if fc_hz <= 0.0 {
+            return Self::identity();
+        }
+        let fc_hz = clamp_cutoff_hz(fc_hz, fs_hz);
         // Pre-warped angular frequency.
         let w = libm::tanf(PI * fc_hz / fs_hz);
         let w2 = w * w;
@@ -226,6 +251,39 @@ impl ImuFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cutoff above Nyquist used to produce an unstable filter. Clamped,
+    /// it stays finite and settles to unity DC gain.
+    #[test]
+    fn cutoff_above_nyquist_is_clamped_to_a_stable_filter() {
+        let mut b = Biquad::new_lowpass_butterworth(150.0, 200.0);
+        let mut y = 0.0;
+        for _ in 0..2000 {
+            y = b.apply(1.0);
+            assert!(y.is_finite());
+        }
+        assert!((y - 1.0).abs() < 1e-3, "DC gain {y}");
+    }
+
+    #[test]
+    fn a_clamped_design_matches_a_design_at_the_limit() {
+        let fs = 200.0;
+        let a = Biquad::new_lowpass_butterworth(150.0, fs);
+        let b = Biquad::new_lowpass_butterworth(MAX_CUTOFF_FRACTION * fs, fs);
+        assert_eq!((a.b0, a.b1, a.b2, a.a1, a.a2), (b.b0, b.b1, b.b2, b.a1, b.a2));
+    }
+
+    #[test]
+    fn cutoffs_below_the_limit_are_untouched() {
+        assert_eq!(clamp_cutoff_hz(150.0, 8000.0), 150.0);
+        assert!((clamp_cutoff_hz(150.0, 200.0) - 90.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_zero_cutoff_gives_the_identity_filter() {
+        let mut b = Biquad::new_lowpass_butterworth(0.0, 8000.0);
+        assert_eq!(b.apply(0.7), 0.7);
+    }
 
     /// Driving a biquad with a constant DC value should converge to
     /// the same value at the output (gain = 1.0 at DC).

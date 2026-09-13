@@ -61,18 +61,6 @@ board at prediction horizons 4 to 30. The tuner genes are not yet added.
 Found during the 2026-09-12/13 sessions and not yet fixed. Each is either
 folded into the work above or needs its own fix; none should be dropped.
 
-Harness and filters:
-- The gyro low-pass filter accepts a cutoff at or above Nyquist.
-  `new_lowpass_butterworth` in `src/imu_filter.rs` prewarps with
-  `tan(pi * fc / fs)`, which turns negative past fs/2, and has no guard.
-  The legacy preset samples at 200 Hz with the firmware's 150 Hz cutoff,
-  so every legacy row went non-finite (104 of 104 failures). On the
-  undegraded legacy trace: non-finite at 2.5 s with the default cutoff; a
-  crash at the 5 s drop with a 40 or 90 Hz cutoff; flies with the filter
-  off. It must be guarded before loop rate becomes a tuner gene, or the
-  tuner will generate invalid filters. The firmware's own 150 Hz at 8 kHz
-  is unaffected.
-
 Firmware:
 - The rate gains put the sim's rate loop into a saturated 41 Hz limit
   cycle. Recorded as a pre-flight item in PROJECT_STATUS.md.
@@ -88,8 +76,12 @@ Fixed 2026-09-13: the `main.rs` comment calling the navigation loop 50 Hz
 USART6) and NMEA-only GPS (UBX is preferred). Also the legacy preset
 solving a 10 ms MPC model every 20 ms: the harness now discretises the MPC
 for each preset's own period and gives the firmware preset the firmware
-model exactly. That was not the cause of the legacy failures; the filter
-entry above is.
+model exactly. That was not the cause of the legacy failures. The
+gyro low-pass filter was: `new_lowpass_butterworth` accepted a cutoff at or
+above Nyquist, where the bilinear prewarp turns negative and the filter
+unstable. It now clamps the cutoff to 0.45 of the sample rate and treats
+zero as disabled. Every legacy resonance row now flies (104 failures to
+none); the sweep baseline was re-blessed for those 13 rows only.
 
 Pending hardware verification:
 - IST8310 hard-iron calibration, mounting orientation, and the handedness
