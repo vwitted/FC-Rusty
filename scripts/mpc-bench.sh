@@ -3,10 +3,10 @@
 #
 #   scripts/mpc-bench.sh
 #
-# Times AttitudeMpc at a menu of horizons (4 to 30 prediction steps) on the
-# board with the DWT cycle counter, logs one MPC_BENCH line per horizon, and
-# halts. It never initialises DShot, so no motor can spin and props do not
-# matter.
+# Times AttitudeMpc at a menu of horizons (4 to 30 prediction steps), each
+# at iteration caps 5, 10, 20 and 50, on the board with the DWT cycle
+# counter. Logs one MPC_BENCH line per horizon and cap, then halts. It
+# never initialises DShot, so no motor can spin and props do not matter.
 #
 # The table is the feasibility data for choosing the MPC horizon and rate:
 # a horizon is usable at a given MPC period only if solve_max_us fits inside

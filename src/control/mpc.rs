@@ -77,11 +77,15 @@ pub struct MpcModel {
     /// Closed rate-loop time constant, seconds: how quickly the inner PID
     /// brings the body rate to the commanded value.
     pub tau_rate_s: f32,
+    /// ADMM iteration cap per solve. It bounds solve time, so it belongs to
+    /// the compute budget rather than the control law; see where the solver
+    /// is configured.
+    pub max_iter: usize,
 }
 
 impl MpcModel {
-    /// What the firmware flies: 100 Hz and 30 ms.
-    pub const FIRMWARE: MpcModel = MpcModel { dt: MPC_DT, tau_rate_s: TAU_MOTOR };
+    /// What the firmware flies: 100 Hz, 30 ms and 10 iterations.
+    pub const FIRMWARE: MpcModel = MpcModel { dt: MPC_DT, tau_rate_s: TAU_MOTOR, max_iter: 10 };
 
     /// First-order rate-lag coefficient: exp(-dt / tau) plus the margin.
     pub fn rate_alpha(&self) -> f32 {
@@ -276,7 +280,8 @@ impl<const PH: usize, const CH: usize> AttitudeMpc<PH, CH> {
         // solve 10 ms later continues from a warm start. The navigation
         // task records `mpc_time_us_max`; check it on hardware if you
         // change this cap.
-        solver.config.max_iter = 10;
+        // The firmware's cap is MpcModel::FIRMWARE.max_iter.
+        solver.config.max_iter = model.max_iter;
         solver.config.do_check = 1;
 
         // ---- Constraints ----
@@ -561,5 +566,15 @@ mod tests {
             assert!(u < 0.0, "a positive roll error must command a negative roll rate, got {u}");
             assert!(u.abs() <= MAX_CMD_RAD + 1e-6);
         }
+    }
+
+    /// The iteration cap comes from the model, so the sim can lift it.
+    #[test]
+    fn iteration_cap_comes_from_the_model() {
+        let deg = core::f32::consts::PI / 180.0;
+        let mut m: AttitudeMpc = AttitudeMpc::with_model(MpcModel { max_iter: 2, ..MpcModel::FIRMWARE });
+        m.set_reference([0.0; 3], [0.0; 3]);
+        let out = m.solve([20.0 * deg, 0.0, 0.0], [0.0; 3]);
+        assert!(out.iterations <= 2, "used {} iterations against a cap of 2", out.iterations);
     }
 }

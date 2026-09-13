@@ -279,6 +279,12 @@ fn tunables() -> Tunables {
     if let Some(v) = std::env::var("D_LPF_MS").ok().and_then(|v| v.parse::<f32>().ok()) {
         t.limits.d_lpf_tau_s = v * 1e-3;
     }
+    // MPC_MAX_ITER overrides the MPC's per-solve iteration cap (10 in the
+    // firmware), so the sweep can separate a controller's quality from the
+    // solve budget it was given.
+    if let Some(v) = std::env::var("MPC_MAX_ITER").ok().and_then(|v| v.parse().ok()) {
+        t.mpc_max_iter = v;
+    }
     if let Some(v) = std::env::var("POS_MAX_TILT_DEG").ok().and_then(|v| v.parse().ok()) {
         t.pos_max_tilt_deg = v;
     }

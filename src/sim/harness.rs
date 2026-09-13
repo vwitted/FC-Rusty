@@ -229,6 +229,10 @@ pub struct Tunables {
     pub pos_max_tilt_deg: f32,
     /// MPC output command bound, deg/s. 0 keeps the firmware's MAX_CMD_RAD.
     pub mpc_cmd_bound_dps: f32,
+    /// MPC iteration cap per solve. The firmware's is sized for its 100 Hz
+    /// budget; a cost search lifts it so a long horizon is not scored as
+    /// worse merely for being under-solved.
+    pub mpc_max_iter: usize,
     pub alt: AltitudeGains,
 }
 
@@ -250,6 +254,8 @@ impl Tunables {
             // remembering to update a second copy.
             pos_max_tilt_deg: PositionGains::default().max_tilt_rad / DEG2RAD,
             mpc_cmd_bound_dps: 0.0,
+            // Read from the firmware's model rather than restated.
+            mpc_max_iter: MpcModel::FIRMWARE.max_iter,
             alt: AltitudeGains { kp: 0.15, kd: 0.1, ki: 0.05 },
         }
     }
@@ -595,7 +601,10 @@ pub fn run_case(
 
     // Discretise the MPC for the period it is actually solved at. The
     // legacy preset previously solved a 10 ms model every 20 ms.
-    let mut mpc: AttitudeMpc = AttitudeMpc::with_model(r.mpc_model());
+    let mut mpc: AttitudeMpc = AttitudeMpc::with_model(MpcModel {
+        max_iter: tun.mpc_max_iter,
+        ..r.mpc_model()
+    });
     if tun.mpc_cmd_bound_dps > 0.0 {
         mpc.set_cmd_bound(tun.mpc_cmd_bound_dps * DEG2RAD);
     }

@@ -33,7 +33,9 @@ specification; PROJECT_STATUS.md holds current state.
 Progress 2026-09-13: `AttitudeMpc` takes its timestep and rate-lag constant
 at runtime (`MpcModel`) and is generic over its horizons; the harness builds
 it for each rate preset. `scripts/mpc-bench.sh` times the solver on the
-board at prediction horizons 4 to 30. The tuner genes are not yet added.
+board at prediction horizons 4 to 30. The iteration cap is a model
+parameter too (`MPC_MAX_ITER` in the sweep), and the bench times caps 5,
+10, 20 and 50 at every horizon. The tuner genes are not yet added.
 
 ## Decisions
 

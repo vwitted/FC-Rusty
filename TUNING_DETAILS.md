@@ -53,11 +53,14 @@ Flashing needs `dfu-util` and `lsusb`, so it is a Debian job; only
 scripts/mpc-bench.sh                  # build + flash; no motors driven
 ```
 
-Times `AttitudeMpc` at prediction horizons 4 to 30 with the DWT cycle
-counter, using the flight entry's core configuration, and logs one line per
-horizon:
+Times `AttitudeMpc` at prediction horizons 4 to 30, each at iteration caps
+5, 10, 20 and 50, with the DWT cycle counter and the flight entry's core
+configuration. One line per horizon and cap:
 
-    MPC_BENCH,ph,ch,construct_us,solve_min_us,solve_mean_us,solve_max_us,max_iters,unconverged,solves
+    MPC_BENCH,ph,ch,cap,construct_us,solve_min_us,solve_mean_us,solve_max_us,max_iters,unconverged,solves
+
+Solves that never converge run to the cap, so size the period against the
+cap's `solve_max_us`, not a typical solve.
 
 A horizon is usable at a given MPC period only if `solve_max_us` fits inside
 it with headroom for the rest of the navigation task. The bench runs with

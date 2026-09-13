@@ -6,9 +6,9 @@
 //! under the `mpc-bench` feature; the scenario set and statistics below are
 //! pure and host-tested.
 //!
-//! Output, one line per horizon:
+//! Output, one line per horizon and iteration cap:
 //!
-//!   MPC_BENCH,ph,ch,construct_us,solve_min_us,solve_mean_us,solve_max_us,max_iters,unconverged,solves
+//!   MPC_BENCH,ph,ch,cap,construct_us,solve_min_us,solve_mean_us,solve_max_us,max_iters,unconverged,solves
 //!
 //! Solve times are measured with the flight entry's core configuration
 //! (480 MHz, D-cache off) and nothing else running. Flight adds interrupt
@@ -30,6 +30,13 @@ pub fn scenarios() -> [([f32; 3], [f32; 3]); 7] {
         ([120.0 * d, 30.0 * d, 180.0 * d], [0.0, 0.0, 0.0]),
     ]
 }
+
+/// Iteration caps timed at every horizon. Solve time grows roughly as a
+/// setup cost plus a per-iteration cost times the cap, so timing several
+/// lets any cap be checked against an MPC period without reflashing.
+/// Solves that never converge run to the cap, so the cap, not the typical
+/// count, is what a period must accommodate.
+pub const CAPS: [usize; 4] = [5, 10, 20, 50];
 
 /// Consecutive solves timed from each scenario, warm-starting as in flight.
 /// The first solve after a reset is the cold case and is usually the slowest.
@@ -85,6 +92,7 @@ mod hw {
     struct Report {
         ph: usize,
         ch: usize,
+        cap: usize,
         construct: u32,
         solve: CycleStats,
         max_iters: usize,
@@ -94,9 +102,10 @@ mod hw {
     /// Build and time one horizon. Synchronous on purpose: the MPC lives on
     /// the stack for the duration of this call rather than in the async
     /// task's future, and no await can interleave with a measurement.
-    fn measure<const PH: usize, const CH: usize>() -> Report {
+    fn measure<const PH: usize, const CH: usize>(cap: usize) -> Report {
         let t0 = DWT::cycle_count();
-        let mut mpc = AttitudeMpc::<PH, CH>::with_model(MpcModel::FIRMWARE);
+        let mut mpc =
+            AttitudeMpc::<PH, CH>::with_model(MpcModel { max_iter: cap, ..MpcModel::FIRMWARE });
         let construct = DWT::cycle_count().wrapping_sub(t0);
 
         let mut solve = CycleStats::new();
@@ -115,15 +124,16 @@ mod hw {
                 }
             }
         }
-        Report { ph: PH, ch: CH, construct, solve, max_iters, unconverged }
+        Report { ph: PH, ch: CH, cap, construct, solve, max_iters, unconverged }
     }
 
     fn report(r: Report, core_hz: f32) {
         let us = |c: u32| cycles_to_us(c, core_hz);
         defmt::info!(
-            "MPC_BENCH,{=usize},{=usize},{=f32},{=f32},{=f32},{=f32},{=usize},{=u32},{=u32}",
+            "MPC_BENCH,{=usize},{=usize},{=usize},{=f32},{=f32},{=f32},{=f32},{=usize},{=u32},{=u32}",
             r.ph,
             r.ch,
+            r.cap,
             us(r.construct),
             us(r.solve.min),
             us(r.solve.mean()),
@@ -135,10 +145,11 @@ mod hw {
     }
 
     /// Time each listed prediction horizon, with the control horizon one
-    /// shorter. Each value is a separate instantiation of the solver.
+    /// shorter, at every cap in `CAPS`. Each horizon is a separate
+    /// instantiation of the solver; the caps are runtime values.
     macro_rules! bench {
         ($core_hz:expr; $($ph:literal),+ $(,)?) => {
-            $( report(measure::<$ph, { $ph - 1 }>(), $core_hz); )+
+            $( for cap in CAPS { report(measure::<$ph, { $ph - 1 }>(cap), $core_hz); } )+
         };
     }
 
@@ -147,7 +158,7 @@ mod hw {
         defmt::info!("mpc-bench build: [{=str}]", env!("FC_BUILD_STAMP"));
         defmt::warn!("MPC BENCH: no motors are driven. Timing the solver at each horizon.");
         defmt::info!(
-            "MPC_BENCH_HEADER,ph,ch,construct_us,solve_min_us,solve_mean_us,solve_max_us,max_iters,unconverged,solves"
+            "MPC_BENCH_HEADER,ph,ch,cap,construct_us,solve_min_us,solve_mean_us,solve_max_us,max_iters,unconverged,solves"
         );
         bench!(core_hz; 4, 6, 8, 10, 12, 15, 20, 25, 30);
         defmt::info!(
@@ -171,6 +182,12 @@ mod tests {
             s.add(c);
         }
         assert_eq!((s.n, s.min, s.max, s.mean()), (3, 100, 300, 200));
+    }
+
+    #[test]
+    fn caps_ascend_and_include_the_firmware_cap() {
+        assert!(CAPS.windows(2).all(|w| w[0] < w[1]));
+        assert!(CAPS.contains(&crate::control::mpc::MpcModel::FIRMWARE.max_iter));
     }
 
     #[test]
