@@ -40,6 +40,16 @@ specification; PROJECT_STATUS.md holds current state.
   the firmware keeps one. The MPC's rate-response constant (`TAU_MOTOR`,
   30 ms) models the closed rate loop, so it depends on the rate gains and
   belongs in the same search.
+- 2026-09-13: horizon and MPC rate are chosen without regard to compute
+  first, then cut to what the board can run. For each horizon and rate, the
+  remaining genes are re-tuned and the best cost recorded over several
+  seeds, giving a cost surface. The feasible region is where the MPC solve,
+  timed on the board, fits inside the MPC period with headroom for the rest
+  of the navigation task. The choice is the lowest-cost point in that
+  region; a smaller horizon is preferred when its cost is within noise of
+  that minimum. The cost need not fall monotonically with horizon: model
+  error compounds over a longer look-ahead, and the solver is capped at
+  10 iterations per solve.
 
 ## Tuning approach
 
