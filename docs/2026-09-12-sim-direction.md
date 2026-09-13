@@ -69,13 +69,14 @@ Firmware:
   cycle. Recorded as a pre-flight item in PROJECT_STATUS.md.
 - `TAU_MOTOR` (30 ms) in `src/control/mpc.rs` is a pre-measurement guess at
   the closed rate-loop constant. Folded into the tuner search above.
-- `src/main.rs:191` calls the navigation loop 50 Hz; it runs at 100 Hz from
-  `MPC_PERIOD_US`.
 - PosKF drifts at rest without GPS: on the 2026-09-09 bench log
   (`docs/log_09-09-2026.log`) north position walked 1.2 m in 8 s and
   altitude wandered 0.2-0.6 m while the board warmed from 27 to 29.5 degC.
   Not investigated.
-- PROJECT_STATUS.md lists defmt on USART3; it is USART6.
+
+Fixed 2026-09-13: the `main.rs` comment calling the navigation loop 50 Hz
+(it runs at 100 Hz), and PROJECT_STATUS.md listing defmt on USART3 (it is
+USART6) and NMEA-only GPS (UBX is preferred).
 
 Pending hardware verification:
 - IST8310 hard-iron calibration, mounting orientation, and the handedness

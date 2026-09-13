@@ -188,7 +188,7 @@ static RAW_IMU: Signal<CriticalSectionRawMutex, RawImu> = Signal::new();
 /// Dedicated signal for the navigation task so it doesn't steal IMU_DATA from the fast inner loop.
 static IMU_DATA_FOR_NAV: Signal<CriticalSectionRawMutex, ImuData> = Signal::new();
 
-/// Command output from the 50 Hz navigation outer loop, read by the 8 kHz fast inner loop.
+/// Command output from the 100 Hz navigation outer loop, read by the 8 kHz fast inner loop.
 #[derive(Clone, Copy)]
 pub struct OuterLoopCommand {
     pub thrust: f32,

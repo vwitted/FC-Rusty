@@ -95,7 +95,7 @@ d`).
 
   IMU loss is the only mid-flight auto-disarm path: there's no safe
   recovery from losing attitude.
-- **Comms**: CRSF RC (6 channels), NMEA GPS, defmt over USART3.
+- **Comms**: CRSF RC (6 channels), GPS (UBX preferred, NMEA fallback), defmt over USART6.
 - **Control loop**: Asynchronous dual-loop architecture communicating via lock-free `Watch` channel:
   - **Outer Loop (100 Hz)**: `navigation_task` handles Attitude MPC, altitude hold, position hold, and RC processing.
   - **Inner Loop (8 kHz)**: `control_loop` executes the rate PID and DShot output, fully synchronized to the MEKF gyro predicts without arbitrary timers.
