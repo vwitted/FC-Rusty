@@ -51,6 +51,37 @@ specification; PROJECT_STATUS.md holds current state.
   error compounds over a longer look-ahead, and the solver is capped at
   10 iterations per solve.
 
+## Known defects
+
+Found during the 2026-09-12/13 sessions and not yet fixed. Each is either
+folded into the work above or needs its own fix; none should be dropped.
+
+Harness:
+- The legacy rate preset (200 Hz inner, 50 Hz outer) solves the MPC every
+  20 ms with a model discretised for 10 ms (`MPC_DT` is a constant). The
+  baseline's legacy resonance rows (104 failures) may be artefacts of the
+  mismatch. Resolved by the runtime-timestep MPC.
+- The legacy preset goes non-finite at 2.5 s under `sim_sweep --trace-inner
+  --legacy`. Not investigated; may share the cause above.
+
+Firmware:
+- The rate gains put the sim's rate loop into a saturated 41 Hz limit
+  cycle. Recorded as a pre-flight item in PROJECT_STATUS.md.
+- `TAU_MOTOR` (30 ms) in `src/control/mpc.rs` is a pre-measurement guess at
+  the closed rate-loop constant. Folded into the tuner search above.
+- `src/main.rs:191` calls the navigation loop 50 Hz; it runs at 100 Hz from
+  `MPC_PERIOD_US`.
+- PosKF drifts at rest without GPS: on the 2026-09-09 bench log
+  (`docs/log_09-09-2026.log`) north position walked 1.2 m in 8 s and
+  altitude wandered 0.2-0.6 m while the board warmed from 27 to 29.5 degC.
+  Not investigated.
+- PROJECT_STATUS.md lists defmt on USART3; it is USART6.
+
+Pending hardware verification:
+- IST8310 hard-iron calibration, mounting orientation, and the handedness
+  choice (Z flip, as PX4 and ArduPilot; Betaflight flips Y).
+- ESC re-arming between plant-capture runs.
+
 ## Tuning approach
 
 Defaults should be discovered per hardware rather than tuned to hold
