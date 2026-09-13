@@ -8,6 +8,10 @@
 .idea/
 .vscode/
 
+# Bench and flight logs from scripts/defmt-log.sh. Copy a log worth keeping
+# into docs/ deliberately.
+/logs/
+
 # OS metadata
 .DS_Store
 Thumbs.db

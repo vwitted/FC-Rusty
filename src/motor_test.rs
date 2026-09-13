@@ -32,6 +32,11 @@ pub struct MotorTestConfig {
     /// dump the run stops sending frames and never enters the
     /// constant-throttle loop.
     pub profile: bool,
+    /// Consecutive capture runs, from `PLANT_RUNS`: default 10, clamped to
+    /// 1..=MAX_RUNS. Runs after the first re-arm the ESCs with a counted-down
+    /// zero-throttle stream, because each dump leaves them disarmed. Ignored
+    /// unless `profile`.
+    pub runs: u8,
 }
 
 /// Hard safety ceiling on any motor's throttle. Raising it requires a
@@ -44,6 +49,10 @@ const DEFAULT_BIDIR: bool = true;
 const DEFAULT_LOOP_KHZ: u8 = 8;
 const MIN_LOOP_KHZ: u8 = 2;
 const MAX_LOOP_KHZ: u8 = 8;
+/// Capture runs when `PLANT_RUNS` is unset, and the ceiling. Ten runs is
+/// about two minutes of props-on operation.
+const DEFAULT_RUNS: u8 = 10;
+const MAX_RUNS: u8 = 50;
 
 /// Parse + clamp raw string inputs into a `MotorTestConfig`. Pure (no env
 /// IO) so it can be unit-tested with arbitrary inputs.
@@ -52,6 +61,7 @@ fn parse_config(
     bidir: Option<&str>,
     loop_khz: Option<&str>,
     profile: Option<&str>,
+    runs: Option<&str>,
 ) -> MotorTestConfig {
     let motor_pct = core::array::from_fn(|i| {
         motor[i]
@@ -71,11 +81,16 @@ fn parse_config(
     // Opt-in only. An unset PLANT_CAPTURE must never start a scripted run
     // that ramps the motors on its own.
     let profile = matches!(profile.map(|s| s.trim()), Some("1"));
+    let runs = runs
+        .and_then(|s| s.trim().parse::<u8>().ok())
+        .unwrap_or(DEFAULT_RUNS)
+        .clamp(1, MAX_RUNS);
     MotorTestConfig {
         motor_pct,
         bidir,
         loop_khz,
         profile,
+        runs,
     }
 }
 
@@ -134,6 +149,7 @@ const _: () = {
     assert!(env_u8_ok(option_env!("M4_PCT")), "M4_PCT must be an integer 0-255");
     assert!(env_bidir_ok(option_env!("BIDIR")), "BIDIR must be 0 or 1");
     assert!(env_u8_ok(option_env!("LOOP_KHZ")), "LOOP_KHZ must be an integer (kHz)");
+    assert!(env_u8_ok(option_env!("PLANT_RUNS")), "PLANT_RUNS must be an integer 1-50");
 };
 
 /// Read the build-time env values and resolve them into a clamped config.
@@ -149,6 +165,7 @@ pub fn resolve_config() -> MotorTestConfig {
         option_env!("BIDIR"),
         option_env!("LOOP_KHZ"),
         option_env!("PLANT_CAPTURE"),
+        option_env!("PLANT_RUNS"),
     )
 }
 
@@ -178,7 +195,8 @@ pub async fn run(p: embassy_stm32::Peripherals) -> ! {
         // the prop. So this run needs props ON, which makes it the more
         // dangerous of the two, and it must not read as the same thing.
         defmt::warn!(
-            "PLANT CAPTURE — PROPS ON, AIRCRAFT SECURED. All four motors, {=u32} ms profile to {=u8}% in 5s",
+            "PLANT CAPTURE — PROPS ON, AIRCRAFT SECURED. All four motors, {=u8} runs of a {=u32} ms profile to {=u8}%, first in 5s",
+            cfg.runs,
             crate::plant_capture::profile_ms(),
             crate::plant_capture::PROFILE.iter().fold(0u8, |m, h| if h.pct > m { h.pct } else { m }),
         );
@@ -236,7 +254,34 @@ pub async fn run(p: embassy_stm32::Peripherals) -> ! {
     }
 
     if cfg.profile {
-        run_profile(&mut dshot, &mut ticker, cfg).await;
+        // Seconds of counted-down zero throttle before each run after the
+        // first. The same 3 s stream arms the ESCs at boot.
+        const REARM_S: u32 = 3;
+        for run in 1..=cfg.runs {
+            if run > 1 {
+                // The dump holds the UART for several seconds with no DShot
+                // frames, so the ESCs lose signal and disarm. Re-arm with a
+                // zero-throttle stream, and count down loudly: between runs
+                // the aircraft is silent but not finished.
+                for s in (1..=REARM_S).rev() {
+                    defmt::warn!(
+                        "plant capture: run {=u8}/{=u8} starts in {=u32} s -- PROPS WILL SPIN",
+                        run,
+                        cfg.runs,
+                        s,
+                    );
+                    for _ in 0..(cfg.loop_khz as u32 * 1000) {
+                        if cfg.bidir {
+                            dshot.send_and_receive(stop).await;
+                        } else {
+                            dshot.send(stop).await;
+                        }
+                        ticker.next().await;
+                    }
+                }
+            }
+            run_profile(&mut dshot, &mut ticker, cfg, run).await;
+        }
         // A capture build must not continue into the constant-throttle loop
         // below: that loop drives every motor at `motor_pct` (5% when
         // unset), and this build runs with props on. On the 2026-09-12
@@ -245,7 +290,10 @@ pub async fn run(p: embassy_stm32::Peripherals) -> ! {
         // a nonzero first frame. No further frames are sent, so the ESCs
         // remain disarmed; re-arming requires the zero-throttle stream that
         // only a reboot produces.
-        defmt::warn!("plant capture: complete. DShot output stopped, ESCs disarmed. Disconnect the battery to end the run.");
+        defmt::warn!(
+            "plant capture: all {=u8} runs complete. DShot output stopped, ESCs disarmed. Disconnect the battery to end the session.",
+            cfg.runs,
+        );
         loop {
             Timer::after(Duration::from_secs(3600)).await;
         }
@@ -278,7 +326,7 @@ mod tests {
 
     #[test]
     fn defaults_when_all_unset() {
-        let c = parse_config([None; 4], None, None, None);
+        let c = parse_config([None; 4], None, None, None, None);
         assert_eq!(c.motor_pct, [5, 5, 5, 5]); // bare motor test spins gently
         assert!(c.bidir);
         assert_eq!(c.loop_khz, 8);
@@ -286,27 +334,27 @@ mod tests {
 
     #[test]
     fn explicit_zero_still_stops_motor() {
-        let c = parse_config([Some("0"), None, None, None], None, None, None);
+        let c = parse_config([Some("0"), None, None, None], None, None, None, None);
         assert_eq!(c.motor_pct[0], 0);
     }
 
     #[test]
     fn parses_each_motor_independently() {
-        let c = parse_config([Some("3"), None, Some("7"), None], None, None, None);
+        let c = parse_config([Some("3"), None, Some("7"), None], None, None, None, None);
         assert_eq!(c.motor_pct, [3, 5, 7, 5]);
     }
 
     #[test]
     fn clamps_motor_to_max_pct() {
-        let c = parse_config([Some("90"), Some("25"), Some("26"), Some("0")], None, None, None);
+        let c = parse_config([Some("90"), Some("25"), Some("26"), Some("0")], None, None, None, None);
         assert_eq!(c.motor_pct, [25, 25, 25, 0]);
     }
 
     #[test]
     fn bidir_explicit_zero_one_else_default() {
-        assert!(!parse_config([None; 4], Some("0"), None, None).bidir);
-        assert!(parse_config([None; 4], Some("1"), None, None).bidir);
-        assert!(parse_config([None; 4], Some("yes"), None, None).bidir); // garbage → default true
+        assert!(!parse_config([None; 4], Some("0"), None, None, None).bidir);
+        assert!(parse_config([None; 4], Some("1"), None, None, None).bidir);
+        assert!(parse_config([None; 4], Some("yes"), None, None, None).bidir); // garbage → default true
     }
 
     #[test]
@@ -316,16 +364,16 @@ mod tests {
         //
         // The "release" case is not hypothetical: PROFILE was the original
         // name and flash-motor-test.sh clobbered it with exactly that.
-        assert!(!parse_config([None; 4], None, None, None).profile);
-        assert!(parse_config([None; 4], None, None, Some("1")).profile);
+        assert!(!parse_config([None; 4], None, None, None, None).profile);
+        assert!(parse_config([None; 4], None, None, Some("1"), None).profile);
         for junk in ["0", "", "yes", "true", "2", " ", "release", "debug"] {
             assert!(
-                !parse_config([None; 4], None, None, Some(junk)).profile,
+                !parse_config([None; 4], None, None, Some(junk), None).profile,
                 "PLANT_CAPTURE={junk:?} must not enable the profile"
             );
         }
         // Whitespace around a real 1 is still a 1 -- shell quoting adds it.
-        assert!(parse_config([None; 4], None, None, Some(" 1 ")).profile);
+        assert!(parse_config([None; 4], None, None, Some(" 1 "), None).profile);
     }
 
     #[test]
@@ -360,10 +408,21 @@ mod tests {
 
     #[test]
     fn loop_khz_clamped_to_range() {
-        assert_eq!(parse_config([None; 4], None, Some("1"), None).loop_khz, 2);
-        assert_eq!(parse_config([None; 4], None, Some("9"), None).loop_khz, 8);
-        assert_eq!(parse_config([None; 4], None, Some("4"), None).loop_khz, 4);
-        assert_eq!(parse_config([None; 4], None, Some("x"), None).loop_khz, 8); // garbage → default
+        assert_eq!(parse_config([None; 4], None, Some("1"), None, None).loop_khz, 2);
+        assert_eq!(parse_config([None; 4], None, Some("9"), None, None).loop_khz, 8);
+        assert_eq!(parse_config([None; 4], None, Some("4"), None, None).loop_khz, 4);
+        assert_eq!(parse_config([None; 4], None, Some("x"), None, None).loop_khz, 8); // garbage → default
+    }
+
+    #[test]
+    fn plant_runs_default_and_clamp() {
+        let runs = |v: Option<&str>| parse_config([None; 4], None, None, Some("1"), v).runs;
+        assert_eq!(runs(None), 10);
+        assert_eq!(runs(Some("3")), 3);
+        assert_eq!(runs(Some(" 7 ")), 7);
+        assert_eq!(runs(Some("0")), 1); // at least one run
+        assert_eq!(runs(Some("200")), 50); // ceiling
+        assert_eq!(runs(Some("x")), 10); // garbage -> default
     }
 }
 
@@ -388,6 +447,7 @@ async fn run_profile(
     dshot: &mut crate::drivers::dshot_bitbang::DshotBitbang<'static>,
     ticker: &mut embassy_time::Ticker,
     cfg: MotorTestConfig,
+    run: u8,
 ) {
     use crate::drivers::dshot_bb_decode::BbTelemetry;
     use crate::drivers::dshot_frame::DshotFrame;
@@ -399,9 +459,12 @@ async fn run_profile(
     // an async fn's locals live in its future, which the executor holds
     // in a fixed-size arena.
     static mut BUF: Capture<N> = Capture::new();
-    // SAFETY: the motor-test build runs exactly one task and this is the
-    // only reference taken anywhere in it.
+    // SAFETY: the motor-test build runs exactly one task, and this is the
+    // only reference taken in it: once per call, and calls do not overlap.
     let cap: &mut Capture<N> = unsafe { &mut *(&raw mut BUF) };
+    // Reused across runs, so emptied in place rather than rebuilt; see
+    // Capture::clear.
+    cap.clear();
 
     let loop_hz = cfg.loop_khz as u32 * 1000;
     // Frames between captured samples. The DShot loop must keep running at
@@ -410,7 +473,9 @@ async fn run_profile(
     let decim = (loop_hz / plant_capture::SAMPLE_HZ).max(1);
 
     defmt::info!(
-        "plant capture: {=u32} ms profile, {=u32} Hz sampling, {=usize} sample buffer",
+        "plant capture: run {=u8}/{=u8}, {=u32} ms profile, {=u32} Hz sampling, {=usize} sample buffer",
+        run,
+        cfg.runs,
         plant_capture::profile_ms(),
         plant_capture::SAMPLE_HZ,
         N,
@@ -482,11 +547,16 @@ async fn run_profile(
         .filter(|s| s.period_us.iter().any(|&p| p != NO_TELEMETRY))
         .count();
     defmt::info!(
-        "plant capture done: {=usize} samples ({=usize} with telemetry), {=u32} dropped. Dumping.",
+        "plant capture: run {=u8}/{=u8} done: {=usize} samples ({=usize} with telemetry), {=u32} dropped. Dumping.",
+        run,
+        cfg.runs,
         n,
         with_telem,
         cap.dropped(),
     );
+    // Run marker. The fit tool also splits runs where the timestamp restarts
+    // at zero, so this line is informational.
+    defmt::info!("PLANT_RUN,{=u8},{=u8}", run, cfg.runs);
     defmt::info!("PLANT_HEADER,{=str}", crate::plant_log::CSV_HEADER);
 
     for s in cap.as_slice().iter() {

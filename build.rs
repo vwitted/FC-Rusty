@@ -42,6 +42,8 @@ fn emit_motor_test_env_deps() {
         // so `PROFILE=1 scripts/flash-motor-test.sh` reached cargo as
         // PROFILE=release and silently disabled the capture. Verified.
         "PLANT_CAPTURE",
+        // Number of consecutive capture runs; same reasoning as above.
+        "PLANT_RUNS",
     ] {
         println!("cargo:rerun-if-env-changed={var}");
     }

@@ -58,6 +58,16 @@ if ! lsusb | grep -q "0483:df11"; then
   exit 1
 fi
 
+# Optional defmt reader. With DEFMT_LOG=<subdir> set (plant-capture.sh sets
+# it), open a reader in a new terminal now -- after DFU is confirmed and
+# before the write -- so it is already listening when the board reboots
+# into the new firmware. A missing adapter stops the script here, before
+# anything is flashed. Logs go to logs/<subdir>/.
+DEFMT_LOG_FILE=""
+if [ -n "${DEFMT_LOG:-}" ]; then
+  DEFMT_LOG_FILE="$(scripts/defmt-log.sh --launch "${ELF}" "${DEFMT_LOG}")"
+fi
+
 STAMP="$(cat target/build-stamp.txt 2>/dev/null || echo unknown)"
 SHA="$(sha256sum "${BIN}" 2>/dev/null | cut -c1-16 || shasum -a 256 "${BIN}" | cut -c1-16)"
 
@@ -71,3 +81,8 @@ echo "    binary sha  : ${SHA}"
 echo
 echo "    The firmware logs 'DShot build: [<stamp>]' at init. If that does not"
 echo "    match the stamp above, the board is running older firmware."
+
+if [ -n "${DEFMT_LOG_FILE}" ]; then
+  echo
+  echo "    defmt log   : ${DEFMT_LOG_FILE}"
+fi

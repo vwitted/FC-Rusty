@@ -51,18 +51,33 @@ fn main() {
         eprintln!(
             "No PLANT sample lines found.\n\
              Expected lines like: PLANT,t_ms,cmd0..3,per0..3,gx,gy,gz\n\
-             Was the firmware built with PROFILE=1 and BIDIR=1?"
+             Was the firmware built with PLANT_CAPTURE=1 and BIDIR=1?"
         );
         std::process::exit(1);
     }
 
-    let span_ms = samples.last().unwrap().t_ms.saturating_sub(samples[0].t_ms);
+    // A log may hold several runs back to back (PLANT_RUNS). Each run's
+    // timestamps restart at zero, so a decrease marks a boundary. Steps are
+    // found and fitted within one run, then pooled.
+    let mut runs: Vec<&[PlantSample]> = Vec::new();
+    let mut start = 0usize;
+    for i in 1..samples.len() {
+        if samples[i].t_ms < samples[i - 1].t_ms {
+            runs.push(&samples[start..i]);
+            start = i;
+        }
+    }
+    runs.push(&samples[start..]);
+
+    let first = runs[0];
+    let span_ms = first.last().unwrap().t_ms.saturating_sub(first[0].t_ms);
     println!("=== plant capture ===");
     println!(
-        "{} samples over {} ms ({:.0} Hz), {} pole pairs assumed",
+        "{} samples in {} run(s), {} ms per run ({:.0} Hz), {} pole pairs assumed",
         samples.len(),
+        runs.len(),
         span_ms,
-        samples.len() as f32 / (span_ms as f32 * 1e-3).max(1e-6),
+        first.len() as f32 / (span_ms as f32 * 1e-3).max(1e-6),
         pole_pairs,
     );
 
@@ -90,33 +105,55 @@ fn main() {
     let mut per_motor_tau = [f32::NAN; 4];
 
     for m in 0..4 {
-        let mut buf = [Step { motor: m, start: 0, end: 0, cmd_from: 0.0, cmd_to: 0.0 }; 32];
-        let n = find_steps(&samples, m, MAX_WINDOW_MS, &mut buf);
-        let fits: Vec<StepFit> =
-            buf[..n].iter().filter_map(|&st| fit_step(&samples, st)).collect();
+        let mut n = 0usize;
+        let mut fits: Vec<StepFit> = Vec::new();
+        let mut run_tau_ms: Vec<f32> = Vec::new();
+        for run in &runs {
+            let mut buf = [Step { motor: m, start: 0, end: 0, cmd_from: 0.0, cmd_to: 0.0 }; 32];
+            let k = find_steps(run, m, MAX_WINDOW_MS, &mut buf);
+            n += k;
+            let run_fits: Vec<StepFit> =
+                buf[..k].iter().filter_map(|&st| fit_step(run, st)).collect();
+            run_tau_ms.push(
+                summarise(&run_fits, MAX_RESIDUAL).map_or(f32::NAN, |s| s.mean_s * 1e3),
+            );
+            fits.extend(run_fits);
+        }
 
         println!("--- M{} : {} steps, {} fitted ---", m + 1, n, fits.len());
         if fits.is_empty() {
             println!("  no usable steps\n");
             continue;
         }
-        println!(
-            "  {:>5} {:>5}  {:>9} {:>9}  {:>9} {:>9}  {:>8}",
-            "from", "to", "rpm_from", "rpm_to", "tau_thr", "tau_omega", "resid"
-        );
-        for f in &fits {
-            let flag = if f.residual_frac > MAX_RESIDUAL { " <-- rejected" } else { "" };
+        if runs.len() == 1 {
             println!(
-                "  {:>4.0}% {:>4.0}%  {:>9.0} {:>9.0}  {:>8.1}ms {:>8.1}ms  {:>7.3}{}",
-                f.cmd_from * 100.0,
-                f.cmd_to * 100.0,
-                f.erpm_from / pole_pairs,
-                f.erpm_to / pole_pairs,
-                f.tau_thrust_s * 1e3,
-                f.tau_omega_s * 1e3,
-                f.residual_frac,
-                flag,
+                "  {:>5} {:>5}  {:>9} {:>9}  {:>9} {:>9}  {:>8}",
+                "from", "to", "rpm_from", "rpm_to", "tau_thr", "tau_omega", "resid"
             );
+            for f in &fits {
+                let flag = if f.residual_frac > MAX_RESIDUAL { " <-- rejected" } else { "" };
+                println!(
+                    "  {:>4.0}% {:>4.0}%  {:>9.0} {:>9.0}  {:>8.1}ms {:>8.1}ms  {:>7.3}{}",
+                    f.cmd_from * 100.0,
+                    f.cmd_to * 100.0,
+                    f.erpm_from / pole_pairs,
+                    f.erpm_to / pole_pairs,
+                    f.tau_thrust_s * 1e3,
+                    f.tau_omega_s * 1e3,
+                    f.residual_frac,
+                    flag,
+                );
+            }
+        } else {
+            // With several runs the per-step table is eight rows per run per
+            // motor; the per-run constant shows repeatability more directly.
+            let shown: Vec<String> = run_tau_ms
+                .iter()
+                .map(|t| if t.is_finite() { format!("{:.1}", t) } else { "-".into() })
+                .collect();
+            let rejected = fits.iter().filter(|f| f.residual_frac > MAX_RESIDUAL).count();
+            println!("  motor_tau by run (ms): {}", shown.join(" "));
+            println!("  {} of {} fitted steps rejected on residual", rejected, fits.len());
         }
         // Report the three separately. tau_omega is the motor's actual
         // constant; the two thrust figures differ by construction and the

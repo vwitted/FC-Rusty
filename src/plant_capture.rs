@@ -166,6 +166,15 @@ impl<const N: usize> Capture<N> {
     pub fn dropped(&self) -> u32 {
         self.dropped
     }
+
+    /// Empty the buffer for another run without moving it. Rebuilding with
+    /// `Capture::new()` would construct the whole array as a temporary --
+    /// about 63 KB at the default capacity -- on the stack of the single
+    /// task the capture build runs.
+    pub fn clear(&mut self) {
+        self.len = 0;
+        self.dropped = 0;
+    }
 }
 
 #[cfg(test)]
@@ -261,6 +270,21 @@ mod tests {
         // And what it kept is the START of the run, where the first step
         // is -- not the end.
         assert_eq!(c.as_slice()[0].t_ms, 0);
+    }
+
+    #[test]
+    fn clear_empties_the_buffer_and_resets_overruns() {
+        let s = PlantSample { t_ms: 1, cmd: [0; 4], period_us: [0; 4], gyro_dps10: [0; 3] };
+        let mut c: Capture<2> = Capture::new();
+        c.push(s);
+        c.push(s);
+        c.push(s);
+        assert_eq!(c.dropped(), 1);
+        c.clear();
+        assert!(c.is_empty());
+        assert_eq!(c.dropped(), 0);
+        c.push(s);
+        assert_eq!(c.len(), 1);
     }
 
     #[test]

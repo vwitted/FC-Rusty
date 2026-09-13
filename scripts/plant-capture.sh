@@ -19,7 +19,11 @@
 # So this run spins four loaded props to 25% on a script, with no
 # operator in the loop once it starts. SECURE THE AIRCRAFT. The firmware
 # prints "PLANT CAPTURE — PROPS ON, AIRCRAFT SECURED" and counts down
-# five seconds before the first frame; if you see the motor-test wording
+# five seconds before the first frame. It then repeats the profile
+# PLANT_RUNS times (default 10), re-arming the ESCs and counting down three
+# seconds before each later run: between runs the aircraft is silent but
+# NOT finished. After the last run it stops sending DShot frames for good.
+# If you see the motor-test wording
 # instead ("REMOVE PROPS"), the capture is NOT enabled and something in
 # this script has gone wrong -- stop and check rather than proceeding.
 # ---------------------------------------------------------------------
@@ -44,5 +48,16 @@ echo
 # and says so, but that is a wasted props-on run.
 export PLANT_CAPTURE=1
 export BIDIR=1
+
+# Consecutive runs, pooled by scripts/plant-fit.sh. Build-time, like the
+# flags above; the firmware also defaults to 10.
+export PLANT_RUNS="${PLANT_RUNS:-10}"
+
+# Open a defmt reader in a new terminal once DFU is confirmed, logging to
+# logs/plant_capture/. DEFMT_LOG= (set but empty) skips it.
+export DEFMT_LOG="${DEFMT_LOG-plant_capture}"
+
+echo "    runs: ${PLANT_RUNS}    defmt log: ${DEFMT_LOG:-off}"
+echo
 
 exec scripts/flash-motor-test.sh "$@"
