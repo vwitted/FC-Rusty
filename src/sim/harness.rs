@@ -10,7 +10,7 @@
 use crate::attitude_mekf::{AttitudeMekf, MekfParams};
 use crate::control::altitude::{AltitudeController, AltitudeGains};
 use crate::control::mixer::{ControlDemand, QUAD_X};
-use crate::control::mpc::AttitudeMpc;
+use crate::control::mpc::{AttitudeMpc, MpcModel};
 use crate::control::modes::{
     nav_step, FlightMode, NavInputs, NavState, PosEstimate,
 };
@@ -28,7 +28,8 @@ const DEG2RAD: f32 = PI / 180.0;
 const RAD2DEG: f32 = 180.0 / PI;
 
 /// Inner (rate/IMU) and outer (MPC/altitude) loop rates.
-#[derive(Debug, Clone, Copy)]
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rates {
     pub dt: f32,
     pub outer_div: usize,
@@ -43,6 +44,21 @@ impl Rates {
 
     pub fn inner_hz(&self) -> f32 { 1.0 / self.dt }
     pub fn outer_hz(&self) -> f32 { 1.0 / (self.dt * self.outer_div as f32) }
+
+    /// The MPC model for this preset, discretised for its outer period.
+    ///
+    /// The firmware preset returns `MpcModel::FIRMWARE` exactly. Its period
+    /// computed as `dt * outer_div` in f32 is not bit-equal to `MPC_DT`, and
+    /// on 2026-09-13 that last-bit difference moved 19 sweep rows and one
+    /// failure count, so the firmware case must not go through the
+    /// arithmetic. Other presets get a model for their own period.
+    pub fn mpc_model(&self) -> MpcModel {
+        if *self == Rates::FIRMWARE {
+            MpcModel::FIRMWARE
+        } else {
+            MpcModel { dt: self.dt * self.outer_div as f32, ..MpcModel::FIRMWARE }
+        }
+    }
 }
 
 /// Why a run ended early. Not interchangeable: a sink with attitude level
@@ -577,7 +593,9 @@ pub fn run_case(
     let mut alt_ctrl = AltitudeController::new(tun.alt, hover_throttle);
     let mut current_thrust = hover_throttle;
 
-    let mut mpc = AttitudeMpc::new();
+    // Discretise the MPC for the period it is actually solved at. The
+    // legacy preset previously solved a 10 ms model every 20 ms.
+    let mut mpc: AttitudeMpc = AttitudeMpc::with_model(r.mpc_model());
     if tun.mpc_cmd_bound_dps > 0.0 {
         mpc.set_cmd_bound(tun.mpc_cmd_bound_dps * DEG2RAD);
     }
@@ -1016,5 +1034,19 @@ pub fn run_case(
         recovered_at,
         alt_min,
         failed_at: None,
+    }
+}
+
+#[cfg(test)]
+mod mpc_timestep_tests {
+    use super::*;
+
+    /// The firmware preset gets the firmware's MPC model exactly; other
+    /// presets get one discretised for their own outer period.
+    #[test]
+    fn rate_presets_get_matching_mpc_models() {
+        assert_eq!(Rates::FIRMWARE.mpc_model(), MpcModel::FIRMWARE);
+        let legacy = Rates::LEGACY.mpc_model();
+        assert!((legacy.dt - 0.02).abs() < 1e-7, "legacy MPC dt {}", legacy.dt);
     }
 }

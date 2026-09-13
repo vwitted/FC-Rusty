@@ -17,6 +17,11 @@
 #[cfg(test)]
 pub mod motor_test;
 
+// MPC solve-time bench. As with motor_test, the firmware run() is compiled
+// into the binary under its feature; here only the pure parts are tested.
+#[cfg(test)]
+pub mod mpc_bench;
+
 // Versioned flash config store. `record` is pure (host-tested); the
 // firmware flash wrapper lives in main.rs's module tree (needs embassy).
 pub mod persist {

@@ -38,7 +38,7 @@
 // Under `motor-test` the entire flight stack is cfg'd out (the flight `main`
 // is gated off), so its tasks, helpers, and imports are intentionally unused.
 // Silence that noise for the bench build only; the flight build is unaffected.
-#![cfg_attr(feature = "motor-test", allow(unused))]
+#![cfg_attr(any(feature = "motor-test", feature = "mpc-bench"), allow(unused))]
 
 use embassy_executor::Spawner;
 use embassy_stm32::time::Hertz;
@@ -93,6 +93,13 @@ mod rc_task;
 
 #[cfg(feature = "motor-test")]
 mod motor_test;
+
+// Solve-time bench for the MPC at a menu of horizons. It has its own entry
+// point, as motor-test does, so the two cannot be combined.
+#[cfg(feature = "mpc-bench")]
+mod mpc_bench;
+#[cfg(all(feature = "motor-test", feature = "mpc-bench"))]
+compile_error!("motor-test and mpc-bench each provide main(); enable one");
 
 // Plant characterisation. The record format and the profile are pure and
 // host-tested (they are in lib.rs unconditionally, which is where their
@@ -390,7 +397,26 @@ async fn main(_spawner: Spawner) {
     motor_test::run(p).await;
 }
 
-#[cfg(not(feature = "motor-test"))]
+/// MPC solve-time bench entry point: times the solver at a menu of horizons
+/// and halts. No DShot, no sensors, no flight stack.
+#[cfg(feature = "mpc-bench")]
+#[embassy_executor::main]
+async fn main(_spawner: Spawner) {
+    let _p = embassy_stm32::init(board_config());
+
+    // The same core configuration as the flight entry, so the timings
+    // represent flight: D-cache off, DWT cycle counter on.
+    let mut core = cortex_m::Peripherals::take().unwrap();
+    core.SCB.disable_dcache(&mut core.CPUID);
+    core.DCB.enable_trace();
+    core.DWT.enable_cycle_counter();
+
+    logger::init_usart6();
+
+    mpc_bench::run(CORE_HZ).await;
+}
+
+#[cfg(not(any(feature = "motor-test", feature = "mpc-bench")))]
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(board_config());

@@ -46,3 +46,20 @@ Flashing needs `dfu-util` and `lsusb`, so it is a Debian job; only
 `plant-fit` has a `.cmd` twin.
 
 ---
+
+## MPC solve-time bench
+
+```
+scripts/mpc-bench.sh                  # build + flash; no motors driven
+```
+
+Times `AttitudeMpc` at prediction horizons 4 to 30 with the DWT cycle
+counter, using the flight entry's core configuration, and logs one line per
+horizon:
+
+    MPC_BENCH,ph,ch,construct_us,solve_min_us,solve_mean_us,solve_max_us,max_iters,unconverged,solves
+
+A horizon is usable at a given MPC period only if `solve_max_us` fits inside
+it with headroom for the rest of the navigation task. The bench runs with
+nothing else active, so flight solves will be slower. Timings read zero in
+Renode, which does not model the cycle counter.

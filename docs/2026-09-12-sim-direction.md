@@ -30,6 +30,11 @@ specification; PROJECT_STATUS.md holds current state.
 5. Validate against the first blackbox flight by comparing the sim's
    predicted response with the measured one.
 
+Progress 2026-09-13: `AttitudeMpc` takes its timestep and rate-lag constant
+at runtime (`MpcModel`) and is generic over its horizons; the harness builds
+it for each rate preset. `scripts/mpc-bench.sh` times the solver on the
+board at prediction horizons 4 to 30. The tuner genes are not yet added.
+
 ## Decisions
 
 - 2026-09-13: the MPC horizon is a tuner variable, not held at a fixed
@@ -56,13 +61,17 @@ specification; PROJECT_STATUS.md holds current state.
 Found during the 2026-09-12/13 sessions and not yet fixed. Each is either
 folded into the work above or needs its own fix; none should be dropped.
 
-Harness:
-- The legacy rate preset (200 Hz inner, 50 Hz outer) solves the MPC every
-  20 ms with a model discretised for 10 ms (`MPC_DT` is a constant). The
-  baseline's legacy resonance rows (104 failures) may be artefacts of the
-  mismatch. Resolved by the runtime-timestep MPC.
-- The legacy preset goes non-finite at 2.5 s under `sim_sweep --trace-inner
-  --legacy`. Not investigated; may share the cause above.
+Harness and filters:
+- The gyro low-pass filter accepts a cutoff at or above Nyquist.
+  `new_lowpass_butterworth` in `src/imu_filter.rs` prewarps with
+  `tan(pi * fc / fs)`, which turns negative past fs/2, and has no guard.
+  The legacy preset samples at 200 Hz with the firmware's 150 Hz cutoff,
+  so every legacy row went non-finite (104 of 104 failures). On the
+  undegraded legacy trace: non-finite at 2.5 s with the default cutoff; a
+  crash at the 5 s drop with a 40 or 90 Hz cutoff; flies with the filter
+  off. It must be guarded before loop rate becomes a tuner gene, or the
+  tuner will generate invalid filters. The firmware's own 150 Hz at 8 kHz
+  is unaffected.
 
 Firmware:
 - The rate gains put the sim's rate loop into a saturated 41 Hz limit
@@ -76,7 +85,11 @@ Firmware:
 
 Fixed 2026-09-13: the `main.rs` comment calling the navigation loop 50 Hz
 (it runs at 100 Hz), and PROJECT_STATUS.md listing defmt on USART3 (it is
-USART6) and NMEA-only GPS (UBX is preferred).
+USART6) and NMEA-only GPS (UBX is preferred). Also the legacy preset
+solving a 10 ms MPC model every 20 ms: the harness now discretises the MPC
+for each preset's own period and gives the firmware preset the firmware
+model exactly. That was not the cause of the legacy failures; the filter
+entry above is.
 
 Pending hardware verification:
 - IST8310 hard-iron calibration, mounting orientation, and the handedness

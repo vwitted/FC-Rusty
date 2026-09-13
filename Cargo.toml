@@ -65,6 +65,11 @@ firmware = [
 # keeps `firmware` on. No extra deps of its own.
 motor-test = []
 
+# MPC solve-time bench: times AttitudeMpc at a menu of horizons with the DWT
+# cycle counter, logs a table over defmt, and halts. Never initialises DShot,
+# so it spins no motors. Adds to the default set, like motor-test.
+mpc-bench = []
+
 # Per-frame bidirectional-DShot RX instrumentation: run lengths, edge
 # positions and transition counts for every reply, dumped over defmt.
 #

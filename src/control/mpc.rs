@@ -63,10 +63,30 @@ pub const MPC_DT: f32 = 0.01;
 const TAU_MOTOR: f32 = 0.030;
 const RATE_ALPHA_MARGIN: f32 = 0.035;
 
-/// First-order rate-lag coefficient α for the current model timestep.
-/// Derived from `MPC_DT` so it tracks any change to the loop rate.
-fn rate_alpha() -> f32 {
-    libm::expf(-MPC_DT / TAU_MOTOR) + RATE_ALPHA_MARGIN
+/// The MPC's internal model: the step it is discretised for, and the
+/// closed rate-loop time constant it assumes.
+///
+/// The firmware uses `MpcModel::FIRMWARE`, fixed at compile time and tied
+/// to `MPC_PERIOD_US`. The sim builds its own so that the model always
+/// matches the period the harness actually solves at, and so a tuner can
+/// vary both.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MpcModel {
+    /// Model timestep, seconds. Must equal the period `solve` is called at.
+    pub dt: f32,
+    /// Closed rate-loop time constant, seconds: how quickly the inner PID
+    /// brings the body rate to the commanded value.
+    pub tau_rate_s: f32,
+}
+
+impl MpcModel {
+    /// What the firmware flies: 100 Hz and 30 ms.
+    pub const FIRMWARE: MpcModel = MpcModel { dt: MPC_DT, tau_rate_s: TAU_MOTOR };
+
+    /// First-order rate-lag coefficient: exp(-dt / tau) plus the margin.
+    pub fn rate_alpha(&self) -> f32 {
+        libm::expf(-self.dt / self.tau_rate_s) + RATE_ALPHA_MARGIN
+    }
 }
 
 // ---- Constraint bounds ----
@@ -120,9 +140,9 @@ const MAX_CMD_RAD: f32 = 40.0 * PI / 180.0;     // ±40°/s
 
 // ---- Type aliases ----
 type MpcPolicy = FixedPolicy<f32, NX, NU>;
-type MpcSolver = Solver<f32, MpcPolicy, NX, NU, HX, HU>;
-type XConstraint = Constraint<f32, Fixed<project::Box<f32, NX>>, NX, HX>;
-type UConstraint = Constraint<f32, Fixed<project::Box<f32, NU>>, NU, HU>;
+type MpcSolver<const PH: usize, const CH: usize> = Solver<f32, MpcPolicy, NX, NU, PH, CH>;
+type XConstraint<const PH: usize> = Constraint<f32, Fixed<project::Box<f32, NX>>, NX, PH>;
+type UConstraint<const CH: usize> = Constraint<f32, Fixed<project::Box<f32, NU>>, NU, CH>;
 
 /// Result of one MPC solve step.
 pub struct MpcOutput {
@@ -139,11 +159,16 @@ pub struct MpcOutput {
 /// Wraps a tinympc-rs solver with a 6-state attitude model.
 /// Constraints and dual variables are persisted between solves
 /// for warm-starting.
-pub struct AttitudeMpc {
-    solver: MpcSolver,
-    x_ref: SMatrix<f32, NX, HX>,
-    x_con: XConstraint,
-    u_con: UConstraint,
+///
+/// Generic over the prediction horizon `PH` and control horizon `CH`,
+/// defaulting to the firmware's `HX` and `HU`. The solver sizes its buffers
+/// from them at compile time, so one build cannot vary them; the sim and
+/// the solve-time bench instantiate several. `CH` must equal `PH - 1`.
+pub struct AttitudeMpc<const PH: usize = HX, const CH: usize = HU> {
+    solver: MpcSolver<PH, CH>,
+    x_ref: SMatrix<f32, NX, PH>,
+    x_con: XConstraint<PH>,
+    u_con: UConstraint<CH>,
     /// Output clamp, rad/s. Defaults to MAX_CMD_RAD; settable so the
     /// harness can sweep it, since the right value depends on the
     /// ESTIMATOR's bandwidth as much as the inner PID's linear range.
@@ -151,25 +176,43 @@ pub struct AttitudeMpc {
 }
 
 impl AttitudeMpc {
-    /// Create a new MPC attitude controller with default weights.
+    /// Create the firmware's MPC: default horizons and `MpcModel::FIRMWARE`.
     ///
     /// # Panics
     ///
     /// If the Riccati solve fails (should not happen with valid parameters).
     pub fn new() -> Self {
+        Self::with_model(MpcModel::FIRMWARE)
+    }
+}
+
+impl<const PH: usize, const CH: usize> AttitudeMpc<PH, CH> {
+    /// Rejects, at compile time, a control horizon that is not one step
+    /// shorter than the prediction horizon.
+    const HORIZONS_VALID: () = assert!(PH >= 2 && CH + 1 == PH, "AttitudeMpc needs CH == PH - 1");
+
+    /// Create an MPC with the given model and this instantiation's horizons.
+    ///
+    /// # Panics
+    ///
+    /// If the Riccati solve fails (should not happen with valid parameters).
+    pub fn with_model(model: MpcModel) -> Self {
+        let () = Self::HORIZONS_VALID;
+        let dt = model.dt;
+
         // ---- System matrices ----
         // angle[k+1] = angle[k] + dt * rate[k]
         // rate[k+1]  = α * rate[k] + (1-α) * u[k]
         //
         // The first-order lag models the PID's finite bandwidth:
         // rates don't jump instantly to the commanded value.
-        let alpha = rate_alpha();
+        let alpha = model.rate_alpha();
         let beta = 1.0 - alpha;
 
         let a: SMatrix<f32, NX, NX> = SMatrix::from_row_slice(&[
-            1.0, 0.0, 0.0, MPC_DT, 0.0,    0.0,
-            0.0, 1.0, 0.0, 0.0,    MPC_DT,  0.0,
-            0.0, 0.0, 1.0, 0.0,    0.0,     MPC_DT,
+            1.0, 0.0, 0.0, dt,     0.0,    0.0,
+            0.0, 1.0, 0.0, 0.0,    dt,     0.0,
+            0.0, 0.0, 1.0, 0.0,    0.0,    dt,
             0.0, 0.0, 0.0, alpha,  0.0,     0.0,
             0.0, 0.0, 0.0, 0.0,    alpha,   0.0,
             0.0, 0.0, 0.0, 0.0,    0.0,     alpha,
@@ -223,7 +266,7 @@ impl AttitudeMpc {
         let policy = FixedPolicy::new(rho, riccati_iters, &a, &b, &q, &r, &s)
             .expect("MPC policy computation failed — check A, B, Q, R");
 
-        let mut solver = MpcSolver::new(a, b, policy);
+        let mut solver = MpcSolver::<PH, CH>::new(a, b, policy);
         // Cap ADMM iterations so the solve fits inside the 10 ms / 100 Hz
         // navigation budget (the H743's 480 MHz Cortex-M7 with a
         // double-precision FPU has ample headroom, but bounding the
@@ -274,7 +317,7 @@ impl AttitudeMpc {
             angles_rad[0], angles_rad[1], angles_rad[2],
             rates_rad[0], rates_rad[1], rates_rad[2],
         ]);
-        for i in 0..HX {
+        for i in 0..PH {
             self.x_ref.set_column(i, &ref_state);
         }
     }
@@ -383,7 +426,7 @@ mod tests {
     #[test]
     fn rate_alpha_consistent_with_timestep() {
         let exact = libm::expf(-MPC_DT / TAU_MOTOR);
-        let alpha = rate_alpha();
+        let alpha = MpcModel::FIRMWARE.rate_alpha();
         assert!(
             alpha >= exact - 1.0e-3 && alpha <= exact + 0.06,
             "rate_alpha() {} inconsistent with exp(-MPC_DT/TAU_MOTOR) = {} \
@@ -474,6 +517,49 @@ mod tests {
             let out = mpc.solve([err * deg, 0.0, 0.0], [0.0, 0.0, 0.0]);
             assert!(out.converged, "{err} deg should converge");
             assert!(out.iterations <= 8, "{err} deg used {} iters", out.iterations);
+        }
+    }
+
+    /// `new()` is exactly `with_model(MpcModel::FIRMWARE)`: the firmware's
+    /// behaviour must not move when the sim gains a configurable model.
+    #[test]
+    fn new_is_the_firmware_model() {
+        let deg = core::f32::consts::PI / 180.0;
+        let mut a = AttitudeMpc::new();
+        let mut b: AttitudeMpc = AttitudeMpc::with_model(MpcModel::FIRMWARE);
+        a.set_reference([0.0; 3], [0.0; 3]);
+        b.set_reference([0.0; 3], [0.0; 3]);
+        for err in [1.0f32, 20.0, 120.0] {
+            let oa = a.solve([err * deg, -err * deg, 0.3], [0.1, 0.0, -0.2]);
+            let ob = b.solve([err * deg, -err * deg, 0.3], [0.1, 0.0, -0.2]);
+            assert_eq!(oa.rate_setpoints_rads, ob.rate_setpoints_rads);
+            assert_eq!(oa.iterations, ob.iterations);
+        }
+    }
+
+    /// A longer model step carries less lag per step: the coefficient falls
+    /// as dt rises, following exp(-dt / tau).
+    #[test]
+    fn rate_alpha_follows_the_model_timestep() {
+        let legacy = MpcModel { dt: 0.02, ..MpcModel::FIRMWARE };
+        let exact = libm::expf(-0.02 / TAU_MOTOR) + RATE_ALPHA_MARGIN;
+        assert!((legacy.rate_alpha() - exact).abs() < 1e-6);
+        assert!(legacy.rate_alpha() < MpcModel::FIRMWARE.rate_alpha());
+    }
+
+    /// Other horizons build, solve and respect the command bound, and a roll
+    /// error is corrected in the same direction at every horizon.
+    #[test]
+    fn other_horizons_solve_consistently() {
+        fn roll_cmd<const PH: usize, const CH: usize>(err: f32) -> f32 {
+            let mut m = AttitudeMpc::<PH, CH>::with_model(MpcModel::FIRMWARE);
+            m.set_reference([0.0; 3], [0.0; 3]);
+            m.solve([err, 0.0, 0.0], [0.0; 3]).rate_setpoints_rads[0]
+        }
+        let err = 5.0 * core::f32::consts::PI / 180.0;
+        for u in [roll_cmd::<4, 3>(err), roll_cmd::<10, 9>(err), roll_cmd::<30, 29>(err)] {
+            assert!(u < 0.0, "a positive roll error must command a negative roll rate, got {u}");
+            assert!(u.abs() <= MAX_CMD_RAD + 1e-6);
         }
     }
 }
