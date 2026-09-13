@@ -30,6 +30,17 @@ specification; PROJECT_STATUS.md holds current state.
 5. Validate against the first blackbox flight by comparing the sim's
    predicted response with the measured one.
 
+## Decisions
+
+- 2026-09-13: the MPC horizon is a tuner variable, not held at a fixed
+  look-ahead time. The horizon lengths are const-generic parameters of the
+  vendored solver (`Solver<f32, MpcPolicy, NX, NU, HX, HU>` in
+  `src/control/mpc.rs`), so one build cannot vary them. The sim will
+  instantiate a small set of horizons and let the tuner choose among them;
+  the firmware keeps one. The MPC's rate-response constant (`TAU_MOTOR`,
+  30 ms) models the closed rate loop, so it depends on the rate gains and
+  belongs in the same search.
+
 ## Tuning approach
 
 Defaults should be discovered per hardware rather than tuned to hold
