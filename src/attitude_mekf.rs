@@ -147,6 +147,33 @@ impl AttitudeMekf {
         self.hard_iron = Vector3::new(offset[0], offset[1], offset[2]);
     }
 
+    /// The hard-iron offset currently subtracted from every reading, uT.
+    pub fn hard_iron(&self) -> [f32; 3] {
+        [self.hard_iron[0], self.hard_iron[1], self.hard_iron[2]]
+    }
+
+    /// Tilt-compensated magnetic heading, radians, from a raw reading. The
+    /// hard-iron offset is subtracted, the field is levelled with the
+    /// current roll and pitch, and the heading is read from its horizontal
+    /// part. Magnetic, not true: no declination is added. This is the
+    /// computation `anchor_heading` anchors to. None for a zero reading.
+    pub fn mag_heading_rad(&self, mag_body: [f32; 3]) -> Option<f32> {
+        let m = Vector3::new(
+            mag_body[0] - self.hard_iron[0],
+            mag_body[1] - self.hard_iron[1],
+            mag_body[2] - self.hard_iron[2],
+        );
+        if m.norm() < 1e-6 {
+            return None;
+        }
+        let e = quat_to_euler(&self.q);
+        // Rotate the corrected body field into a yaw-zeroed nav frame.
+        let q0 = euler_to_quat(e[0], e[1], 0.0);
+        let m0 = r_bn_mul(&q0, &m);
+        // Sign matches NED and quat_to_euler's yaw.
+        Some(-libm::atan2f(m0[1], m0[0]))
+    }
+
     /// Seed the quaternion from a stationary accel reading — level board
     /// assumption, yaw set to zero (accel can't observe yaw, so the filter
     /// will converge on whatever the initial drift-free heading happens
@@ -350,21 +377,16 @@ impl AttitudeMekf {
     /// hard-iron offset is applied internally. Returns false on a
     /// zero-magnitude reading.
     pub fn anchor_heading(&mut self, mag_body: [f32; 3], declination_rad: f32) -> bool {
+        let Some(psi_mag) = self.mag_heading_rad(mag_body) else {
+            return false;
+        };
         let m = Vector3::new(
             mag_body[0] - self.hard_iron[0],
             mag_body[1] - self.hard_iron[1],
             mag_body[2] - self.hard_iron[2],
         );
-        if m.norm() < 1e-6 {
-            return false;
-        }
         let e = quat_to_euler(&self.q);
         let (roll, pitch) = (e[0], e[1]);
-        // Rotate the corrected body field into a yaw-zeroed nav frame.
-        let q0 = euler_to_quat(roll, pitch, 0.0);
-        let m0 = r_bn_mul(&q0, &m);
-        // Magnetic heading (sign matches NED + quat_to_euler yaw).
-        let psi_mag = -libm::atan2f(m0[1], m0[0]);
         let psi_true = psi_mag + declination_rad;
         // Rebuild q at the true heading, reseed the reference.
         self.q = euler_to_quat(roll, pitch, psi_true);
@@ -647,6 +669,44 @@ fn quat_to_euler(q: &[f32; 4]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Level, with the nose at heading psi, a north-and-down field reads as
+    /// psi, with the hard-iron offset removed first.
+    #[test]
+    fn mag_heading_reads_the_nose_direction_when_level() {
+        let mut m = AttitudeMekf::new(MekfParams::default());
+        let off = [70.0, -10.0, -35.0];
+        m.set_hard_iron(off);
+        for deg in [0.0f32, 45.0, 90.0, 135.0, -135.0, -90.0] {
+            let psi = deg.to_radians();
+            // The field as seen by a level body yawed to psi.
+            let b = [19.0 * libm::cosf(psi), -19.0 * libm::sinf(psi), 45.0];
+            let raw = [b[0] + off[0], b[1] + off[1], b[2] + off[2]];
+            let h = m.mag_heading_rad(raw).unwrap();
+            let err = libm::atan2f(libm::sinf(h - psi), libm::cosf(h - psi));
+            assert!(err.abs() < 1e-3, "heading {deg} deg read as {} deg", h.to_degrees());
+        }
+    }
+
+    /// Tilted, the heading is compensated: the same yaw reads the same
+    /// heading at 20 degrees of roll and 10 of pitch.
+    #[test]
+    fn mag_heading_is_tilt_compensated() {
+        let mut m = AttitudeMekf::new(MekfParams::default());
+        let (roll, pitch, psi) = (20f32.to_radians(), 10f32.to_radians(), 60f32.to_radians());
+        m.q = euler_to_quat(roll, pitch, psi);
+        let nav = Vector3::new(19.0, 0.0, 45.0);
+        let body = r_nb_mul(&m.q, &nav);
+        let h = m.mag_heading_rad([body[0], body[1], body[2]]).unwrap();
+        let err = libm::atan2f(libm::sinf(h - psi), libm::cosf(h - psi));
+        assert!(err.abs() < 1e-3, "read {} deg", h.to_degrees());
+    }
+
+    #[test]
+    fn mag_heading_rejects_a_zero_reading() {
+        let m = AttitudeMekf::new(MekfParams::default());
+        assert!(m.mag_heading_rad([0.0; 3]).is_none());
+    }
 
     fn approx(a: f32, b: f32, tol: f32) -> bool {
         libm::fabsf(a - b) < tol

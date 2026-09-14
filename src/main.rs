@@ -703,6 +703,13 @@ async fn blink_task(mut led: embassy_stm32::gpio::Output<'static>) {
 }
 
 // ---- Persist Task ----
+/// Best guess for the SE100 V2's IST8310: the chip is on the underside of
+/// the module's board, so it is upside down relative to the unit. Roll180
+/// and Pitch180 are both upside down and differ by 180 degrees of heading;
+/// neither is verified. Confirm with a level heading test before trusting
+/// heading, and correct it here.
+const IST8310_SE100_ORIENTATION: MagOrientation = MagOrientation::Roll180;
+
 /// Whichever magnetometer is actually fitted.
 ///
 /// Four are supported and they are not alternatives in the "pick one in
@@ -803,8 +810,8 @@ impl Compass {
     /// not, so the QMC's write-readback presence test runs first and the
     /// IST8310's ID read second.
     ///
-    /// ORIENTATION IS UNVERIFIED FOR THE SE100. Identity is a placeholder
-    /// for every part: this firmware has never flown, and the mounting of
+    /// ORIENTATION IS UNVERIFIED FOR THE SE100. The IST8310 uses a best
+    /// guess (IST8310_SE100_ORIENTATION), the others Identity: this firmware has never flown, and the mounting of
     /// the compass inside the SE100 relative to the airframe has not been
     /// checked on the bench. A wrong Orientation here does not degrade
     /// yaw, it inverts or mirrors it. Confirm against the magnitude and
@@ -865,7 +872,7 @@ impl Compass {
                 if !IST8310_ADDRS.contains(&addr) {
                     continue;
                 }
-                match Ist8310::init(i2c, addr, MagOrientation::Identity).await {
+                match Ist8310::init(i2c, addr, IST8310_SE100_ORIENTATION).await {
                     Ok(d) => {
                         defmt::info!(
                             "Magnetometer: IST8310 online, single-shot polled @ 125 Hz (I2C 0x{=u8:02x}, SE100 V2)",
@@ -1402,6 +1409,7 @@ async fn mekf_task() {
     let mut gps_accel_ned = [0.0f32; 2];
     let mut anchor_pending = false;
     let mut last_cal_log = Instant::now();
+    let mut last_mag_log = Instant::now();
     let cal_led_tx = CAL_LED.sender();
 
     loop {
@@ -1520,6 +1528,31 @@ async fn mekf_task() {
         if let Some(mag) = MAG_DATA.try_take() {
             let ut = mag.ut();
             last_mag_ut = ut;
+            // Bench instrumentation, once a second: the field with the
+            // hard-iron offset removed, and the headings derived from it.
+            // The baro task's line is the raw reading; this is what the
+            // estimator uses. Skipped while calibrating, when the offset is
+            // still being fitted.
+            if !cal_active && last_mag_log.elapsed().as_millis() >= 1000 {
+                last_mag_log = Instant::now();
+                let off = mekf.hard_iron();
+                let c = [ut[0] - off[0], ut[1] - off[1], ut[2] - off[2]];
+                let norm = libm::sqrtf(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+                let wrap = |d: f32| if d < 0.0 { d + 360.0 } else { d };
+                // NED heading convention, as AttitudeMekf::mag_heading_rad.
+                let level = wrap(-libm::atan2f(c[1], c[0]) * RAD2DEG);
+                let tilt = mekf.mag_heading_rad(ut).map_or(f32::NAN, |h| wrap(h * RAD2DEG));
+                defmt::info!(
+                    "Mag corrected |B|={=f32} uT body [{=f32}, {=f32}, {=f32}] uT; magnetic heading level {=f32} deg, tilt-compensated {=f32} deg; MEKF yaw {=f32} deg",
+                    norm,
+                    c[0],
+                    c[1],
+                    c[2],
+                    level,
+                    tilt,
+                    wrap(mekf.euler()[2] * RAD2DEG),
+                );
+            }
             if cal_active {
                 calibrator.feed(ut);
                 if last_cal_log.elapsed().as_millis() >= 500 {
@@ -2393,19 +2426,22 @@ async fn baro_task(
                         );
                     }
                 }
-                // Bring-up instrumentation: the field itself, once a
-                // second. Init prints it once, which is not enough to
-                // move the module around and watch |B| settle towards
-                // Earth's ~50 uT, or to flip it and watch Z change sign
-                // -- the two tests that decide scale and handedness.
+                // Bring-up instrumentation: the RAW field, once a second,
+                // before the hard-iron offset is removed. mekf_task logs the
+                // corrected field and the heading the estimator uses; this
+                // line shows what the sensor delivers, for checking scale and
+                // mounting. Its heading is uncorrected and, with a large
+                // offset, barely moves under yaw.
                 if let Some(m) = last_mag {
                     let v = m.ut();
-                    let mut hdg: f32 = libm::atan2f(v[1], v[0]) * RAD2DEG;
-                    if hdg < 0.00 {
+                    // NED convention, as AttitudeMekf::mag_heading_rad:
+                    // heading = -atan2(y, x), in 0..360.
+                    let mut hdg: f32 = -libm::atan2f(v[1], v[0]) * RAD2DEG;
+                    if hdg < 0.0 {
                         hdg += 360.0;
-	                }
+                    }
                     defmt::info!(
-                        "Mag |B|={=f32} uT body [{=f32}, {=f32}, {=f32}] uT - Hdg: {=f32}",
+                        "Mag raw, no hard-iron correction: |B|={=f32} uT body [{=f32}, {=f32}, {=f32}] uT, uncorrected heading {=f32} deg",
                         m.magnitude_ut(), v[0], v[1], v[2], hdg
                     );
                 }
