@@ -13,16 +13,22 @@
 # The firmware logs on USART6 TX (the T6 pad) at 115200 baud, 8N1. The
 # stream is binary defmt, decoded against the ELF that was flashed; a
 # stale ELF produces plausible-looking nonsense rather than an error. So
-# each log keeps a copy of the ELF it was decoded with and the raw bytes
-# (<log>.elf, <log>.raw), which is enough to decode it again later.
+# each log keeps a copy of the ELF it was decoded with (<log>.elf).
+#
+# The port is opened by defmt-print's own serial mode, the command verified
+# on the bench. An earlier version configured the port with stty and read
+# it with cat; on 2026-09-14 that captured nothing (0 raw bytes) while
+# `defmt-print ... serial` on the same port worked. The likely cause is
+# that a plain open blocks until the adapter reports carrier detect, which
+# the stty settings did not disable (clocal).
 #
 # Environment:
 #   SERIAL_DEV   adapter device. Default: the only /dev/ttyUSB* or
 #                /dev/ttyACM* present; none or several is an error.
 #   DEFMT_BAUD   default 115200.
 #
-# Requires defmt-print (cargo install defmt-print). Debian: the flash
-# scripts that call this need dfu-util and lsusb.
+# Requires defmt-print with its serial mode (cargo install defmt-print).
+# Debian: the flash scripts that call this need dfu-util and lsusb.
 
 set -euo pipefail
 
@@ -96,7 +102,7 @@ if [ "${1:-}" = "--launch" ]; then
     echo "==> no terminal emulator found; defmt reader running in the background" >&2
     echo "    follow it with: tail -f ${LOG}" >&2
   fi
-  # Let the reader configure the port before the board reboots.
+  # Let the reader open the port before the board reboots.
   sleep 1
   echo "${LOG}"
   exit 0
@@ -113,14 +119,12 @@ mkdir -p "$(dirname "${LOG}")"
 BASE="${LOG%.log}"
 cp "${ELF}" "${BASE}.elf"
 
-stty -F "${DEV}" "${BAUD}" raw -echo -ixon -ixoff cs8 -cstopb -parenb
-
 {
   echo "# defmt log $(date -Iseconds)"
   echo "# device ${DEV} at ${BAUD} baud"
   echo "# build stamp $(cat target/build-stamp.txt 2>/dev/null || echo unknown)"
-  echo "# decoded with ${BASE}.elf; raw bytes in ${BASE}.raw"
+  echo "# decoded with ${BASE}.elf"
 } | tee "${LOG}"
 echo "==> reading ${DEV}; Ctrl-C to stop"
 
-cat "${DEV}" | tee "${BASE}.raw" | defmt-print -e "${BASE}.elf" | tee -a "${LOG}"
+defmt-print -e "${BASE}.elf" serial --path "${DEV}" --baud "${BAUD}" | tee -a "${LOG}"

@@ -28,10 +28,11 @@ counted-down zero-throttle stream. After the last run the build stops DShot
 output and parks; the ESCs stay disarmed until the board is power-cycled.
 
 The reader is `scripts/defmt-log.sh`: USART6 at 115200 baud through a
-USB-UART adapter, auto-detected or set with `SERIAL_DEV`. It needs
-`defmt-print` (`cargo install defmt-print`). Beside each log it keeps the
-ELF it decoded with and the raw bytes, so the log can be decoded again.
-`DEFMT_LOG=<subdir>` enables it for any flash script.
+USB-UART adapter, auto-detected or set with `SERIAL_DEV`. It runs
+`defmt-print -e <elf> serial --path <dev> --baud <baud>`, the command
+verified on the bench, so it needs a `defmt-print` with serial support
+(`cargo install defmt-print`). Beside each log it keeps a copy of the ELF
+it decoded with. `DEFMT_LOG=<subdir>` enables it for any flash script.
 
 First capture: 2026-09-12, `docs/plant-capture-2026-09-12.log`, `motor_tau`
 36 ms.
