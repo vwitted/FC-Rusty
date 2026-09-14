@@ -1,0 +1,47 @@
+=== plant capture ===
+18219 samples in 12 run(s), 2448 ms per run (470 Hz), 7 pole pairs assumed
+telemetry present: M1=93%  M2=93%  M3=93%  M4=93%
+
+--- M1 : 79 steps, 78 fitted ---
+  motor_tau by run (ms): 31.9 32.0 27.1 31.5 32.6 27.2 31.2 31.6 31.8 32.1 33.1 32.5
+  10 of 78 fitted steps rejected on residual
+  motor_tau = 31.8 ms  (spread 27.1..44.5 over 68 steps, both directions)
+    (thrust-domain check: 41.5 ms up / 24.9 ms down, ratio 1.67 — expect >1)
+    (speed-domain: 34.9 ms up / 29.3 ms down, ratio 1.19 — the sim assumes 1.00)
+
+--- M2 : 80 steps, 78 fitted ---
+  motor_tau by run (ms): 39.4 41.5 36.2 40.7 42.4 37.0 41.6 43.2 42.6 43.2 43.5 42.9
+  7 of 78 fitted steps rejected on residual
+  motor_tau = 42.1 ms  (spread 32.5..59.3 over 71 steps, both directions)
+    (thrust-domain check: 54.8 ms up / 32.0 ms down, ratio 1.71 — expect >1)
+    (speed-domain: 46.9 ms up / 37.9 ms down, ratio 1.24 — the sim assumes 1.00)
+
+--- M3 : 82 steps, 79 fitted ---
+  motor_tau by run (ms): 29.1 29.8 26.2 30.1 30.6 29.2 30.7 29.7 31.0 30.9 30.9 31.3
+  17 of 79 fitted steps rejected on residual
+  motor_tau = 30.4 ms  (spread 25.9..37.5 over 62 steps, both directions)
+    (thrust-domain check: 40.1 ms up / 24.2 ms down, ratio 1.66 — expect >1)
+    (speed-domain: 33.3 ms up / 28.5 ms down, ratio 1.17 — the sim assumes 1.00)
+
+--- M4 : 80 steps, 78 fitted ---
+  motor_tau by run (ms): 42.1 42.0 36.2 41.5 42.6 36.4 40.9 42.9 43.5 41.2 43.6 44.2
+  7 of 78 fitted steps rejected on residual
+  motor_tau = 42.3 ms  (spread 33.9..56.9 over 71 steps, both directions)
+    (thrust-domain check: 55.0 ms up / 32.0 ms down, ratio 1.72 — expect >1)
+    (speed-domain: 47.2 ms up / 38.0 ms down, ratio 1.24 — the sim assumes 1.00)
+
+=== result ===
+motor_tau = 0.0369 s   (36.9 ms, from 272 steps across all motors)
+  sim default is 0.036 s — see QuadParams::motor_tau
+  speed-domain by direction: 41.3 ms up / 33.4 ms down, ratio 1.23
+  QuadSim lags rotor speed with ONE constant in both directions;
+  a ratio away from 1.00 measures how far that model is an approximation.
+  per-motor spread: M3 fastest at 30.4 ms, M4 slowest at 42.3 ms (1.39x)
+  WARNING: >1.3x spread. The mixer assumes four identical motors,
+          so this is a hardware finding, not a modelling one.
+
+What this does NOT give you:
+  max_thrust  — needs a load cell, or a measured hover throttle
+  inertia     — needs the airframe free to rotate
+  drag_k      — needs airspeed, so a forward-flight log
+Those are flight measurements and want the flash log, not the wire.

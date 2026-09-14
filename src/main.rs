@@ -2162,6 +2162,8 @@ async fn baro_task(
     use embassy_stm32::i2c::{Config as I2cConfig, I2c};
     use embassy_stm32::time::Hertz;
     use embassy_time::Timer;
+    use core::f32::consts::PI;
+    const RAD2DEG: f32 = 180.0 / PI;
 
     let make_cfg = || {
         let mut c = I2cConfig::default();
@@ -2398,9 +2400,13 @@ async fn baro_task(
                 // -- the two tests that decide scale and handedness.
                 if let Some(m) = last_mag {
                     let v = m.ut();
+                    let mut hdg: f32 = libm::atan2f(v[1], v[0]) * RAD2DEG;
+                    if hdg < 0.00 {
+                        hdg += 360.0;
+	                }
                     defmt::info!(
-                        "Mag |B|={=f32} uT body [{=f32}, {=f32}, {=f32}] uT",
-                        m.magnitude_ut(), v[0], v[1], v[2],
+                        "Mag |B|={=f32} uT body [{=f32}, {=f32}, {=f32}] uT - Hdg: {=f32}",
+                        m.magnitude_ut(), v[0], v[1], v[2], hdg
                     );
                 }
                 reads = 0;
