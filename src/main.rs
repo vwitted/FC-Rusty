@@ -40,6 +40,7 @@
 // Silence that noise for the bench build only; the flight build is unaffected.
 #![cfg_attr(any(feature = "motor-test", feature = "mpc-bench"), allow(unused))]
 
+use cortex_m::peripheral::scb::VectActive::Exception;
 use embassy_executor::Spawner;
 use embassy_stm32::time::Hertz;
 use embassy_stm32::usart::{self, Uart, UartRx, UartTx};
@@ -66,6 +67,7 @@ mod drivers {
     pub mod lis2mdl;
     pub mod mag;
     pub mod qmc5883l;
+    pub mod qmc5883p;
     pub mod orientation;
     pub mod nmea;
     pub mod ubx;
@@ -143,6 +145,7 @@ use drivers::ist8310::Ist8310;
 use drivers::lis2mdl::Lis2mdl;
 use drivers::mag::{MagError, MagSample, Orientation as MagOrientation};
 use drivers::qmc5883l::Qmc5883l;
+use drivers::qmc5883p::Qmc5883p;
 use drivers::dshot_bitbang::DshotBitbang;
 use drivers::dshot_frame::DshotFrame;
 use drivers::icm42688::RawImu;
@@ -710,15 +713,32 @@ async fn blink_task(mut led: embassy_stm32::gpio::Output<'static>) {
 /// heading, and correct it here.
 const IST8310_SE100_ORIENTATION: MagOrientation = MagOrientation::Roll180;
 
+/// QMC5883P mounting: compass facing up, module cable running aft.
+///
+/// That is Betaflight's CW180FLIP, which is `Roll180` here -- FLIP is two
+/// 90-degree PITCH rotations, so CW180FLIP composes to X -> +X, Y -> -Y,
+/// Z -> -Z. See the mapping table on `mag::Orientation`; reading FLIP as
+/// a roll would give `Pitch180`, which negates the wrong axis.
+///
+/// UNVERIFIED on the bench. This is the intended mounting, not a measured
+/// one, and it assumes the chip's own axes are aligned with the module
+/// housing. A wrong value here does not degrade yaw, it inverts or
+/// mirrors it -- confirm with a level heading test before trusting
+/// heading, and correct it here.
+const QMC5883P_ORIENTATION: MagOrientation = MagOrientation::Roll180;
+
 /// Whichever magnetometer is actually fitted.
 ///
-/// Four are supported and they are not alternatives in the "pick one in
+/// Five are supported and they are not alternatives in the "pick one in
 /// a config" sense -- they live on different boards, all of them wired
 /// to the FC's SDA/SCL pads rather than mounted on it (the DAKEFPV H743
 /// has no onboard compass). The LIS2MDL is a standalone breakout; the
 /// Radiolink SE100 GPS module carries a QMC5883L, an HMC5883L or (V2,
 /// the one on the bench) an IST8310 depending on revision, and they are
-/// externally identical. Any of them may be plugged in on a given day, so
+/// externally identical. The QMC5883P is a separate QST part, not a
+/// revision of the QMC5883L: different address (0x2C), register map and
+/// sensitivity, so it gets its own driver and its own probe branch.
+/// Any of them may be plugged in on a given day, so
 /// the honest thing is to ask the bus rather than to carry a build flag
 /// someone will forget to flip.
 ///
@@ -728,6 +748,7 @@ enum Compass {
     Lis2mdl(Lis2mdl),
     Hmc5883l(Hmc5883l),
     Qmc5883l(Qmc5883l),
+    Qmc5883p(Qmc5883p),
     Ist8310(Ist8310),
 }
 
@@ -810,14 +831,17 @@ impl Compass {
     /// not, so the QMC's write-readback presence test runs first and the
     /// IST8310's ID read second.
     ///
-    /// ORIENTATION IS UNVERIFIED FOR THE SE100. The IST8310 uses a best
-    /// guess (IST8310_SE100_ORIENTATION), the others Identity: this firmware has never flown, and the mounting of
+    /// ORIENTATION IS UNVERIFIED. The IST8310 uses a best guess
+    /// (IST8310_SE100_ORIENTATION) and the QMC5883P the intended mounting
+    /// (QMC5883P_ORIENTATION); the rest are Identity. This firmware has never flown, and the mounting of
     /// the compass inside the SE100 relative to the airframe has not been
     /// checked on the bench. A wrong Orientation here does not degrade
     /// yaw, it inverts or mirrors it. Confirm against the magnitude and
     /// axis signs logged below before trusting heading.
     async fn probe(i2c: &mut MagBus<'_>) -> Option<Self> {
-        use drivers::mag::{describe_addr, IST8310_ADDRS, LIS2MDL_OR_HMC5883L_ADDR, QMC5883L_ADDR};
+        use drivers::mag::{
+            describe_addr, IST8310_ADDRS, LIS2MDL_OR_HMC5883L_ADDR, QMC5883L_ADDR, QMC5883P_ADDR,
+        };
 
         let scan = scan_bus(i2c);
         if scan.fault {
@@ -867,6 +891,19 @@ impl Compass {
             }
         }
 
+        if found.is_none() && scan.addrs().contains(&QMC5883P_ADDR) {
+            match Qmc5883p::init(i2c, QMC5883P_ORIENTATION).await {
+                Ok(d) => {
+                    defmt::info!("Magnetometer: QMC5883P online @ 200 Hz (I2C 0x2C)");
+                    found = Some(Self::Qmc5883p(d));
+                }
+                Err(e) => defmt::info!(
+                    "Magnetometer: 0x2C is not a QMC5883P ({:?}; CHIPID wants 0x80)",
+                    e,
+                ),
+            }
+        }
+
         if found.is_none() {
             for &addr in scan.addrs() {
                 if !IST8310_ADDRS.contains(&addr) {
@@ -910,6 +947,9 @@ impl Compass {
                 Some(c)
             }
             None => {
+                  for &addr in scan.addrs() {
+                    defmt::warn!("I2C address found: {}", addr);
+                  }
                 defmt::warn!(
                     "Magnetometer: none found among {} ACKing address(es) — continuing without mag (yaw will drift)",
                     scan.n,
@@ -927,6 +967,7 @@ impl Compass {
             Self::Lis2mdl(d) => d.read(i2c).map(Some),
             Self::Hmc5883l(d) => d.read(i2c).map(Some),
             Self::Qmc5883l(d) => d.read(i2c).map(Some),
+            Self::Qmc5883p(d) => d.read(i2c).map(Some),
             Self::Ist8310(d) => d.read(i2c),
         }
     }
