@@ -237,11 +237,35 @@ impl PosKf {
     /// useful for damping pre-home dead-reckoning drift from O(t²) to
     /// O(t), and for keeping a rough velocity solution alive during
     /// position dropouts.
+    /// Fuse GPS horizontal velocity with the default noise figure.
+    ///
+    /// 1σ GPS horizontal-velocity noise. Consumer modules quote
+    /// 0.05–0.1 m/s on ground speed; 0.3 leaves headroom for the
+    /// course-induced cross-axis error at low speeds.
+    pub const SIGMA_GPS_VEL_DEFAULT: f32 = 0.3;
+
     pub fn update_gps_velocity(&mut self, vn: f32, ve: f32) {
-        // 1σ GPS horizontal-velocity noise. Consumer modules quote
-        // 0.05–0.1 m/s on ground speed; 0.3 leaves headroom for the
-        // course-induced cross-axis error at low speeds.
-        const SIGMA_GPS_VEL: f32 = 0.3;
+        self.update_gps_velocity_scaled(vn, ve, Self::SIGMA_GPS_VEL_DEFAULT);
+    }
+
+    /// Fuse GPS horizontal velocity with an explicit 1σ.
+    ///
+    /// Separate from `update_gps_velocity` so a UBX receiver's own sAcc
+    /// can be used instead of a fixed constant: a fix the receiver rates
+    /// at 0.05 m/s and one it rates at 0.8 m/s should not move the
+    /// filter by the same amount, and a constant says they do.
+    ///
+    /// NOTE for callers: the gain here is 6x2, so `x += K*y` corrects the
+    /// POSITION states as well as the velocity ones, through the
+    /// position/velocity cross-covariance. Fusing a bad velocity moves
+    /// the position estimate directly -- this is not a velocity-only
+    /// operation, and it must be quality-gated accordingly.
+    pub fn update_gps_velocity_scaled(&mut self, vn: f32, ve: f32, sigma: f32) {
+        let sigma_gps_vel = if sigma.is_finite() && sigma > 0.0 {
+            sigma
+        } else {
+            Self::SIGMA_GPS_VEL_DEFAULT
+        };
 
         // H = picks vn (state 3) and ve (state 4) out of the 6-state
         // vector. y = z − H·x.
@@ -250,8 +274,8 @@ impl PosKf {
         // S = H·P·H^T + R = P[3:5, 3:5] + σ²·I₂
         let p_vv = self.p_cov.fixed_view::<2, 2>(3, 3).into_owned();
         let mut s = p_vv;
-        s[(0, 0)] += SIGMA_GPS_VEL * SIGMA_GPS_VEL;
-        s[(1, 1)] += SIGMA_GPS_VEL * SIGMA_GPS_VEL;
+        s[(0, 0)] += sigma_gps_vel * sigma_gps_vel;
+        s[(1, 1)] += sigma_gps_vel * sigma_gps_vel;
 
         let s_inv = match s.try_inverse() {
             Some(m) => m,

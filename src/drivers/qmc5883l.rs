@@ -173,7 +173,7 @@ pub const fn decode_raw(buf: [u8; 6]) -> [i16; 3] {
 
 /// Decode six data bytes into a body-frame sample.
 pub fn decode_sample(buf: [u8; 6], orient: Orientation) -> MagSample {
-    MagSample::new(decode_raw(buf), SENS_UT_PER_LSB, orient.sign())
+    MagSample::new(decode_raw(buf), SENS_UT_PER_LSB, orient)
 }
 
 // ---- Driver ----

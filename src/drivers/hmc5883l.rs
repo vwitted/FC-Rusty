@@ -208,7 +208,7 @@ pub fn decode_sample(buf: [u8; 6], orient: Orientation) -> Option<MagSample> {
     if is_overflowed(raw) {
         return None;
     }
-    Some(MagSample::new(raw, SENS_UT_PER_LSB, orient.sign()))
+    Some(MagSample::new(raw, SENS_UT_PER_LSB, orient))
 }
 
 // ---- Driver ----

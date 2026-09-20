@@ -438,7 +438,21 @@ pub const ALT_FACTORY_BAUD: u32 = 38_400;
 /// the SE100's M8 build ships at; 38400 is the M10 default, and the M10
 /// SE100 is externally identical. You cannot tell which you have without
 /// opening it, so the firmware asks instead of assuming.
-pub const CANDIDATE_BAUDS: [u32; 3] = [TARGET_BAUD, FACTORY_BAUD, ALT_FACTORY_BAUD];
+///
+/// The list is deliberately wider than the two factory defaults. A
+/// framing error means the line is carrying transitions at a rate we are
+/// not clocking -- so "errors at every candidate" is evidence the module
+/// is on a rate NOT in this list, and the cure is more candidates. These
+/// four extras are the rates FPV vendors and configurators actually
+/// leave M10 modules on for 10 Hz work.
+pub const CANDIDATE_BAUDS: [u32; 6] = [
+    TARGET_BAUD,
+    FACTORY_BAUD,
+    ALT_FACTORY_BAUD,
+    230_400,
+    57_600,
+    460_800,
+];
 
 /// How long to listen at each candidate baud.
 ///
@@ -449,6 +463,26 @@ pub const CANDIDATE_BAUDS: [u32; 3] = [TARGET_BAUD, FACTORY_BAUD, ALT_FACTORY_BA
 /// being tried usually answers well inside this -- the window only runs
 /// to completion when the guess was wrong.
 pub const PROBE_WINDOW_MS: u64 = 1200;
+
+/// How long the first pass listens at each candidate baud.
+///
+/// The full window cannot be spent on every candidate: at 1200 ms a list
+/// long enough to actually FIND a misconfigured module costs more boot
+/// latency than the GPS is worth (see
+/// `worst_case_probe_time_stays_reasonable`). So the sweep is two-pass.
+///
+/// Pass one is a census, not a search. It does not need to see a whole
+/// frame -- it only needs to know whether the line produces clockable
+/// bytes at this rate, and a module streaming at 10 Hz answers that in
+/// one solution period. 200 ms covers two.
+///
+/// A 1 Hz burster can sit out a 200 ms census entirely, which is exactly
+/// why pass two exists and why it still runs when the census finds
+/// nothing at all.
+pub const CENSUS_WINDOW_MS: u64 = 200;
+
+/// How many candidates pass two is allowed to spend a full window on.
+pub const FULL_WINDOW_ATTEMPTS: usize = 3;
 
 /// What was heard at a given baud.
 ///
@@ -462,6 +496,9 @@ pub const PROBE_WINDOW_MS: u64 = 1200;
 /// wrong -- and the more candidate bauds there are, the more chances it
 /// gets to be wrong. Both arms below now require a frame whose checksum
 /// verifies, which garbage does not produce.
+///
+/// A fourth outcome used to be folded into `Silent` and should not have
+/// been: see `ProbeStats`.
 #[cfg(feature = "firmware")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ProbeResult {
@@ -473,38 +510,100 @@ enum ProbeResult {
     Silent,
 }
 
+/// What the line actually did during one probe window.
+///
+/// The point of this type is that "no valid frame" and "nothing on the
+/// wire" are completely different faults and the old probe reported both
+/// as "nothing at N baud". A dead RX pin, a module on a baud we do not
+/// probe, and a module talking to us correctly but losing bytes to
+/// buffer turnaround are three different repairs, and they are told
+/// apart by bytes-received and error counts -- not by whether a checksum
+/// happened to verify.
+#[cfg(feature = "firmware")]
+#[derive(Debug, Clone, Copy, Default)]
+struct ProbeStats {
+    bytes: u32,
+    framing: u32,
+    noise: u32,
+    overrun: u32,
+    other: u32,
+    /// First bytes seen, for the log. At a wrong baud these are the
+    /// mis-clocked bits of real characters, and the pattern is often
+    /// enough to recognise the true rate by eye.
+    head: [u8; 8],
+    head_n: usize,
+}
+
+#[cfg(feature = "firmware")]
+impl ProbeStats {
+    fn errors(&self) -> u32 {
+        self.framing + self.noise + self.overrun + self.other
+    }
+}
+
+/// Listen at the current baud for `PROBE_WINDOW_MS` and report both what
+/// parsed and what was seen.
+///
+/// Errors do NOT end the window. The previous version broke out of the
+/// loop on the first `Err`, which made every "nothing at N baud" line in
+/// the boot log a lie: the flight log showed windows of 356 ms and 106 ms
+/// against a nominal 1200 ms, i.e. the probe was abandoning the rate
+/// after one framing error rather than listening. A framing error is
+/// evidence ABOUT the baud, not grounds to stop collecting evidence --
+/// and on the correct baud a single noise glitch would equally have
+/// thrown the rate away.
 #[cfg(feature = "firmware")]
 async fn probe_for_data(
     rx: &mut embassy_stm32::usart::UartRx<'_, embassy_stm32::mode::Async>,
-) -> ProbeResult {
+    window_ms: u64,
+) -> (ProbeResult, ProbeStats) {
+    use embassy_stm32::usart::Error as UartError;
     use embassy_time::{with_timeout, Duration, Instant};
 
     let mut ubx = UbxParser::new();
     let mut nmea = super::nmea::NmeaParser::new();
     let mut buf = [0u8; 64];
-    let deadline = Instant::now() + Duration::from_millis(PROBE_WINDOW_MS);
+    let mut st = ProbeStats::default();
+    let deadline = Instant::now() + Duration::from_millis(window_ms);
 
     while Instant::now() < deadline {
         let timeout = deadline - Instant::now();
-        match with_timeout(timeout, rx.read(&mut buf)).await {
-            Ok(Ok(())) => {
-                for &byte in &buf {
+        // read_until_idle, not read: `read` completes only when all 64
+        // bytes have arrived, so a burst shorter than the buffer is held
+        // until the window expires and is then DISCARDED with the dropped
+        // future. Idle-line detection hands back short bursts intact,
+        // which is what both parsers need to see a whole frame.
+        match with_timeout(timeout, rx.read_until_idle(&mut buf)).await {
+            Ok(Ok(n)) => {
+                st.bytes += n as u32;
+                for &byte in &buf[..n] {
+                    if st.head_n < st.head.len() {
+                        st.head[st.head_n] = byte;
+                        st.head_n += 1;
+                    }
                     if ubx.push_byte(byte).is_some() {
-                        return ProbeResult::Ubx;
+                        return (ProbeResult::Ubx, st);
                     }
                     if nmea.push_byte(byte).is_some() {
-                        return ProbeResult::Nmea;
+                        return (ProbeResult::Nmea, st);
                     }
                 }
             }
-            // A UART framing/overrun error is itself a signature of a
-            // baud mismatch, but not a reliable one (a disconnected line
-            // is simply quiet), so it ends this attempt and the caller
-            // moves to the next candidate rate.
-            _ => break,
+            Ok(Err(e)) => {
+                match e {
+                    UartError::Framing => st.framing += 1,
+                    UartError::Noise => st.noise += 1,
+                    UartError::Overrun => st.overrun += 1,
+                    _ => st.other += 1,
+                }
+                // Keep listening. The next read re-arms DMA and clears
+                // the stale error flag on the way in.
+            }
+            // Window expired mid-read.
+            Err(_) => break,
         }
     }
-    ProbeResult::Silent
+    (ProbeResult::Silent, st)
 }
 
 /// Find the module, put it on `TARGET_BAUD` speaking UBX only, and set
@@ -538,74 +637,225 @@ pub async fn configure(
     // Give the module time to boot and start streaming after power-on.
     Timer::after(Duration::from_millis(500)).await;
 
-    for &baud in CANDIDATE_BAUDS.iter() {
+    // ---- Pass one: census every candidate rate ----
+    //
+    // Cheap windows across the whole list, recording what the line does
+    // at each rate rather than only whether a frame parsed. This is the
+    // pass that answers "which rate is the module actually on", which a
+    // single-pass search cannot afford to ask across a list this long.
+    // If a frame happens to parse here, so much the better -- take it.
+    let mut census = [ProbeStats::default(); CANDIDATE_BAUDS.len()];
+    let mut found_at: Option<(u32, ProbeResult)> = None;
+
+    for (i, &baud) in CANDIDATE_BAUDS.iter().enumerate() {
         tx.set_baudrate(baud).unwrap();
         rx.set_baudrate(baud).unwrap();
         Timer::after(Duration::from_millis(50)).await;
 
-        let found = probe_for_data(rx).await;
-        if found == ProbeResult::Silent {
-            defmt::info!("GPS: nothing at {} baud", baud);
-            continue;
+        let (res, st) = probe_for_data(rx, CENSUS_WINDOW_MS).await;
+        census[i] = st;
+        log_probe(baud, "census", res, &st);
+        if res != ProbeResult::Silent {
+            found_at = Some((baud, res));
+            break;
         }
-
-        defmt::info!(
-            "GPS: module found at {} baud speaking {}",
-            baud,
-            if found == ProbeResult::Ubx { "UBX" } else { "NMEA" },
-        );
-
-        // CFG-PRT carries baud AND the protocol masks, so this both moves
-        // the module to TARGET_BAUD and restricts it to UBX output. Sent
-        // even when baud already equals TARGET_BAUD, for the masks.
-        let mut frame = [0u8; 28];
-        let n = cfg::set_uart_baud(&mut frame, TARGET_BAUD);
-        let _ = tx.write(&frame[..n]).await;
-
-        // u-blox modules switch as soon as the command is accepted, so
-        // let the ACK drain at the OLD rate before following it.
-        Timer::after(Duration::from_millis(100)).await;
-        if baud != TARGET_BAUD {
-            tx.set_baudrate(TARGET_BAUD).unwrap();
-            rx.set_baudrate(TARGET_BAUD).unwrap();
-            Timer::after(Duration::from_millis(100)).await;
-        }
-
-        // Factory configs enable no UBX messages at all, only NMEA, so
-        // the module is silent on UBX until this.
-        enable_nav_pvt(tx).await;
-        return TARGET_BAUD;
     }
 
-    defmt::warn!(
-        "GPS: no response at {}, {} or {} baud - check wiring, and whether the module is on a rate we do not probe",
-        CANDIDATE_BAUDS[0],
-        CANDIDATE_BAUDS[1],
-        CANDIDATE_BAUDS[2],
+    // ---- Pass two: full windows, best evidence first ----
+    //
+    // Ordered by what the census saw. A rate that produced clockable
+    // bytes is a better bet than one that produced only framing errors,
+    // and both beat a rate that produced nothing -- but "nothing" is not
+    // disqualifying, because a 1 Hz burster is silent for most of a
+    // 200 ms census. So every candidate stays eligible; the census only
+    // decides the ORDER and how many get a full window.
+    if found_at.is_none() {
+        let mut order: [usize; CANDIDATE_BAUDS.len()] = [0; CANDIDATE_BAUDS.len()];
+        for (i, slot) in order.iter_mut().enumerate() {
+            *slot = i;
+        }
+        // Insertion sort by descending evidence; stable, so an all-zero
+        // census leaves CANDIDATE_BAUDS order untouched and pass two
+        // degrades to exactly the old behaviour.
+        for i in 1..order.len() {
+            let mut j = i;
+            while j > 0 && evidence(&census[order[j]]) > evidence(&census[order[j - 1]]) {
+                order.swap(j, j - 1);
+                j -= 1;
+            }
+        }
+
+        for &i in order.iter().take(FULL_WINDOW_ATTEMPTS) {
+            let baud = CANDIDATE_BAUDS[i];
+            tx.set_baudrate(baud).unwrap();
+            rx.set_baudrate(baud).unwrap();
+            Timer::after(Duration::from_millis(50)).await;
+
+            let (res, st) = probe_for_data(rx, PROBE_WINDOW_MS).await;
+            log_probe(baud, "full", res, &st);
+            if res != ProbeResult::Silent {
+                found_at = Some((baud, res));
+                break;
+            }
+        }
+    }
+
+    let (baud, found) = match found_at {
+        Some(v) => v,
+        None => {
+            defmt::warn!(
+                "GPS: no valid frame at any of {} candidate bauds. Read the per-baud lines above: bytes=0 and err=0 everywhere means the RX line never moved (wiring, or the module is not transmitting); err>0 at every rate means it IS transmitting, on a rate not in CANDIDATE_BAUDS.",
+                CANDIDATE_BAUDS.len(),
+            );
+            return 0;
+        }
+    };
+
+    defmt::info!(
+        "GPS: module found at {} baud speaking {}",
+        baud,
+        if found == ProbeResult::Ubx { "UBX" } else { "NMEA" },
     );
-    0
+
+    // CFG-PRT carries baud AND the protocol masks, so this both moves
+    // the module to TARGET_BAUD and restricts it to UBX output. Sent
+    // even when baud already equals TARGET_BAUD, for the masks.
+    //
+    // NOTE: CFG-PRT (0x06 0x00) exists only on M8 and earlier. An M10
+    // supports exactly five UBX-CFG messages -- CFG-CFG, CFG-RST,
+    // CFG-VALDEL, CFG-VALGET, CFG-VALSET -- and NAKs everything else, so
+    // on an M10 this and the two commands in `enable_nav_pvt` are all
+    // rejected and the module stays on whatever it booted with. See the
+    // module comment on `cfg`.
+    let mut frame = [0u8; 28];
+    let n = cfg::set_uart_baud(&mut frame, TARGET_BAUD);
+    let _ = tx.write(&frame[..n]).await;
+
+    // Same request through the modern interface, for M9/M10 parts that
+    // do not implement CFG-PRT. VALSET applies atomically, so baud and
+    // the protocol masks either all take effect or none do -- the module
+    // cannot end up at the new baud while still emitting NMEA.
+    //
+    // NMEA output off matches what the CFG-PRT masks above ask for. It is
+    // safe against losing the NMEA fallback: if this frame is rejected
+    // nothing changes, and if it is accepted then NAV-PVT was enabled by
+    // the same atomic write.
+    let n = cfg::valset(
+        &mut frame,
+        cfg::LAYER_RAM,
+        &[
+            (cfg::KEY_UART1_BAUDRATE, TARGET_BAUD as u64),
+            (cfg::KEY_UART1_OUTPROT_UBX, 1),
+            (cfg::KEY_UART1_OUTPROT_NMEA, 0),
+        ],
+    );
+    if n > 0 {
+        let _ = tx.write(&frame[..n]).await;
+    }
+
+    // u-blox modules switch as soon as the command is accepted, so
+    // let the ACK drain at the OLD rate before following it.
+    Timer::after(Duration::from_millis(100)).await;
+    if baud != TARGET_BAUD {
+        tx.set_baudrate(TARGET_BAUD).unwrap();
+        rx.set_baudrate(TARGET_BAUD).unwrap();
+        Timer::after(Duration::from_millis(100)).await;
+    }
+
+    // Factory configs enable no UBX messages at all, only NMEA, so
+    // the module is silent on UBX until this.
+    enable_nav_pvt(tx).await;
+    TARGET_BAUD
 }
 
-/// Enable UBX NAV-PVT (0x01 0x07) at 1 Hz on the current UART.
+/// Rank a census result. Higher is a better bet for a full window.
+///
+/// Bytes outrank errors because a rate that clocks characters at all is
+/// closer to correct than one that only produces framing errors, and
+/// both outrank silence. Errors still count for something: they prove
+/// the line is alive, which is the difference between "wrong baud" and
+/// "nothing connected".
+#[cfg(feature = "firmware")]
+fn evidence(st: &ProbeStats) -> u32 {
+    st.bytes.saturating_mul(4).saturating_add(st.errors())
+}
+
+/// One per-baud line, covering both passes.
+#[cfg(feature = "firmware")]
+fn log_probe(baud: u32, pass: &str, res: ProbeResult, st: &ProbeStats) {
+    if res != ProbeResult::Silent {
+        return;
+    }
+    defmt::info!(
+        "GPS [{}]: no valid frame at {} baud - {=u32} bytes, {=u32} err ({=u32} framing / {=u32} noise / {=u32} overrun), head {=[u8]:02x}",
+        pass,
+        baud,
+        st.bytes,
+        st.errors(),
+        st.framing,
+        st.noise,
+        st.overrun,
+        &st.head[..st.head_n],
+    );
+}
+
+/// Put NAV-PVT on the current UART at `NAV_RATE_MS`.
+///
+/// Sends the request twice, once through each generation's configuration
+/// interface, because the module generation is not known at runtime and
+/// each generation ignores the other's messages:
+///
+///   - M8 and earlier understand CFG-RATE / CFG-MSG;
+///   - M9/M10 understand CFG-VALSET and NAK CFG-RATE / CFG-MSG, which
+///     are not in their UBX-CFG class at all.
+///
+/// Both are idempotent and cost a few hundred bytes once at boot. The
+/// alternative -- identify the part from UBX-MON-VER first -- needs a
+/// reply parser and an ACK/NAK path, and buys nothing: whichever message
+/// the module does not recognise it simply rejects.
+///
+/// This is why an M10 sat at 1 Hz on the bench: only the legacy pair was
+/// ever sent, so the solution rate never moved off the module default,
+/// and nothing parsed the NAK that said so.
 #[cfg(feature = "firmware")]
 async fn enable_nav_pvt(
     tx: &mut embassy_stm32::usart::UartTx<'static, embassy_stm32::mode::Async>,
 ) {
     use embassy_time::{Duration, Timer};
-    let mut frame = [0u8; 16];
+    let mut frame = [0u8; 32];
 
+    // ---- Modern interface (M9/M10) ----
+    //
+    // One VALSET carrying all three items. VALSET applies atomically, so
+    // the solution rate and the message rate cannot land out of step the
+    // way two separate legacy commands can.
+    //
+    // 100 ms with nav_rate = 1 is 10 Hz. One NAV-PVT is 100 bytes, so
+    // 10 Hz is 1 kB/s against 11.5 kB/s of a 115200 link -- comfortable.
+    // It would NOT fit in the factory 9600.
+    let n = cfg::valset(
+        &mut frame,
+        cfg::LAYER_RAM,
+        &[
+            (cfg::KEY_RATE_MEAS, NAV_RATE_MS as u64),
+            (cfg::KEY_RATE_NAV, 1),
+            (cfg::KEY_MSGOUT_NAV_PVT_UART1, 1),
+        ],
+    );
+    if n > 0 {
+        let _ = tx.write(&frame[..n]).await;
+        Timer::after(Duration::from_millis(50)).await;
+    } else {
+        defmt::warn!("GPS: CFG-VALSET frame did not build - skipping modern config");
+    }
+
+    // ---- Legacy interface (M8 and earlier) ----
+    //
     // Solution rate FIRST, then the message rate against it.
     //
-    // CFG-RATE was never sent before, so NAV-PVT arrived at the module
-    // default of 1 Hz -- which quietly undoes the reason for using UBX at
-    // all. gps_accel.rs differentiates GPS velocity and is specified
-    // against 10 Hz fixes; at 1 Hz the differentiation interval is a full
-    // second and the estimate is worthless.
-    //
-    // 100 ms with nav_rate = 1 is 10 Hz, which an M8 sustains on
-    // multi-GNSS (the 18 Hz figure in the M8 datasheet is GPS-only). One
-    // NAV-PVT is 100 bytes, so 10 Hz is 1 kB/s against 11.5 kB/s of
-    // 115200 link -- comfortable. It would NOT fit in the factory 9600.
+    // gps_accel.rs differentiates GPS velocity and is specified against
+    // 10 Hz fixes; at 1 Hz the differentiation interval is a full second
+    // and the estimate is worthless.
     let n = cfg::set_nav_rate(&mut frame, NAV_RATE_MS, 1);
     let _ = tx.write(&frame[..n]).await;
     Timer::after(Duration::from_millis(50)).await;
@@ -615,13 +865,42 @@ async fn enable_nav_pvt(
     let _ = tx.write(&frame[..n]).await;
     Timer::after(Duration::from_millis(50)).await;
     defmt::info!(
-        "GPS: NAV-PVT enabled at {} ms solution rate",
+        "GPS: NAV-PVT requested at {} ms solution rate (VALSET + legacy CFG)",
         NAV_RATE_MS,
     );
 }
 
 // ---- Common configuration commands ----
 
+// ---- LEGACY (M8-era) CONFIGURATION INTERFACE ----
+//
+// Every command in this module is a UBX-CFG-* message from the interface
+// u-blox froze at protocol version 23.01. They work on M8 and earlier.
+//
+// They DO NOT WORK ON M10. The u-blox M10 SPG 5.10 interface description
+// (UBX-21035062, protocol 34.10) documents exactly five messages in the
+// UBX-CFG class, section 3.10:
+//
+//     UBX-CFG-CFG    0x06 0x09
+//     UBX-CFG-RST    0x06 0x04
+//     UBX-CFG-VALDEL 0x06 0x8c
+//     UBX-CFG-VALGET 0x06 0x8b
+//     UBX-CFG-VALSET 0x06 0x8a
+//
+// CFG-PRT (0x06 0x00), CFG-MSG (0x06 0x01) and CFG-RATE (0x06 0x08) are
+// not among them. They survive in that document only as an appendix
+// mapping each legacy field onto a configuration key -- e.g.
+// `UBX-CFG-PRT.baudRate` -> `CFG-UART1-BAUDRATE` (0x40520001). An M10
+// answers all three with UBX-ACK-NAK and changes nothing.
+//
+// Consequence for this driver: on an M10 the probe may find the module
+// and report success, then fail to move its baud, fail to restrict it to
+// UBX, and fail to set the 10 Hz solution rate -- silently, because no
+// ACK/NAK is parsed. The module keeps whatever configuration it booted
+// with (factory: 38400 baud, NMEA, 1 Hz -- CFG-UART1-BAUDRATE default is
+// 38400, Table 84).
+//
+// Replacing these with CFG-VALSET is the fix; it is not done here yet.
 pub mod cfg {
     use super::build_frame;
 
@@ -647,6 +926,97 @@ pub mod cfg {
         payload[4] = 1; // timeRef = GPS
         payload[5] = 0;
         build_frame(out, 0x06, 0x08, &payload)
+    }
+
+    // ---- Modern (M9/M10) configuration interface ----
+    //
+    // UBX-CFG-VALSET (0x06 0x8a). Payload, section 3.10.5:
+    //
+    //   byte 0    U1     version = 0x00
+    //   byte 1    X1     layers: bit0 RAM, bit1 BBR, bit2 Flash
+    //   bytes 2-3 U1[2]  reserved
+    //   bytes 4+         key/value pairs, concatenated with NO padding
+    //
+    // A key is a U4 whose bits 30..28 encode the VALUE width, so the key
+    // itself says how many bytes follow it:
+    //
+    //   0x01 = one bit (stored in one byte)   0x02 = one byte
+    //   0x03 = two bytes                      0x04 = four bytes
+    //   0x05 = eight bytes
+    //
+    // `valset` derives the width from that encoding rather than taking a
+    // separate length argument, which makes a key/width mismatch
+    // unrepresentable. The failure it replaces is a frame the receiver
+    // NAKs as a whole, with no indication of which pair was malformed.
+
+    /// RAM layer only.
+    ///
+    /// Deliberately not Flash: same reasoning as the CFG-CFG note on
+    /// `configure`. Configuring every boot is cheaper than debugging a
+    /// module that half-remembers a previous firmware's settings.
+    pub const LAYER_RAM: u8 = 0x01;
+
+    /// Measurement rate, milliseconds. U2.
+    pub const KEY_RATE_MEAS: u32 = 0x3021_0001;
+    /// Measurements per navigation solution. U2.
+    pub const KEY_RATE_NAV: u32 = 0x3021_0002;
+    /// NAV-PVT output rate on UART1, in solutions per message. U1.
+    pub const KEY_MSGOUT_NAV_PVT_UART1: u32 = 0x2091_0007;
+    /// UART1 baud rate. U4.
+    pub const KEY_UART1_BAUDRATE: u32 = 0x4052_0001;
+    /// UBX as an output protocol on UART1. L (one bit, one byte stored).
+    pub const KEY_UART1_OUTPROT_UBX: u32 = 0x1074_0001;
+    /// NMEA as an output protocol on UART1. L. Defaults to 1 (Table 87),
+    /// so an unconfigured M10 emits NMEA alongside UBX.
+    pub const KEY_UART1_OUTPROT_NMEA: u32 = 0x1074_0002;
+
+    /// Value width in bytes that a key ID declares, from bits 30..28.
+    ///
+    /// Returns 0 for the reserved size codes. No key this firmware uses
+    /// has one, and `valset` refuses to encode such a key rather than
+    /// guessing a width for it.
+    pub const fn key_value_len(key: u32) -> usize {
+        match (key >> 28) & 0x7 {
+            0x01 => 1, // one bit, stored in a byte
+            0x02 => 1,
+            0x03 => 2,
+            0x04 => 4,
+            0x05 => 8,
+            _ => 0,
+        }
+    }
+
+    /// Build a CFG-VALSET frame from key/value pairs.
+    ///
+    /// Each value is taken little-endian from the low bytes of the `u64`
+    /// and truncated to the width its key declares. Returns 0 if a key
+    /// has an unknown width or the frame does not fit, so callers send
+    /// nothing rather than something malformed: VALSET applies
+    /// atomically, and one bad pair voids the whole message.
+    pub fn valset(out: &mut [u8], layers: u8, pairs: &[(u32, u64)]) -> usize {
+        // 64 pairs is the documented maximum for one VALSET, and 12 bytes
+        // is the widest pair (4-byte key + 8-byte value).
+        let mut payload = [0u8; 4 + 64 * 12];
+        payload[0] = 0x00; // version
+        payload[1] = layers;
+        // bytes 2..4 are reserved and already zero.
+        let mut n = 4;
+
+        for &(key, value) in pairs {
+            let width = key_value_len(key);
+            if width == 0 || n + 4 + width > payload.len() {
+                return 0;
+            }
+            payload[n..n + 4].copy_from_slice(&key.to_le_bytes());
+            n += 4;
+            payload[n..n + width].copy_from_slice(&value.to_le_bytes()[..width]);
+            n += width;
+        }
+
+        if out.len() < n + 8 {
+            return 0;
+        }
+        build_frame(out, 0x06, 0x8A, &payload[..n])
     }
 
     /// Set UART1 baud rate via CFG-PRT (0x06 0x00).
@@ -876,8 +1246,191 @@ mod tests {
         // Nothing connected means every window runs to completion. This
         // is boot latency the user pays before the GPS task starts
         // reading, so it is worth knowing when it grows.
-        let worst_ms = PROBE_WINDOW_MS * CANDIDATE_BAUDS.len() as u64;
+        //
+        // Two passes now: a census window at every candidate, then a
+        // full window at up to FULL_WINDOW_ATTEMPTS of them. This is what
+        // buys a candidate list long enough to find a module that is not
+        // on a factory default -- a single-pass sweep at the full window
+        // would blow this budget at four candidates.
+        let census_ms = CENSUS_WINDOW_MS * CANDIDATE_BAUDS.len() as u64;
+        let full_ms = PROBE_WINDOW_MS * FULL_WINDOW_ATTEMPTS as u64;
+        let worst_ms = census_ms + full_ms;
         assert!(worst_ms <= 5000, "{worst_ms} ms of probing at boot");
+    }
+
+    #[test]
+    fn census_pass_is_cheap_enough_to_afford_every_candidate() {
+        // The census only has to catch a streaming module, so it can be
+        // far shorter than the burst-catching full window. If it ever
+        // grows to the point where sweeping the whole list costs as much
+        // as a full window, the two-pass split has stopped paying for
+        // itself.
+        assert!(
+            CENSUS_WINDOW_MS * CANDIDATE_BAUDS.len() as u64 <= PROBE_WINDOW_MS * 2,
+            "census sweep is no longer cheap relative to a full window",
+        );
+        assert!(FULL_WINDOW_ATTEMPTS <= CANDIDATE_BAUDS.len());
+    }
+
+    #[test]
+    fn the_factory_defaults_are_all_still_candidates() {
+        // Widening the list must not drop the rates a module is most
+        // likely to actually be on. M8 ships at 9600, M10 at 38400, and
+        // a module a previous boot configured is at TARGET_BAUD.
+        for b in [TARGET_BAUD, FACTORY_BAUD, ALT_FACTORY_BAUD] {
+            assert!(CANDIDATE_BAUDS.contains(&b), "{b} baud is no longer probed");
+        }
+    }
+
+
+    // ---- CFG-VALSET (M9/M10 configuration interface) ----
+
+    #[test]
+    fn key_ids_declare_the_widths_the_datasheet_gives_them() {
+        // Bits 30..28 of a key ID are its value width (section 4,
+        // "Configuration Key ID"). Every key below was read off the M10
+        // SPG 5.10 interface description; if one is mistyped the width
+        // almost always changes with it, so this catches transcription
+        // errors that would otherwise show up as a NAKed frame.
+        assert_eq!(cfg::key_value_len(cfg::KEY_RATE_MEAS), 2, "CFG-RATE-MEAS is U2");
+        assert_eq!(cfg::key_value_len(cfg::KEY_RATE_NAV), 2, "CFG-RATE-NAV is U2");
+        assert_eq!(
+            cfg::key_value_len(cfg::KEY_MSGOUT_NAV_PVT_UART1), 1,
+            "CFG-MSGOUT-UBX_NAV_PVT_UART1 is U1",
+        );
+        assert_eq!(
+            cfg::key_value_len(cfg::KEY_UART1_BAUDRATE), 4,
+            "CFG-UART1-BAUDRATE is U4",
+        );
+        // L (single bit) still occupies a whole byte on the wire.
+        assert_eq!(cfg::key_value_len(cfg::KEY_UART1_OUTPROT_UBX), 1);
+        assert_eq!(cfg::key_value_len(cfg::KEY_UART1_OUTPROT_NMEA), 1);
+        // Reserved size codes are refused, not guessed at.
+        assert_eq!(cfg::key_value_len(0x0000_0001), 0);
+        assert_eq!(cfg::key_value_len(0x6000_0001), 0);
+    }
+
+    #[test]
+    fn valset_rate_frame_is_byte_exact() {
+        // The frame that fixes the 1 Hz M10. Built by hand from section
+        // 3.10.5: version, layers, two reserved bytes, then key/value
+        // pairs concatenated with NO padding, every field little-endian.
+        let mut out = [0u8; 64];
+        let n = cfg::valset(
+            &mut out,
+            cfg::LAYER_RAM,
+            &[
+                (cfg::KEY_RATE_MEAS, NAV_RATE_MS as u64),
+                (cfg::KEY_RATE_NAV, 1),
+                (cfg::KEY_MSGOUT_NAV_PVT_UART1, 1),
+            ],
+        );
+
+        let expect: [u8; 29] = [
+            0xB5, 0x62, // sync
+            0x06, 0x8A, // CFG-VALSET
+            21, 0x00,   // payload length
+            0x00,       // version
+            0x01,       // layers = RAM
+            0x00, 0x00, // reserved
+            0x01, 0x00, 0x21, 0x30, 0x64, 0x00, // CFG-RATE-MEAS = 100 ms
+            0x02, 0x00, 0x21, 0x30, 0x01, 0x00, // CFG-RATE-NAV = 1
+            0x07, 0x00, 0x91, 0x20, 0x01,       // NAV-PVT on UART1 = 1
+            0x00, 0x00, // checksum, filled below
+        ];
+        assert_eq!(n, expect.len(), "frame length");
+
+        let (ck_a, ck_b) = fletcher16(&out[2..n - 2]);
+        let mut want = expect;
+        want[27] = ck_a;
+        want[28] = ck_b;
+        assert_eq!(&out[..n], &want[..], "frame bytes");
+
+        // 100 ms measurement rate with 1 measurement per solution is the
+        // 10 Hz this whole exercise is for.
+        assert_eq!(NAV_RATE_MS, 100);
+    }
+
+    #[test]
+    fn valset_truncates_each_value_to_its_keys_width() {
+        // A U1 key must emit one byte even though the value is a u64.
+        // Emitting eight would shift every following pair and void the
+        // frame -- and the receiver reports that as a single NAK with no
+        // indication of which pair was wrong.
+        let mut out = [0u8; 64];
+        let n = cfg::valset(&mut out, cfg::LAYER_RAM, &[(cfg::KEY_MSGOUT_NAV_PVT_UART1, 0xFFFF_FFFF_FFFF_FF01)]);
+        assert_eq!(n, 8 + 4 + 4 + 1, "header + framing + key + one value byte");
+        // Frame is sync(2) + class/id/len(4) + payload; the payload opens
+        // with version/layers/reserved(4) then the 4-byte key, so the
+        // first value byte lands at index 14.
+        assert_eq!(&out[10..14], &cfg::KEY_MSGOUT_NAV_PVT_UART1.to_le_bytes(), "key");
+        assert_eq!(out[14], 0x01, "value truncated to its low byte");
+
+        // U4 key, four bytes, little-endian.
+        let n = cfg::valset(&mut out, cfg::LAYER_RAM, &[(cfg::KEY_UART1_BAUDRATE, 115_200)]);
+        assert_eq!(n, 8 + 4 + 4 + 4);
+        assert_eq!(&out[10..14], &cfg::KEY_UART1_BAUDRATE.to_le_bytes(), "key");
+        assert_eq!(&out[14..18], &115_200u32.to_le_bytes(), "value");
+    }
+
+    #[test]
+    fn valset_refuses_rather_than_emitting_a_bad_frame() {
+        let mut out = [0u8; 64];
+        // Unknown width code.
+        assert_eq!(cfg::valset(&mut out, cfg::LAYER_RAM, &[(0x0000_0001, 1)]), 0);
+        // Output buffer too small for the frame.
+        let mut small = [0u8; 8];
+        assert_eq!(cfg::valset(&mut small, cfg::LAYER_RAM, &[(cfg::KEY_RATE_MEAS, 100)]), 0);
+    }
+
+    #[test]
+    fn valset_frame_is_self_consistent_for_any_pair_list() {
+        // UbxParser deliberately signals only for NAV-PVT (see
+        // `MsgType`), so it cannot be used to validate an outgoing
+        // command frame. Check the two fields a receiver actually
+        // rejects on instead: the length must match the payload we
+        // wrote, and the checksum must cover class..payload inclusive.
+        let cases: [&[(u32, u64)]; 3] = [
+            &[(cfg::KEY_RATE_MEAS, 100)],
+            &[(cfg::KEY_RATE_MEAS, 100), (cfg::KEY_RATE_NAV, 1)],
+            &[
+                (cfg::KEY_UART1_BAUDRATE, 115_200),
+                (cfg::KEY_UART1_OUTPROT_UBX, 1),
+                (cfg::KEY_UART1_OUTPROT_NMEA, 0),
+            ],
+        ];
+
+        for pairs in cases {
+            let mut out = [0u8; 64];
+            let n = cfg::valset(&mut out, cfg::LAYER_RAM, pairs);
+            assert!(n > 0, "frame failed to build");
+
+            assert_eq!(&out[..2], &[SYNC_1, SYNC_2]);
+            assert_eq!(out[2], 0x06, "class");
+            assert_eq!(out[3], 0x8A, "id");
+
+            let plen = u16::from_le_bytes([out[4], out[5]]) as usize;
+            // 4 bytes of version/layers/reserved, then each pair is its
+            // 4-byte key plus the width that key declares.
+            let want: usize = 4 + pairs
+                .iter()
+                .map(|&(k, _)| 4 + cfg::key_value_len(k))
+                .sum::<usize>();
+            assert_eq!(plen, want, "length field disagrees with the payload");
+            assert_eq!(n, 6 + plen + 2, "frame length");
+
+            let (ck_a, ck_b) = fletcher16(&out[2..n - 2]);
+            assert_eq!((ck_a, ck_b), (out[n - 2], out[n - 1]), "checksum");
+        }
+    }
+
+    #[test]
+    fn layer_is_ram_only() {
+        // Flash would persist across boots, which this driver explicitly
+        // does not want: it configures every boot instead, so a module is
+        // never half-remembering a previous firmware's settings.
+        assert_eq!(cfg::LAYER_RAM, 0x01);
+        assert_eq!(cfg::LAYER_RAM & 0x04, 0, "flash layer bit must not be set");
     }
 
     #[test]

@@ -170,7 +170,7 @@ impl Lis2mdl {
                 i16::from_le_bytes([buf[4], buf[5]]),
             ],
             SENS_UT_PER_LSB,
-            self.orientation.sign(),
+            self.orientation,
         ))
     }
 
@@ -236,25 +236,8 @@ mod tests {
     }
 
     #[test]
-    fn orientation_signs_unit_magnitude() {
-        for o in [
-            Orientation::Identity,
-            Orientation::Roll180,
-            Orientation::Pitch180,
-            Orientation::Yaw180,
-        ] {
-            for s in o.sign() {
-                assert_eq!(s.abs(), 1.0);
-            }
-        }
-    }
-
-    #[test]
-    fn sample_applies_orientation_sign() {
-        let s = MagSample {
-            raw: [100, 200, 300],
-            sign: Orientation::Roll180.sign(),
-        };
+    fn sample_applies_orientation() {
+        let s = MagSample::new([100, 200, 300], SENS_UT_PER_LSB, Orientation::Roll180);
         let ut = s.ut();
         assert!((ut[0] - 100.0 * SENS_UT_PER_LSB).abs() < 1e-6);
         assert!((ut[1] + 200.0 * SENS_UT_PER_LSB).abs() < 1e-6);

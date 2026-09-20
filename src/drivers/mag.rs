@@ -22,24 +22,22 @@
 
 /// How a magnetometer is mounted relative to the FC body frame (NED).
 ///
-/// Same shape as the IMU drivers so downstream fusion code does not need
-/// to special-case the magnetometer.
-///
-/// These are sign flips, not general rotations: they cover a part
-/// soldered flat in one of four yaw/flip positions, which is every case
-/// on this airframe so far. A 90-degree yaw mount would need an axis
-/// SWAP and is deliberately not expressible here -- better a missing
-/// variant than one that silently drops a component.
+/// Covers a part soldered flat in any of the eight yaw/flip positions:
+/// four 90-degree yaw steps, each either upright or flipped. That is the
+/// whole set of mountings for a board-mounted sensor whose Z axis is
+/// vertical, which is every case on this airframe.
 ///
 /// # Completeness
 ///
-/// The four variants are not an arbitrary selection: they are EVERY
-/// diagonal sign matrix with determinant +1, and there are exactly four
-/// (of the eight sign combinations, the four with an odd number of
-/// negations are mirrors, not rotations). So no fifth sign-flip variant
-/// can be added, and the set is closed under composition -- combining
-/// any two always lands on a third. Both facts are pinned by the tests
-/// below.
+/// These eight are a GROUP: the rotations that map the vertical axis to
+/// plus or minus itself, closed under composition, every one a proper
+/// rotation (determinant +1, never a mirror). Both facts are pinned by
+/// the tests below, and closure is what lets "turn it round, then flip
+/// it" resolve to a single variant instead of needing a new one.
+///
+/// A mounting NOT in this set -- a sensor tipped onto its side, or at
+/// 45 degrees -- is deliberately not expressible. Better a missing
+/// variant than one that silently drops a component.
 ///
 /// # Mapping from Betaflight / configurator alignment names
 ///
@@ -47,40 +45,90 @@
 /// rotations**, stated in `sensor_alignment.h` as
 /// `CW0_DEG_FLIP = 5, // _FLIP = 2x90 degree PITCH rotations`. It is not
 /// a roll, so the composition does not come out where the name suggests:
+/// `CW180FLIP` is `Roll180`, NOT `Pitch180`.
 ///
-/// | Betaflight  | = pitch x yaw   | this enum |
-/// |-------------|-----------------|-----------|
-/// | `CW0`       | --              | `Identity`|
-/// | `CW180`     | yaw 180         | `Yaw180`  |
-/// | `CW0FLIP`   | pitch 180       | `Pitch180`|
-/// | `CW180FLIP` | pitch 180 + yaw 180 | `Roll180` |
+/// | Betaflight  | = pitch x yaw       | this enum    | body axes        |
+/// |-------------|---------------------|--------------|------------------|
+/// | `CW0`       | --                  | `Identity`   | +x, +y, +z       |
+/// | `CW90`      | yaw 90              | `Yaw90`      | -y, +x, +z       |
+/// | `CW180`     | yaw 180             | `Yaw180`     | -x, -y, +z       |
+/// | `CW270`     | yaw 270             | `Yaw270`     | +y, -x, +z       |
+/// | `CW0FLIP`   | pitch 180           | `Pitch180`   | -x, +y, -z       |
+/// | `CW90FLIP`  | pitch 180 + yaw 90  | `Yaw90Flip`  | +y, +x, -z       |
+/// | `CW180FLIP` | pitch 180 + yaw 180 | `Roll180`    | +x, -y, -z       |
+/// | `CW270FLIP` | pitch 180 + yaw 270 | `Yaw270Flip` | -y, -x, -z       |
 ///
-/// `CW180FLIP` is `Roll180`, NOT `Pitch180` -- flipping a part over and
-/// then turning it around leaves X alone and negates Y and Z. The other
-/// four Betaflight alignments (`CW90`, `CW270`, and their FLIPs) are the
-/// axis-swap cases above and have no variant here.
+/// The four names that are not `YawNN` are the ones that predate the
+/// 90-degree variants and are kept because they are what the mounting
+/// constants elsewhere already say.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "firmware", derive(defmt::Format))]
 pub enum Orientation {
-    /// No axis flips — sensor frame == body frame (NED).
+    /// No change — sensor frame == body frame (NED). Betaflight `CW0`.
     Identity,
-    /// Roll 180°: X → +X, Y → −Y, Z → −Z.
-    Roll180,
-    /// Pitch 180°: X → −X, Y → +Y, Z → −Z.
-    Pitch180,
-    /// Yaw 180°: X → −X, Y → −Y, Z → +Z.
+    /// Yaw 90°: X → −Y, Y → +X, Z → +Z. Betaflight `CW90`.
+    Yaw90,
+    /// Yaw 180°: X → −X, Y → −Y, Z → +Z. Betaflight `CW180`.
     Yaw180,
+    /// Yaw 270°: X → +Y, Y → −X, Z → +Z. Betaflight `CW270`.
+    Yaw270,
+    /// Pitch 180°: X → −X, Y → +Y, Z → −Z. Betaflight `CW0FLIP`.
+    Pitch180,
+    /// Flipped, then yawed 90°: X → +Y, Y → +X, Z → −Z. `CW90FLIP`.
+    Yaw90Flip,
+    /// Roll 180°: X → +X, Y → −Y, Z → −Z. Betaflight `CW180FLIP`.
+    Roll180,
+    /// Flipped, then yawed 270°: X → −Y, Y → −X, Z → −Z. `CW270FLIP`.
+    Yaw270Flip,
 }
 
 impl Orientation {
-    pub const fn sign(self) -> [f32; 3] {
+    /// Rotate a sensor-frame vector into the FC body frame.
+    ///
+    /// Four of the eight are pure sign flips; the other four also SWAP
+    /// the X and Y axes, which is why this cannot be a `[f32; 3]` of
+    /// signs the way it was before the 90-degree mountings existed. Any
+    /// code that multiplies a stored sign vector component-wise is
+    /// therefore wrong for half the variants -- go through this instead.
+    pub const fn apply(self, v: [f32; 3]) -> [f32; 3] {
+        let [x, y, z] = v;
         match self {
-            Self::Identity => [1.0, 1.0, 1.0],
-            Self::Roll180 => [1.0, -1.0, -1.0],
-            Self::Pitch180 => [-1.0, 1.0, -1.0],
-            Self::Yaw180 => [-1.0, -1.0, 1.0],
+            Self::Identity => [x, y, z],
+            Self::Yaw90 => [-y, x, z],
+            Self::Yaw180 => [-x, -y, z],
+            Self::Yaw270 => [y, -x, z],
+            Self::Pitch180 => [-x, y, -z],
+            Self::Yaw90Flip => [y, x, -z],
+            Self::Roll180 => [x, -y, -z],
+            Self::Yaw270Flip => [-y, -x, -z],
         }
     }
+
+    /// True if this mounting swaps X and Y rather than only negating.
+    ///
+    /// Diagnostic and test support: the four swapping variants are
+    /// exactly the odd multiples of 90 degrees of yaw, and they are the
+    /// ones a sign-vector representation cannot express.
+    #[allow(dead_code)] // test and bring-up support; no flight-path caller yet
+    pub const fn swaps_xy(self) -> bool {
+        matches!(
+            self,
+            Self::Yaw90 | Self::Yaw270 | Self::Yaw90Flip | Self::Yaw270Flip
+        )
+    }
+
+    /// Every variant, for exhaustive checks.
+    #[allow(dead_code)] // consumed by the exhaustive tests below
+    pub const ALL: [Self; 8] = [
+        Self::Identity,
+        Self::Yaw90,
+        Self::Yaw180,
+        Self::Yaw270,
+        Self::Pitch180,
+        Self::Yaw90Flip,
+        Self::Roll180,
+        Self::Yaw270Flip,
+    ];
 }
 
 /// One magnetometer reading, chip-agnostic.
@@ -91,23 +139,21 @@ pub struct MagSample {
     pub raw: [i16; 3],
     /// Microtesla per count for the range the chip is configured in.
     scale_ut_per_lsb: f32,
-    /// Body-frame sign flips from `Orientation`.
-    sign: [f32; 3],
+    /// How the part is mounted. Stored rather than pre-resolved into a
+    /// sign vector, because the 90-degree mountings swap axes and a sign
+    /// vector cannot represent that.
+    orientation: Orientation,
 }
 
 impl MagSample {
-    pub const fn new(raw: [i16; 3], scale_ut_per_lsb: f32, sign: [f32; 3]) -> Self {
-        Self { raw, scale_ut_per_lsb, sign }
+    pub const fn new(raw: [i16; 3], scale_ut_per_lsb: f32, orientation: Orientation) -> Self {
+        Self { raw, scale_ut_per_lsb, orientation }
     }
 
     /// Field in microtesla, rotated into FC body frame (NED). This is
     /// what the estimator and the calibrator consume.
     pub fn ut(&self) -> [f32; 3] {
-        [
-            self.raw[0] as f32 * self.scale_ut_per_lsb * self.sign[0],
-            self.raw[1] as f32 * self.scale_ut_per_lsb * self.sign[1],
-            self.raw[2] as f32 * self.scale_ut_per_lsb * self.sign[2],
-        ]
+        self.orientation.apply(self.ut_sensor())
     }
 
     /// Field in mgauss, body frame. 1 uT = 10 mgauss.
@@ -194,13 +240,34 @@ pub const fn describe_addr(addr: u8) -> &'static str {
 mod tests {
     use super::*;
 
+    /// The 3x3 matrix of a transform, as columns: column j is where the
+    /// j-th basis vector lands.
+    fn matrix(f: impl Fn([f32; 3]) -> [f32; 3]) -> [[f32; 3]; 3] {
+        [
+            f([1.0, 0.0, 0.0]),
+            f([0.0, 1.0, 0.0]),
+            f([0.0, 0.0, 1.0]),
+        ]
+    }
+
+    fn matrix_of(o: Orientation) -> [[f32; 3]; 3] {
+        matrix(|v| o.apply(v))
+    }
+
+    /// det of a matrix given as three columns: c0 . (c1 x c2).
+    fn det(m: [[f32; 3]; 3]) -> f32 {
+        let [a, b, c] = m;
+        a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
+            + a[2] * (b[0] * c[1] - b[1] * c[0])
+    }
+
     /// Earth's field is 25-65 uT. A driver that gets the scale wrong by
     /// the usual factor (gauss for tesla, or the wrong range) lands
     /// orders of magnitude outside that, so pinning the arithmetic here
     /// is worth more than it looks.
     #[test]
     fn scale_is_applied_per_axis() {
-        let s = MagSample::new([100, -200, 300], 0.1, [1.0, 1.0, 1.0]);
+        let s = MagSample::new([100, -200, 300], 0.1, Orientation::Identity);
         let ut = s.ut();
         assert!((ut[0] - 10.0).abs() < 1e-6);
         assert!((ut[1] + 20.0).abs() < 1e-6);
@@ -208,88 +275,89 @@ mod tests {
     }
 
     #[test]
-    fn orientation_flips_the_right_axes() {
+    fn orientation_reaches_the_sample() {
         let raw = [100, 200, 300];
-        let ident = MagSample::new(raw, 1.0, Orientation::Identity.sign()).ut();
-        let roll = MagSample::new(raw, 1.0, Orientation::Roll180.sign()).ut();
+        let ident = MagSample::new(raw, 1.0, Orientation::Identity).ut();
+        let roll = MagSample::new(raw, 1.0, Orientation::Roll180).ut();
+        let yaw90 = MagSample::new(raw, 1.0, Orientation::Yaw90).ut();
         assert_eq!(ident, [100.0, 200.0, 300.0]);
         assert_eq!(roll, [100.0, -200.0, -300.0]);
+        // The swap has to survive the trip through MagSample, which is
+        // the thing a stored sign vector silently could not do.
+        assert_eq!(yaw90, [-200.0, 100.0, 300.0]);
     }
 
     #[test]
-    fn every_orientation_is_a_pure_reflection_pair() {
-        // Each variant must flip exactly two axes: those are the 180 deg
-        // rotations. Flipping one or three is a MIRROR, which would turn
+    fn the_betaflight_alignment_table_is_what_the_docs_claim() {
+        // Betaflight's FLIP is 2x90 degrees of PITCH (sensor_alignment.h:
+        // "CW0_DEG_FLIP = 5, // _FLIP = 2x90 degree PITCH rotations"), so
+        // every FLIP row is pitch 180 composed with that row's yaw.
+        // Reading FLIP as a roll swaps CW0FLIP and CW180FLIP.
+        let v = [2.0, 3.0, 5.0];
+        let [x, y, z] = v;
+        for (o, want, name) in [
+            (Orientation::Identity, [x, y, z], "CW0"),
+            (Orientation::Yaw90, [-y, x, z], "CW90"),
+            (Orientation::Yaw180, [-x, -y, z], "CW180"),
+            (Orientation::Yaw270, [y, -x, z], "CW270"),
+            (Orientation::Pitch180, [-x, y, -z], "CW0FLIP"),
+            (Orientation::Yaw90Flip, [y, x, -z], "CW90FLIP"),
+            (Orientation::Roll180, [x, -y, -z], "CW180FLIP"),
+            (Orientation::Yaw270Flip, [-y, -x, -z], "CW270FLIP"),
+        ] {
+            assert_eq!(o.apply(v), want, "{name} ({o:?})");
+        }
+
+        // The specific confusion worth a standing test: CW180FLIP is
+        // pitch 180 THEN yaw 180, and that composes to Roll180.
+        let cw180flip = matrix(|v| Orientation::Pitch180.apply(Orientation::Yaw180.apply(v)));
+        assert_eq!(cw180flip, matrix_of(Orientation::Roll180));
+        assert_ne!(cw180flip, matrix_of(Orientation::Pitch180));
+    }
+
+    #[test]
+    fn every_orientation_is_a_proper_rotation() {
+        // Determinant +1. A determinant of -1 is a MIRROR: it would turn
         // a right-handed frame left-handed and invert the sense of yaw
         // without changing the field magnitude -- silent, and exactly the
         // class of bug this project keeps finding.
-        for o in [
-            Orientation::Identity,
-            Orientation::Roll180,
-            Orientation::Pitch180,
-            Orientation::Yaw180,
-        ] {
-            let s = o.sign();
-            let det = s[0] * s[1] * s[2];
-            assert!((det - 1.0).abs() < 1e-6, "{o:?} has determinant {det}, not +1");
+        for o in Orientation::ALL {
+            let d = det(matrix_of(o));
+            assert!((d - 1.0).abs() < 1e-6, "{o:?} has determinant {d}, not +1");
         }
     }
 
-    /// Compose two orientations by multiplying their sign vectors --
-    /// valid because every variant is diagonal, so the matrix product is
-    /// just the elementwise product.
-    fn compose(a: Orientation, b: Orientation) -> [f32; 3] {
-        let (x, y) = (a.sign(), b.sign());
-        [x[0] * y[0], x[1] * y[1], x[2] * y[2]]
-    }
-
-    const ALL: [Orientation; 4] = [
-        Orientation::Identity,
-        Orientation::Roll180,
-        Orientation::Pitch180,
-        Orientation::Yaw180,
-    ];
-
     #[test]
-    fn betaflight_cw180flip_is_roll180_not_pitch180() {
-        // Betaflight's FLIP is 2x90 degrees of PITCH (sensor_alignment.h:
-        // "CW0_DEG_FLIP = 5, // _FLIP = 2x90 degree PITCH rotations"), so
-        // CW180FLIP = pitch 180 composed with yaw 180. Reading "FLIP" as
-        // a roll gives Pitch180 instead -- which negates X rather than
-        // leaving it alone, mirroring heading about the wrong axis.
-        let cw180flip = compose(Orientation::Pitch180, Orientation::Yaw180);
-        assert_eq!(cw180flip, Orientation::Roll180.sign());
-        assert_ne!(cw180flip, Orientation::Pitch180.sign());
-
-        // The rest of the diagonal half of the Betaflight table.
-        assert_eq!(Orientation::Identity.sign(), [1.0, 1.0, 1.0]); // CW0
-        assert_eq!(Orientation::Yaw180.sign(), [-1.0, -1.0, 1.0]); // CW180
-        assert_eq!(Orientation::Pitch180.sign(), [-1.0, 1.0, -1.0]); // CW0FLIP
-    }
-
-    #[test]
-    fn the_four_variants_are_closed_under_composition() {
-        // This is what makes "CW180 and then flip it" expressible without
-        // a new variant: any two of these compose to a third, so a stack
-        // of mountings collapses back into the enum.
-        for a in ALL {
-            for b in ALL {
-                let c = compose(a, b);
+    fn the_variants_are_closed_under_composition() {
+        // This is what makes "turn it round, then flip it" expressible
+        // without a new variant: any two of these compose to a third, so
+        // a stack of mountings collapses back into the enum.
+        for a in Orientation::ALL {
+            for b in Orientation::ALL {
+                let c = matrix(|v| a.apply(b.apply(v)));
                 assert!(
-                    ALL.iter().any(|o| o.sign() == c),
-                    "{a:?} * {b:?} = {c:?} escaped the enum",
+                    Orientation::ALL.iter().any(|&o| matrix_of(o) == c),
+                    "{a:?} * {b:?} escaped the enum",
                 );
             }
         }
     }
 
     #[test]
-    fn the_enum_is_every_proper_sign_flip_there_is() {
-        // Eight sign combinations exist; the four with determinant +1 are
-        // rotations and the four with -1 are mirrors. If all four proper
-        // ones are present, the enum cannot be extended with another
-        // sign-flip variant -- anything missing is necessarily an axis
-        // SWAP, which this type deliberately cannot express.
+    fn all_eight_are_distinct() {
+        for (i, &a) in Orientation::ALL.iter().enumerate() {
+            for &b in &Orientation::ALL[i + 1..] {
+                assert_ne!(matrix_of(a), matrix_of(b), "{a:?} and {b:?} are the same rotation");
+            }
+        }
+    }
+
+    #[test]
+    fn the_sign_flip_variants_are_the_complete_diagonal_set() {
+        // Of the eight sign combinations, the four with determinant +1
+        // are rotations and the four with -1 are mirrors. All four proper
+        // ones must have a variant -- anything missing would be a
+        // mounting we could not express with signs alone.
         let mut found = 0;
         for sx in [1.0f32, -1.0] {
             for sy in [1.0f32, -1.0] {
@@ -297,8 +365,9 @@ mod tests {
                     if sx * sy * sz < 0.0 {
                         continue; // mirror, not a rotation
                     }
+                    let want = [[sx, 0.0, 0.0], [0.0, sy, 0.0], [0.0, 0.0, sz]];
                     assert!(
-                        ALL.iter().any(|o| o.sign() == [sx, sy, sz]),
+                        Orientation::ALL.iter().any(|&o| matrix_of(o) == want),
                         "proper sign flip [{sx}, {sy}, {sz}] has no variant",
                     );
                     found += 1;
@@ -306,23 +375,57 @@ mod tests {
             }
         }
         assert_eq!(found, 4);
-        assert_eq!(ALL.len(), 4);
+    }
+
+    #[test]
+    fn exactly_the_odd_yaw_steps_swap_xy() {
+        // The swapping half is what a `[f32; 3]` of signs cannot encode,
+        // and the reason `MagSample` stores the Orientation itself.
+        for o in Orientation::ALL {
+            let m = matrix_of(o);
+            // X survives as X (up to sign) iff there is no swap.
+            let diagonal = m[0][1] == 0.0 && m[1][0] == 0.0;
+            assert_eq!(!diagonal, o.swaps_xy(), "{o:?}");
+        }
+        assert_eq!(
+            Orientation::ALL.iter().filter(|o| o.swaps_xy()).count(),
+            4,
+        );
     }
 
     #[test]
     fn magnitude_ignores_mounting() {
+        // Frame-independent: the sign flips and swaps are orthogonal, so
+        // magnitude reads the same whichever mounting is applied. That is
+        // why it is the right sanity check for "is this plausible".
         let raw = [300, -400, 0];
-        let a = MagSample::new(raw, 0.1, Orientation::Identity.sign());
-        let b = MagSample::new(raw, 0.1, Orientation::Yaw180.sign());
+        let base = MagSample::new(raw, 0.1, Orientation::Identity);
         // 3-4-5 triangle: 500 counts * 0.1 = 50.0 uT.
-        assert!((a.magnitude_ut() - 50.0).abs() < 1e-4);
-        assert!((a.magnitude_ut() - b.magnitude_ut()).abs() < 1e-6);
+        assert!((base.magnitude_ut() - 50.0).abs() < 1e-4);
+        for o in Orientation::ALL {
+            let s = MagSample::new(raw, 0.1, o);
+            assert!(
+                (s.magnitude_ut() - base.magnitude_ut()).abs() < 1e-6,
+                "{o:?} changed the magnitude",
+            );
+        }
     }
 
     #[test]
     fn mgauss_is_ten_times_microtesla() {
-        let s = MagSample::new([1000, 0, 0], 0.05, Orientation::Identity.sign());
+        let s = MagSample::new([1000, 0, 0], 0.05, Orientation::Identity);
         assert!((s.ut()[0] - 50.0).abs() < 1e-6);
         assert!((s.mgauss()[0] - 500.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn ut_sensor_ignores_mounting() {
+        // Calibration works in the sensor frame, so this must NOT have
+        // the mounting applied -- applying it twice is the failure.
+        let raw = [100, 200, 300];
+        for o in Orientation::ALL {
+            let s = MagSample::new(raw, 0.5, o);
+            assert_eq!(s.ut_sensor(), [50.0, 100.0, 150.0], "{o:?}");
+        }
     }
 }

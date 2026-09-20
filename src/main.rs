@@ -149,7 +149,7 @@ use drivers::qmc5883p::Qmc5883p;
 use drivers::dshot_bitbang::DshotBitbang;
 use drivers::dshot_frame::DshotFrame;
 use drivers::icm42688::RawImu;
-use drivers::nmea::{FixMode, GpsData, NmeaParser};
+use drivers::nmea::{GpsData, NmeaParser};
 use drivers::wt901b::{
     ImuData, UPDATED_ACCEL, UPDATED_ANGLE, UPDATED_GYRO, UPDATED_QUAT,
 };
@@ -713,19 +713,25 @@ async fn blink_task(mut led: embassy_stm32::gpio::Output<'static>) {
 /// heading, and correct it here.
 const IST8310_SE100_ORIENTATION: MagOrientation = MagOrientation::Roll180;
 
-/// QMC5883P mounting: compass facing up, module cable running aft.
+/// QMC5883P mounting, as set from bench readings on 2026-09-19.
 ///
-/// That is Betaflight's CW180FLIP, which is `Roll180` here -- FLIP is two
-/// 90-degree PITCH rotations, so CW180FLIP composes to X -> +X, Y -> -Y,
-/// Z -> -Z. See the mapping table on `mag::Orientation`; reading FLIP as
-/// a roll would give `Pitch180`, which negates the wrong axis.
+/// The module is ALSO physically rotated 90 degrees right from its
+/// intended orientation (compass up, cable aft), because the chip sits
+/// at 90 degrees to the module housing: heading read consistently ~90
+/// degrees west of truth with the module mounted straight. This constant
+/// therefore describes the mounting only in combination with that
+/// physical rotation, not on its own.
 ///
-/// UNVERIFIED on the bench. This is the intended mounting, not a measured
-/// one, and it assumes the chip's own axes are aligned with the module
-/// housing. A wrong value here does not degrade yaw, it inverts or
-/// mirrors it -- confirm with a level heading test before trusting
-/// heading, and correct it here.
-const QMC5883P_ORIENTATION: MagOrientation = MagOrientation::Roll180;
+/// `mag::Orientation` can now express 90-degree yaw steps (`Yaw90`,
+/// `Yaw270`, and their flips), so the physical rotation can be undone in
+/// firmware instead: mount the module straight and compose this value
+/// with the appropriate yaw step. The enum is closed under composition,
+/// so the result is always another single variant.
+///
+/// Still not confirmed against a full level heading sweep -- the value
+/// was set from a consistent offset, not a per-axis check. A wrong value
+/// here does not degrade yaw, it inverts or mirrors it.
+const QMC5883P_ORIENTATION: MagOrientation = MagOrientation::Pitch180;
 
 /// Whichever magnetometer is actually fitted.
 ///
@@ -1082,9 +1088,17 @@ async fn gps_task(
     defmt::info!("GPS task started (UBX preferred, NMEA fallback)");
 
     loop {
-        match rx.read(&mut buf).await {
-            Ok(()) => {
-                for &byte in &buf {
+        // read_until_idle, not read: `read` completes only when all 128
+        // bytes have arrived, so it holds a finished NAV-PVT hostage
+        // until enough of the NEXT one turns up, and the bytes that
+        // arrive between one transfer completing and the next being
+        // armed are lost outright. At 10 Hz a 100-byte NAV-PVT does not
+        // fill this buffer, so every frame would straddle that gap and
+        // some would fail checksum. Idle-line detection returns each
+        // burst whole, which is what the parsers need.
+        match rx.read_until_idle(&mut buf).await {
+            Ok(n) => {
+                for &byte in &buf[..n] {
                     // UBX first. A NAV-PVT carries everything the four
                     // NMEA sentences carry between them, so when one
                     // lands it publishes a complete record on its own.
@@ -1782,6 +1796,14 @@ async fn pos_kf_task() {
     // also caps the per-fuse R-matrix scale below.
     const MIN_SATS: u8 = 4;
     const HDOP_THRESH: f32 = 2.5;
+    // Velocity gate, in the receiver's own units. NAV-PVT's sAcc is a
+    // direct 1σ ground-speed estimate, which beats inferring velocity
+    // quality from satellite geometry -- DOP cannot see multipath or
+    // interference. 1.0 m/s is generous: a healthy consumer module
+    // reports 0.05-0.2 m/s, and anything approaching 1 m/s is a solution
+    // that should not be steering the filter. Falls back to the DOP gate
+    // on the NMEA path, which reports no accuracy at all.
+    const MAX_S_ACC_MS: f32 = 1.0;
     // Home-latch streak: require this many consecutive lat/lon-fresh
     // good fixes before latching home. Three is enough to dodge the
     // single-fix cold-start glitches some modules emit when they
@@ -1905,7 +1927,9 @@ async fn pos_kf_task() {
         // ---- GPS update (sensor-driven) ----
         //
         // Single-stage HDOP gate: a fix must clear FIX3D / MIN_SATS /
-        // HDOP_THRESH to be considered. Home latches against the third
+        // HDOP_THRESH (`GpsData::fix_quality_ok`) to be considered, and
+        // that applies to the VELOCITY path as well as position -- see
+        // the note on that gate below. Home latches against the third
         // consecutive lat/lon-fresh good fix; from that point every
         // good lat/lon-fresh fix fuses as `update_gps_scaled`, with
         // σ_h / σ_v scaled by the fix's HDOP so each measurement
@@ -1919,10 +1943,7 @@ async fn pos_kf_task() {
             last_gps = Some(gps);
             gps_signals_sec = gps_signals_sec.wrapping_add(1);
 
-            let good_fix = gps.fix_mode == FixMode::Fix3D
-                && gps.satellites >= MIN_SATS
-                && gps.hdop > 0.0
-                && gps.hdop < HDOP_THRESH;
+            let good_fix = gps.fix_quality_ok(MIN_SATS, HDOP_THRESH);
 
             let pos_fresh =
                 gps.latitude != last_fused_lat || gps.longitude != last_fused_lon;
@@ -1999,7 +2020,22 @@ async fn pos_kf_task() {
             // stationary but only once per fresh sample.
             let vel_fresh = gps.ground_speed_ms != last_fused_speed
                 || gps.course_deg != last_fused_course;
-            if vel_fresh && gps.fix_mode != FixMode::NoFix && gps.satellites >= 3 {
+            // Velocity has its own gate, on the receiver's own sAcc.
+            //
+            // This gate used to be `fix_mode != NoFix && satellites >= 3`
+            // with NO DOP check, while the position path required Fix3D,
+            // MIN_SATS and HDOP_THRESH. That asymmetry is what let a
+            // searching receiver drive the estimate: `update_gps_velocity`
+            // builds a 6x2 gain, so it corrects the POSITION states too
+            // through the cross-covariance, and `predict` integrates the
+            // velocity state into position every tick. Before the home
+            // latch there is no position fusion to pull any of that back,
+            // so the error is unbounded.
+            //
+            // Velocity fusion still runs independently of `home_latched`,
+            // which is correct: NED velocity needs no local origin. It is
+            // the quality bar that had to match, not the latch.
+            if vel_fresh && gps.velocity_quality_ok(MIN_SATS, MAX_S_ACC_MS, HDOP_THRESH) {
                 let (vn, ve) = if gps.ground_speed_ms < 0.3 {
                     (0.0, 0.0)
                 } else {
@@ -2009,7 +2045,14 @@ async fn pos_kf_task() {
                         gps.ground_speed_ms * libm::sinf(crs),
                     )
                 };
-                kf.update_gps_velocity(vn, ve);
+                // σ from the receiver's sAcc where it exists, clamped so
+                // an optimistic estimate cannot let one fix dominate and
+                // an accepted fix always retains some influence.
+                let sigma_v = gps.velocity_sigma_ms(
+                    PosKf::SIGMA_GPS_VEL_DEFAULT,
+                    MAX_S_ACC_MS,
+                );
+                kf.update_gps_velocity_scaled(vn, ve, sigma_v);
                 // Differentiate the same velocity for the attitude
                 // estimator. dt is measured, not assumed: NMEA fixes are
                 // nominally 10 Hz but arrive when they arrive.
@@ -2069,12 +2112,7 @@ async fn pos_kf_task() {
             // Re-anchor home to current GPS fix if it's healthy. If GPS
             // isn't usable we leave home where it was (either pre-arm
             // provisional or unset).
-            if let Some(gps) = last_gps.filter(|g| {
-                g.fix_mode == FixMode::Fix3D
-                    && g.satellites >= MIN_SATS
-                    && g.hdop > 0.0
-                    && g.hdop < HDOP_THRESH
-            }) {
+            if let Some(gps) = last_gps.filter(|g| g.fix_quality_ok(MIN_SATS, HDOP_THRESH)) {
                 home_lat = gps.latitude;
                 home_lon = gps.longitude;
                 home_alt_msl = gps.altitude_m;

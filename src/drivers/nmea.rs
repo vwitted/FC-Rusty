@@ -17,6 +17,8 @@
 // Checksum: XOR of all bytes between '$' and '*' (exclusive).
 
 /// Maximum NMEA sentence length (spec says 82 chars max including $, *, checksum, \r\n)
+use core::Option;
+
 const MAX_SENTENCE_LEN: usize = 83;
 
 /// GPS fix quality (from GGA sentence).
@@ -108,6 +110,21 @@ pub struct GpsData {
     /// Vertical dilution of precision (from GSA)
     pub vdop: f32,
 
+    // ---- Reported accuracy (UBX only) ----
+    //
+    // `None` on the NMEA path: NMEA has no accuracy sentence, and an
+    // absent estimate must not read as a good one. A receiver's own 1σ
+    // estimate is a far better fusion gate than DOP, which describes
+    // satellite GEOMETRY and says nothing about multipath, interference
+    // or signal strength -- a receiver can report a textbook DOP while
+    // its velocity solution is metres per second wrong.
+    /// Horizontal position accuracy, 1σ metres (UBX NAV-PVT hAcc).
+    pub h_acc_m: Option<f32>,
+    /// Vertical position accuracy, 1σ metres (UBX NAV-PVT vAcc).
+    pub v_acc_m: Option<f32>,
+    /// Ground-speed accuracy, 1σ m/s (UBX NAV-PVT sAcc).
+    pub s_acc_ms: Option<f32>,
+
     // ---- Time (from RMC) ----
     /// UTC time: hours (0-23)
     pub hour: u8,
@@ -145,6 +162,9 @@ impl GpsData {
             hdop: 99.9,
             pdop: 99.9,
             vdop: 99.9,
+            h_acc_m: Option::None,
+            v_acc_m: Option::None,
+            s_acc_ms: Option::None,
             hour: 0,
             minute: 0,
             second: 0,
@@ -154,6 +174,76 @@ impl GpsData {
     }
 
     /// Returns true if we have a valid fix (GGA reports fix + RMC active).
+    /// Is this fix good enough to fuse?
+    ///
+    /// One predicate, used by BOTH the position and the velocity paths in
+    /// `pos_kf_task`. It exists as a function rather than an inline
+    /// condition because having two copies is precisely how this went
+    /// wrong: commit 8788b2e added the DOP gate to the position/home-latch
+    /// path and left the velocity path on its original
+    /// `fix_mode != NoFix && satellites >= 3`, with no DOP check at all.
+    ///
+    /// That asymmetry is not harmless, because velocity fusion moves
+    /// POSITION. `PosKf::update_gps_velocity` builds a 6x2 gain, so
+    /// `x += K*y` corrects all six states -- the position states included
+    /// -- through the position/velocity cross-covariance, and `predict`
+    /// then integrates the velocity state into position on every tick.
+    /// So a fix that the position gate rejects could still drive the
+    /// position estimate through the velocity path, and before the home
+    /// latch there is no position fusion able to pull it back.
+    ///
+    /// `hdop > 0.0` rejects an absent or unparsed figure rather than
+    /// treating it as perfect. On the UBX path this field carries pDOP
+    /// (see `gps_adapt::ubx_to_nmea`), which is >= hDOP and therefore
+    /// errs toward rejecting fixes.
+    pub fn fix_quality_ok(&self, min_sats: u8, max_hdop: f32) -> bool {
+        self.fix_mode == FixMode::Fix3D
+            && self.satellites >= min_sats
+            && self.hdop > 0.0
+            && self.hdop < max_hdop
+    }
+
+    /// Is this fix's VELOCITY good enough to fuse?
+    ///
+    /// Velocity gets its own predicate because the receiver publishes a
+    /// direct 1σ estimate for it (`s_acc_ms`, UBX NAV-PVT sAcc) and that
+    /// is a strictly better test than DOP. DOP describes satellite
+    /// geometry; it does not see multipath, interference or weak signal,
+    /// so a receiver can report an excellent DOP while its Doppler
+    /// solution is badly wrong. sAcc is the receiver's own answer to the
+    /// question being asked.
+    ///
+    /// When sAcc is absent -- the NMEA path, which has no accuracy
+    /// sentence -- this falls back to the DOP gate. Absent is treated as
+    /// "unknown, use the weaker test", never as "good".
+    ///
+    /// The fix-type and satellite-count checks apply either way: sAcc is
+    /// meaningless without a solution behind it.
+    pub fn velocity_quality_ok(&self, min_sats: u8, max_s_acc: f32, max_hdop: f32) -> bool {
+        if self.fix_mode != FixMode::Fix3D || self.satellites < min_sats {
+            return false;
+        }
+        match self.s_acc_ms {
+            Some(s) => s >= 0.0 && s < max_s_acc,
+            None => self.hdop > 0.0 && self.hdop < max_hdop,
+        }
+    }
+
+    /// 1σ velocity noise to fuse this fix with, in m/s.
+    ///
+    /// Prefers the receiver's own sAcc over a fixed constant, clamped
+    /// into `[floor, ceiling]`. The floor stops an optimistic receiver
+    /// claiming a near-zero σ and letting one fix dominate the filter;
+    /// the ceiling is the gate threshold, so an accepted fix always has
+    /// some influence. `None` (NMEA) falls back to `floor`, which is the
+    /// behaviour that path already had.
+    pub fn velocity_sigma_ms(&self, floor: f32, ceiling: f32) -> f32 {
+        match self.s_acc_ms {
+            Some(s) if s.is_finite() => s.clamp(floor, ceiling),
+            _ => floor,
+        }
+    }
+
     pub fn has_fix(&self) -> bool {
         self.fix.has_fix() && self.rmc_valid
     }
@@ -896,4 +986,174 @@ mod tests {
         assert!((parse_f64(b"100").unwrap() - 100.0).abs() < 0.0001);
         assert!(parse_f64(b"").is_none());
     }
+
+    // ---- Fusion quality gate ----
+
+    fn good() -> GpsData {
+        let mut g = GpsData::new();
+        g.fix_mode = FixMode::Fix3D;
+        g.satellites = 9;
+        g.hdop = 1.2;
+        g
+    }
+
+    #[test]
+    fn a_healthy_fix_passes_the_gate() {
+        assert!(good().fix_quality_ok(4, 2.5));
+    }
+
+    #[test]
+    fn a_searching_receiver_is_rejected_on_every_axis() {
+        // These are the states a receiver passes through on its way to a
+        // fix. Each one used to reach the velocity path, which moves
+        // position through the KF cross-covariance.
+        let mut g = good();
+        g.fix_mode = FixMode::NoFix;
+        assert!(!g.fix_quality_ok(4, 2.5), "no fix");
+
+        let mut g = good();
+        g.fix_mode = FixMode::Fix2D;
+        assert!(!g.fix_quality_ok(4, 2.5), "2D fix has no usable vertical solution");
+
+        let mut g = good();
+        g.satellites = 3;
+        assert!(!g.fix_quality_ok(4, 2.5), "too few satellites");
+
+        let mut g = good();
+        g.hdop = 9.9;
+        assert!(!g.fix_quality_ok(4, 2.5), "DOP above threshold");
+    }
+
+    #[test]
+    fn an_absent_dop_is_not_treated_as_a_perfect_one() {
+        // A zero HDOP means the field was never populated, not that the
+        // geometry is flawless. Accepting it would disable the gate
+        // entirely for any source that does not fill the field in.
+        let mut g = good();
+        g.hdop = 0.0;
+        assert!(!g.fix_quality_ok(4, 2.5));
+        // Negative is equally nonsense.
+        g.hdop = -1.0;
+        assert!(!g.fix_quality_ok(4, 2.5));
+    }
+
+    #[test]
+    fn the_threshold_is_exclusive_at_both_ends() {
+        let mut g = good();
+        g.hdop = 2.5;
+        assert!(!g.fix_quality_ok(4, 2.5), "hdop == max must not pass");
+        g.hdop = 2.499;
+        assert!(g.fix_quality_ok(4, 2.5));
+        // min_sats is inclusive: exactly the minimum is acceptable.
+        let mut g = good();
+        g.satellites = 4;
+        assert!(g.fix_quality_ok(4, 2.5));
+    }
+
+    #[test]
+    fn the_default_record_never_passes() {
+        // A GpsData that has never been filled in must not be fusable.
+        // This is the cold-start case: the task holds a default record
+        // until the first sentence lands.
+        assert!(!GpsData::new().fix_quality_ok(4, 2.5));
+    }
+
+
+    // ---- Velocity gate (sAcc) ----
+
+    fn ubx_good() -> GpsData {
+        let mut g = good();
+        g.s_acc_ms = Some(0.08);
+        g.h_acc_m = Some(1.2);
+        g
+    }
+
+    #[test]
+    fn a_confident_velocity_passes() {
+        assert!(ubx_good().velocity_quality_ok(4, 1.0, 2.5));
+    }
+
+    #[test]
+    fn s_acc_overrides_a_flattering_dop() {
+        // The whole point of the change. DOP describes satellite
+        // geometry and cannot see multipath or interference, so a
+        // receiver can report textbook DOP while its Doppler solution is
+        // metres per second wrong. Where sAcc exists it decides.
+        let mut g = ubx_good();
+        g.hdop = 0.9; // geometry looks excellent
+        g.s_acc_ms = Some(4.5); // the receiver knows better
+        assert!(!g.velocity_quality_ok(4, 1.0, 2.5));
+        // ...and the position gate, which only sees DOP, still accepts
+        // it. That asymmetry is intentional: they measure different
+        // things, and velocity now uses the sharper instrument.
+        assert!(g.fix_quality_ok(4, 2.5));
+    }
+
+    #[test]
+    fn an_absent_s_acc_falls_back_to_dop_not_to_pass() {
+        // NMEA has no accuracy sentence. Unknown must mean "use the
+        // weaker test", never "assume good".
+        let mut g = good(); // s_acc_ms is None
+        assert!(g.s_acc_ms.is_none());
+        assert!(g.velocity_quality_ok(4, 1.0, 2.5), "good DOP should pass");
+        g.hdop = 9.9;
+        assert!(!g.velocity_quality_ok(4, 1.0, 2.5), "bad DOP must fail");
+        g.hdop = 0.0;
+        assert!(!g.velocity_quality_ok(4, 1.0, 2.5), "absent DOP must fail too");
+    }
+
+    #[test]
+    fn the_solution_must_exist_before_its_accuracy_matters() {
+        // A tiny sAcc means nothing without a fix behind it.
+        let mut g = ubx_good();
+        g.fix_mode = FixMode::NoFix;
+        assert!(!g.velocity_quality_ok(4, 1.0, 2.5));
+        let mut g = ubx_good();
+        g.fix_mode = FixMode::Fix2D;
+        assert!(!g.velocity_quality_ok(4, 1.0, 2.5));
+        let mut g = ubx_good();
+        g.satellites = 3;
+        assert!(!g.velocity_quality_ok(4, 1.0, 2.5));
+    }
+
+    #[test]
+    fn a_nonsense_s_acc_is_rejected() {
+        let mut g = ubx_good();
+        g.s_acc_ms = Some(-1.0);
+        assert!(!g.velocity_quality_ok(4, 1.0, 2.5), "negative sigma");
+        g.s_acc_ms = Some(f32::NAN);
+        assert!(!g.velocity_quality_ok(4, 1.0, 2.5), "NaN sigma");
+        // The threshold is exclusive.
+        g.s_acc_ms = Some(1.0);
+        assert!(!g.velocity_quality_ok(4, 1.0, 2.5));
+        g.s_acc_ms = Some(0.999);
+        assert!(g.velocity_quality_ok(4, 1.0, 2.5));
+    }
+
+    #[test]
+    fn velocity_sigma_is_clamped_into_the_usable_band() {
+        let mut g = ubx_good();
+
+        // An optimistic receiver cannot claim a near-zero sigma and let
+        // one fix dominate the filter.
+        g.s_acc_ms = Some(0.001);
+        assert!((g.velocity_sigma_ms(0.3, 1.0) - 0.3).abs() < 1e-6);
+
+        // A sigma inside the band is used as reported -- this is the
+        // case that makes the change worth anything.
+        g.s_acc_ms = Some(0.6);
+        assert!((g.velocity_sigma_ms(0.3, 1.0) - 0.6).abs() < 1e-6);
+
+        // At the ceiling an accepted fix still has SOME influence.
+        g.s_acc_ms = Some(5.0);
+        assert!((g.velocity_sigma_ms(0.3, 1.0) - 1.0).abs() < 1e-6);
+
+        // Absent or nonsense falls back to the floor, which is the
+        // behaviour the NMEA path already had.
+        g.s_acc_ms = None;
+        assert!((g.velocity_sigma_ms(0.3, 1.0) - 0.3).abs() < 1e-6);
+        g.s_acc_ms = Some(f32::NAN);
+        assert!((g.velocity_sigma_ms(0.3, 1.0) - 0.3).abs() < 1e-6);
+    }
+
 }

@@ -70,6 +70,16 @@ pub fn ubx_to_nmea(u: &ubx::GpsData) -> nmea::GpsData {
     g.pdop = u.pdop;
     g.vdop = u.pdop;
 
+    // The receiver's own 1-sigma estimates. These are what the velocity
+    // gate actually wants -- see `nmea::GpsData::velocity_quality_ok`.
+    // DOP stays populated above for the position path and for anything
+    // that still reads it, but where a direct accuracy figure exists it
+    // is the better number and it is carried through here rather than
+    // dropped at this boundary as it used to be.
+    g.h_acc_m = Some(u.h_acc_m);
+    g.v_acc_m = Some(u.v_acc_m);
+    g.s_acc_ms = Some(u.s_acc_ms);
+
     g.ground_speed_ms = u.ground_speed_ms;
     g.ground_speed_kmh = u.ground_speed_ms * 3.6;
 
@@ -221,4 +231,32 @@ mod tests {
         u.ground_speed_ms = 10.0;
         assert!((ubx_to_nmea(&u).ground_speed_kmh - 36.0).abs() < 1e-4);
     }
+    #[test]
+    fn the_receivers_accuracy_estimates_reach_the_fusion_record() {
+        // These used to be dropped at this boundary, which left the
+        // velocity gate with nothing but DOP to work from.
+        let mut u = fix3d();
+        u.h_acc_m = 1.5;
+        u.v_acc_m = 2.5;
+        u.s_acc_ms = 0.07;
+        let g = ubx_to_nmea(&u);
+        assert_eq!(g.h_acc_m, Some(1.5));
+        assert_eq!(g.v_acc_m, Some(2.5));
+        assert_eq!(g.s_acc_ms, Some(0.07));
+        // And the gate that consumes them accepts this fix.
+        assert!(g.velocity_quality_ok(4, 1.0, 2.5));
+    }
+
+    #[test]
+    fn a_ubx_record_is_never_mistaken_for_an_accuracy_less_nmea_one() {
+        // `None` is the NMEA signal for "no accuracy reported". Every
+        // record built here must carry Some(..), or the velocity gate
+        // silently falls back to DOP on the path that has the better
+        // number available.
+        let g = ubx_to_nmea(&fix3d());
+        assert!(g.s_acc_ms.is_some());
+        assert!(g.h_acc_m.is_some());
+        assert!(g.v_acc_m.is_some());
+    }
+
 }
