@@ -31,8 +31,17 @@ pub struct QuadParams {
     /// Moments of inertia [Ixx, Iyy, Izz] in kg·m²
     /// (assuming symmetric quad, Ixx ≈ Iyy)
     pub inertia: [f32; 3],
-    /// Arm length in metres (centre to motor)
-    pub arm_length: f32,
+    /// Per-motor position relative to the CENTRE OF GRAVITY, metres, body
+    /// frame: `[x forward, y right]`. Motor order is the mixer's: M1
+    /// rear-right, M2 front-right, M3 rear-left, M4 front-left.
+    ///
+    /// Was a single `arm_length` until 2026-09-20, which forced every
+    /// frame to be a symmetric X. This airframe is a deadcat whose rear
+    /// motors are 200 mm apart and front pair 300 mm, and whose centre of
+    /// gravity is not at the motor centroid — so a symmetric plant could
+    /// not show the one effect that asymmetry actually causes, a pitching
+    /// moment from pure collective thrust.
+    pub motor_xy: [[f32; 2]; 4],
     /// Maximum total thrust in Newtons (all 4 motors at 100%)
     pub max_thrust: f32,
     /// Torque-to-thrust ratio for yaw (motor reaction torque)
@@ -60,6 +69,67 @@ pub struct QuadParams {
 }
 
 impl QuadParams {
+    /// Motor positions for a symmetric X frame of the given arm length:
+    /// every motor `l/sqrt(2)` forward or aft and the same left or right,
+    /// so its distance from the centre is `l` on both axes.
+    ///
+    /// The shape the sim assumed before it carried real geometry. Kept
+    /// for tests that want a frame with no asymmetry to confound them.
+    pub fn symmetric_arms(l: f32) -> [[f32; 2]; 4] {
+        [[-l, l], [l, l], [-l, -l], [l, -l]]
+    }
+
+    /// The real airframe: the 7" deadcat, measured 2026-09-20 and
+    /// recorded in `docs/motor_body_measurements.md`.
+    ///
+    /// NOT the default — see [`QuadParams::default`] for why, and for
+    /// what happens when it is swept in. Use it to study this airframe
+    /// specifically, and as the target once the cascade is retuned.
+    ///
+    /// Confidence varies sharply by field, and the sim is only as good as
+    /// its weakest one:
+    ///
+    ///  - `motor_xy` — SOLID laterally. Derived from motor separations
+    ///    that are over-determined and agree to 6 mm. The fore/aft centre
+    ///    of gravity is the weakest number in the whole set: the
+    ///    measurements give it twice and the two disagree in DIRECTION.
+    ///    See [`crate::control::mixer::DEADCAT_7IN`]. It matters more
+    ///    than its size suggests — a 19 mm offset from the motor centroid
+    ///    pitches the aircraft through 90 degrees in under a second on
+    ///    four equal throttles.
+    ///  - `mass` — measured, 750 g with a 6S1P pack.
+    ///  - `inertia` — COMPUTED, not measured: the four motors as point
+    ///    masses at 55 g each plus a uniform slab for everything else.
+    ///    Lands within 6% of the 5" guesses in `default()`, which is
+    ///    reassuring but is not independent evidence.
+    ///  - `max_thrust` — 25 N per motor as supplied, so 100 N total.
+    ///    TREAT WITH SUSPICION. That is 13.6:1 thrust-to-weight, where a
+    ///    7" build is usually 4-6:1, and it puts hover at 27% throttle.
+    ///    Loop gain scales with it, so if it is wrong every gain the sim
+    ///    recommends is wrong by the same factor. Hover throttle on the
+    ///    first flight is the cheap check: 27% means this is right, and
+    ///    about 54% means it is 4x too high.
+    ///  - `motor_tau` — measured, 12 runs, 2026-09-14.
+    ///  - `drag_k` — still a guess, still isotropic, and still sized for
+    ///    0.6 kg rather than this airframe.
+    pub fn deadcat_7in() -> Self {
+        Self {
+            mass: 0.750,
+            inertia: [0.0040, 0.0035, 0.0076],
+            motor_xy: [
+                /* M1 RR */ [-0.1028, 0.100],
+                /* M2 FR */ [0.1217, 0.150],
+                /* M3 RL */ [-0.1028, -0.100],
+                /* M4 FL */ [0.1217, -0.150],
+            ],
+            max_thrust: 100.0, // 25 N per motor, as supplied; see above
+            yaw_torque_coeff: 0.015,
+            motor_tau: 0.0369,
+            drag_k: 0.0065,
+            wind_ned: [0.0; 3],
+        }
+    }
+
     /// Thrust as a fraction of this motor's maximum, for a normalised
     /// rotor speed.
     ///
@@ -96,19 +166,34 @@ impl QuadParams {
 
 impl Default for QuadParams {
     /// Defaults for a 5" racing quad (~600 g). NOT this airframe, which is
-    /// a 7": its mass, inertia, arm length and thrust are unmeasured, and
-    /// only `motor_tau` below is a measurement of it. Replacing the rest
-    /// with a second set of guesses would move every sim result and force a
-    /// baseline re-bless, so it waits for real figures.
+    /// the 7" deadcat measured on 2026-09-20 — see [`QuadParams::deadcat_7in`].
+    ///
+    /// **Why the measurements did not simply replace these.** They cannot
+    /// be adopted without retuning the whole cascade first, and a plant
+    /// that no controller can fly is a worse baseline than a plant that
+    /// is merely the wrong airframe. Measured on 2026-09-20, sweeping the
+    /// real figures in:
+    ///
+    ///  - Every case in the sweep became a flyaway, all axes, all seeds.
+    ///  - The cause is `max_thrust`, not the frame: at the old 20 N the
+    ///    real geometry flies (attitude RMS 1.10 deg against 0.041), and
+    ///    at 100 N even a symmetric frame flies away.
+    ///  - Scaling the rate gains recovers attitude at about 0.2x
+    ///    (attitude RMS 0.415) but not altitude — hover throttle moves
+    ///    from 0.54 to 0.27, so the altitude and position loops are
+    ///    mistuned too (altitude RMS 13.6 m, airborne 40% of the time).
+    ///
+    /// So adopting them is a retuning project, gated on confirming the
+    /// thrust figure. See `docs/2026-09-12-sim-direction.md`.
     fn default() -> Self {
         Self {
             mass: 0.6,
             inertia: [0.004, 0.004, 0.008],
-            arm_length: 0.12,
+            motor_xy: QuadParams::symmetric_arms(0.12),
             max_thrust: 20.0, // ~3:1 thrust-to-weight ratio
             yaw_torque_coeff: 0.015,
             motor_tau: 0.036, // measured; see the field doc
-            drag_k: 0.0065,  // ~30 m/s terminal velocity at 0.6 kg
+            drag_k: 0.0065,   // ~30 m/s terminal velocity at 0.6 kg
             wind_ned: [0.0; 3],
         }
     }
@@ -338,17 +423,21 @@ impl QuadSim {
         //   Roll torque:  (left motors - right motors) * arm_length
         //   Pitch torque: (front motors - rear motors) * arm_length
         //   Yaw torque:   (CCW reactions - CW reactions) * yaw_coeff
-        let l = p.arm_length;
-
-        // Left = M3+M4, Right = M1+M2
-        let roll_torque = ((thrust_per_motor[2] + thrust_per_motor[3])
-            - (thrust_per_motor[0] + thrust_per_motor[1]))
-            * l;
-
-        // Front = M2+M4, Rear = M1+M3
-        let pitch_torque = ((thrust_per_motor[1] + thrust_per_motor[3])
-            - (thrust_per_motor[0] + thrust_per_motor[2]))
-            * l;
+        // Summed per motor from its own position, rather than from a
+        // left-minus-right difference times one arm length. Identical on a
+        // symmetric frame; on this one it is what carries the collective
+        // pitching moment that a single arm length cannot represent.
+        //
+        // +roll is right-wing-down, so a motor at negative y (left)
+        // contributes positively: the lever is -y. +pitch is nose-up and
+        // lifts the front motors (see conventions.rs), so the pitch lever
+        // is +x.
+        let mut roll_torque = 0.0;
+        let mut pitch_torque = 0.0;
+        for i in 0..4 {
+            roll_torque -= thrust_per_motor[i] * p.motor_xy[i][1];
+            pitch_torque += thrust_per_motor[i] * p.motor_xy[i][0];
+        }
 
         // Yaw torque from motor reaction:
         //   CW motor → CCW reaction on frame (negative yaw)
@@ -540,6 +629,130 @@ pub struct SimImu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::mixer::{ControlDemand, DEADCAT_7IN, QUAD_X};
+
+    /// The asymmetry is worth modelling: holding hover with QUAD_X's flat
+    /// thrust column pitches this airframe, because four equal thrusts
+    /// about a centre of gravity that is not their centroid do not
+    /// balance. This is the plant-side confirmation of the mixer defect —
+    /// asserted here so it cannot be dismissed as an artifact of the
+    /// mixer's own moment arithmetic.
+    #[test]
+    fn flat_thrust_column_pitches_this_airframe() {
+        let p = QuadParams::deadcat_7in();
+        let hover = p.hover_throttle();
+        let mut sim = QuadSim::new(p, QuadState::hovering(50.0));
+        let motors = QUAD_X
+            .apply_no_airmode(&ControlDemand {
+                thrust: hover,
+                roll: 0.0,
+                pitch: 0.0,
+                yaw: 0.0,
+            })
+            .motors;
+        // Only 0.2 s: the moment is violent enough to carry the aircraft
+        // through 90 degrees of pitch in under a second, and past that the
+        // reported Euler angles go through the singularity and stop
+        // meaning anything.
+        for _ in 0..100 {
+            sim.step(&MotorForces { motors }, 1.0 / 500.0);
+        }
+        assert!(
+            sim.state.pitch.abs() > 1.0,
+            "flat thrust should pitch the deadcat, got {} deg",
+            sim.state.pitch,
+        );
+        // Roll stays put: the frame is left-right symmetric.
+        assert!(sim.state.roll.abs() < 0.01, "roll drifted to {}", sim.state.roll);
+    }
+
+    /// ...and the geometry-derived thrust column holds it level.
+    #[test]
+    fn derived_thrust_column_holds_the_deadcat_level() {
+        let p = QuadParams::deadcat_7in();
+        let hover = p.hover_throttle();
+        let mut sim = QuadSim::new(p, QuadState::hovering(50.0));
+        let motors = DEADCAT_7IN
+            .mixer()
+            .apply_no_airmode(&ControlDemand {
+                thrust: hover,
+                roll: 0.0,
+                pitch: 0.0,
+                yaw: 0.0,
+            })
+            .motors;
+        for _ in 0..500 {
+            sim.step(&MotorForces { motors }, 1.0 / 500.0);
+        }
+        assert!(
+            sim.state.pitch.abs() < 0.01,
+            "derived mix should hold level, got {} deg",
+            sim.state.pitch,
+        );
+    }
+
+    /// The per-motor torque sum must agree with the closed form it
+    /// replaced, `(left - right) * arm_length`, on a symmetric frame.
+    ///
+    /// It does, to the last few bits — the two are the same arithmetic in
+    /// a different association order. That is worth pinning because the
+    /// change re-blessed the sweep baseline: 10 s of closed-loop sim
+    /// amplifies a 1-ULP difference into visible digits on the chaotic
+    /// rows, and this test is the evidence that nothing but rounding
+    /// moved.
+    #[test]
+    fn per_motor_torque_matches_the_closed_form_on_a_symmetric_frame() {
+        let l = 0.12f32;
+        let p = QuadParams {
+            motor_xy: QuadParams::symmetric_arms(l),
+            ..QuadParams::default()
+        };
+        // An asymmetric pattern, so roll and pitch are both non-zero.
+        let motors = [0.30f32, 0.55, 0.70, 0.45];
+        let mut sim = QuadSim::new(p, QuadState::hovering(50.0));
+        // Start the rotors at the commanded speeds so motor lag does not
+        // enter, then take one step and read the rates back out.
+        sim.rotor_speed = motors;
+        let dt = 1.0 / 8000.0;
+        sim.step(&MotorForces { motors }, dt);
+
+        let t: Vec<f32> = motors
+            .iter()
+            .map(|s| p.thrust_frac(*s) * p.max_thrust / 4.0)
+            .collect();
+        let roll_torque = ((t[2] + t[3]) - (t[0] + t[1])) * l;
+        let pitch_torque = ((t[1] + t[3]) - (t[0] + t[2])) * l;
+        const R2D: f32 = 180.0 / core::f32::consts::PI;
+        let want_roll = roll_torque / p.inertia[0] * R2D * dt;
+        let want_pitch = pitch_torque / p.inertia[1] * R2D * dt;
+
+        assert!(
+            (sim.state.roll_rate - want_roll).abs() < 1e-4 * want_roll.abs().max(1.0),
+            "roll rate {} vs closed form {want_roll}",
+            sim.state.roll_rate,
+        );
+        assert!(
+            (sim.state.pitch_rate - want_pitch).abs() < 1e-4 * want_pitch.abs().max(1.0),
+            "pitch rate {} vs closed form {want_pitch}",
+            sim.state.pitch_rate,
+        );
+    }
+
+    /// A symmetric frame is unaffected by any of this: the flat column is
+    /// already balanced there. Guards against the per-motor torque sum
+    /// having quietly changed the symmetric case.
+    #[test]
+    fn a_symmetric_frame_needs_no_rebalance() {
+        let mut p = QuadParams::deadcat_7in();
+        p.motor_xy = QuadParams::symmetric_arms(0.12);
+        let hover = p.hover_throttle();
+        let mut sim = QuadSim::new(p, QuadState::hovering(50.0));
+        for _ in 0..500 {
+            sim.step(&MotorForces { motors: [hover; 4] }, 1.0 / 500.0);
+        }
+        assert!(sim.state.pitch.abs() < 0.01, "pitch {}", sim.state.pitch);
+        assert!(sim.state.roll.abs() < 0.01, "roll {}", sim.state.roll);
+    }
 
     #[test]
     fn test_freefall() {
@@ -566,6 +779,7 @@ mod tests {
     fn test_hover_thrust() {
         // At hover, total thrust = weight = mass * g
         // Per motor normalised = (mass * g) / max_thrust
+        //
         let params = QuadParams::default();
         let hover_throttle = params.hover_throttle();
 
@@ -684,6 +898,14 @@ mod tests {
     }
     // ---- Physics fidelity ----
 
+    /// The fidelity tests below assert things about gravity, drag, wind
+    /// and frame rotation, and every one of them holds hover with four
+    /// equal motor commands. That is an equilibrium only on a SYMMETRIC
+    /// frame — on the real airframe equal thrusts pitch it, which is what
+    /// `flat_thrust_column_pitches_this_airframe` is for. The default
+    /// plant is symmetric, so these are safe as they stand; if the
+    /// default ever moves to `deadcat_7in`, they need a symmetric frame
+    /// pinned here or they will all fail for that one unrelated reason.
     fn hover_params() -> QuadParams {
         QuadParams::default()
     }

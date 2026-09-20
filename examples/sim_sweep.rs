@@ -85,13 +85,17 @@ fn plant_params() -> QuadParams {
     }
     // Mass and arm length matter as much as inertia and were not
     // overridable, which mattered once the airframe turned out to be a 7in
-    // rather than the 5in the defaults describe. Loop gain scales with arm
-    // length (torque per unit thrust) and inversely with inertia.
+    // rather than the 5in the defaults once described. Loop gain scales
+    // with arm length (torque per unit thrust) and inversely with inertia.
     if let Some(v) = std::env::var("PLANT_MASS").ok().and_then(|v| v.parse().ok()) {
         p.mass = v;
     }
+    // Replaces the measured geometry with a SYMMETRIC X of this arm
+    // length, which is what the plant was before it carried real motor
+    // positions. Use it to ask what the asymmetry is worth, not to vary
+    // the real frame: it discards the deadcat entirely.
     if let Some(v) = std::env::var("PLANT_ARM").ok().and_then(|v| v.parse().ok()) {
-        p.arm_length = v;
+        p.motor_xy = QuadParams::symmetric_arms(v);
     }
     if let Some(v) = std::env::var("PLANT_INERTIA").ok().and_then(|v| v.parse().ok()) {
         p.inertia = [v, v, v * 2.0];
