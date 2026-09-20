@@ -187,3 +187,65 @@ rate loop, and it is worth doing only once the thrust figure is
 confirmed. Sequence: confirm thrust, settle the CoG by balance test, wire
 the derived mixer, then run the GA jointly over rate gains, filters,
 altitude and position gains, and re-bless.
+
+## GA run against the real plant, 2026-09-20
+
+Two runs, 64 population x 60 generations, identical but for the mixer.
+Both converged with all 16 training and all 16 holdout cases flying;
+holdout tracked training, so neither overfitted.
+
+                        rate_kp   rate_ki   rate_kd   yaw_kp   gyro_fc  d_tau
+  firmware              0.0200    0.0050    0.00100   0.0300   150.0    8.0 ms
+  GA, geometry mixer    0.00532   0.0433    0.00008   0.00735   57.9    0.77 ms
+  GA, QUAD_X            0.00623   0.0500*   0.00007   0.00598   71.6    1.41 ms
+
+  * PINNED at its bound.
+
+On the measured plant the firmware gains do not fly at all: fitness 1422
+with 0 of 16 cases surviving, against 57 with 16 of 16 for the fitted
+genome. Full 96-row sweep, which the GA never trains on:
+
+                                       failures  clean  air_frac  att_rms
+  5in plant, firmware gains (baseline)   43/768  89/96    0.878    0.489
+  deadcat + geometry mixer, firmware    760/768   1/96    0.010    fail
+  deadcat + geometry mixer, GA           90/768  84/96    0.110    0.072
+  deadcat + QUAD_X, GA                   89/768  84/96    0.109    0.126
+
+**The pinned gene is the finding.** With QUAD_X the search drives rate_ki
+into its bound and stays there; with the geometry mixer it settles at
+0.0433, comfortably interior. That is the collective pitch trim showing
+up as a demand for integral gain — the integrator is the only term that
+can cancel a standing moment, so the search spends authority on it. With
+the trim removed at the mixer the demand disappears. It is independent
+confirmation of the argument in `mixer.rs`, arrived at by a search that
+knows nothing about frame geometry, and it is the strongest reason yet to
+wire the derived mixer into flight.
+
+Widening the ki bound would not help: the search is not short of range,
+it is short of a mixer.
+
+Two changes were needed before the search could work. The rate gain
+floors were raised two decades (kp's old floor of 0.002 sat ABOVE the
+answer, so the search could not represent it), and the sweep gained
+`RATE_KI`, `YAW_KP` and `YAW_KI` overrides — without them it could set kp
+and kd but silently keep the firmware's ki, and report the mixture as the
+fitted genome.
+
+Remaining failures cluster in vibration (50 Hz worst), motor-scale
+asymmetry, and the legacy 200 Hz preset. Those are the next thing to
+look at, not the gains.
+
+## The 150 Hz gyro filter and Nyquist
+
+`Tunables::firmware()` still says 150 Hz, and that is correct: the
+firmware's inner loop runs at 8 kHz, so 150 Hz is nowhere near Nyquist.
+The Nyquist problem was only ever the LEGACY 200 Hz preset, where 150 Hz
+sits above the 100 Hz Nyquist. Since dcb5982 `clamp_cutoff_hz` limits any
+cutoff to 0.45*fs, so legacy silently filters at 90 Hz instead
+(`cutoffs_below_the_limit_are_untouched` asserts both cases).
+
+Safe, but silent: a legacy sweep row reports `gyro_fc 150` while actually
+filtering at 90. Worth surfacing the effective cutoff if the legacy
+preset is ever tuned seriously — and note a GA on that preset would see a
+flat search space above 90 Hz, since every value there clamps to the same
+filter.

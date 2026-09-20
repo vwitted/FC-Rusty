@@ -67,13 +67,20 @@ impl Gene {
 
 const N_GENES: usize = 7;
 
-/// Bounds bracket the firmware's current values by roughly a decade either
-/// way, so the incumbent sits mid-genome and the search can go both up and
-/// down. kd's floor is effectively "off".
+/// Bounds bracket the firmware's current values so the incumbent sits
+/// inside and the search can go both up and down. kd's floor is
+/// effectively "off".
+///
+/// The rate floors are TWO decades below the firmware, not one. On the
+/// measured 7in plant the best gains found by hand were kp 0.001 and
+/// kd 5e-5 — kp sat below the old 0.002 floor, so the search could not
+/// represent its own answer and would have reported the floor as optimal.
+/// A bound that clips the result is worse than no search: it returns a
+/// confident number with no warning that it is pinned.
 const GENES: [Gene; N_GENES] = [
-    Gene::new(0.002, 0.2),      // rate kp   (firmware 0.02)
-    Gene::new(0.0002, 0.05),    // rate ki   (firmware 0.005)
-    Gene::new(1e-5, 0.01),      // rate kd   (firmware 0.001)
+    Gene::new(0.0002, 0.2),     // rate kp   (firmware 0.02)
+    Gene::new(2e-5, 0.05),      // rate ki   (firmware 0.005)
+    Gene::new(1e-6, 0.01),      // rate kd   (firmware 0.001)
     Gene::new(0.003, 0.3),      // yaw kp    (firmware 0.03)
     Gene::new(0.0002, 0.05),    // yaw ki    (firmware 0.005)
     Gene::new(40.0, 2000.0),    // gyro fc   (firmware 150)
@@ -103,6 +110,10 @@ fn to_tunables(g: &[f32; N_GENES]) -> Tunables {
         gyro_fc_hz: GENES[5].decode(g[5]),
         // Fixed on purpose -- see the header.
         alt: AltitudeGains { kp: 0.15, kd: 0.1, ki: 0.05 },
+        // Not a tuned gene: it is a statement about the airframe, not a
+        // gain. Set from the environment so a run can ask what the gains
+        // look like with the collective trim removed.
+        geometry_mixer: std::env::var("GEOMETRY_MIXER").is_ok(),
         // Everything the search does not tune comes from the firmware
         // baseline, so a field added later joins the fixed set rather than
         // silently becoming a zero.
@@ -315,12 +326,19 @@ fn main() {
     let mut rng = Rng::new(env_usize("GA_SEED", 12345) as u64);
     let mut_sigma = env_f32("GA_MUT", 0.08);
 
-    // PLANT_THRUST/PLANT_INERTIA: check a candidate against a plant that is
-    // wrong in the direction the real one probably is. The default 20 N is
-    // 3:1 thrust-to-weight; a real 5in racer is 6-10:1, and this airframe is a 7in, i.e. MORE control
-    // authority and so more loop gain. Gains that only work at 3:1 would not
-    // transfer, and that is the whole risk of tuning in sim.
-    let mut plant = QuadParams::default();
+    // PLANT=deadcat selects the measured 7in airframe; the default stays
+    // the 5in figures the baseline is blessed against. PLANT_THRUST and
+    // PLANT_INERTIA then override either, to check a candidate against a
+    // plant wrong in the direction the real one might be. Loop gain goes
+    // as the SQUARE ROOT of max_thrust at the hover point, so a 4x thrust
+    // error is a 2x gain error — gains fitted at one thrust do partly
+    // transfer to another, but not exactly, and that is the whole risk of
+    // tuning in sim.
+    let mut plant = match std::env::var("PLANT").as_deref() {
+        Ok("deadcat") => QuadParams::deadcat_7in(),
+        Ok("default") | Err(_) => QuadParams::default(),
+        Ok(other) => panic!("PLANT={other}: expected 'deadcat' or 'default'"),
+    };
     if let Some(v) = std::env::var("PLANT_THRUST").ok().and_then(|v| v.parse().ok()) {
         plant.max_thrust = v;
     }

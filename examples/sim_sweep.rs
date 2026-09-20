@@ -282,6 +282,19 @@ fn tunables() -> Tunables {
     if let Some(v) = std::env::var("RATE_KD").ok().and_then(|v| v.parse().ok()) {
         t.rate.kd = v;
     }
+    // The remaining gains ga_tune searches. Without these the sweep could
+    // not reproduce a GA result: it could set kp and kd but silently keep
+    // the firmware's ki and yaw gains, and report the mixture as if it
+    // were the fitted genome.
+    if let Some(v) = std::env::var("RATE_KI").ok().and_then(|v| v.parse().ok()) {
+        t.rate.ki = v;
+    }
+    if let Some(v) = std::env::var("YAW_KP").ok().and_then(|v| v.parse().ok()) {
+        t.yaw.kp = v;
+    }
+    if let Some(v) = std::env::var("YAW_KI").ok().and_then(|v| v.parse().ok()) {
+        t.yaw.ki = v;
+    }
     // Altitude gains, in throttle per metre and per m/s. They were not
     // overridable, which hid a real effect when the plant's thrust changed:
     // the throttle-to-acceleration gain at hover scales as the SQUARE ROOT
