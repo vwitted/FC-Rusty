@@ -11,17 +11,28 @@ specification; PROJECT_STATUS.md holds current state.
   `docs/motor_body_measurements.md`. Carried into the code as
   `QuadParams::deadcat_7in()` and `mixer::DEADCAT_7IN`. Two numbers are
   still open, and both block the retune below:
-  - **Thrust.** 25 N per motor, 100 N total, is 13.6:1 on 750 g where a
-    7in build is usually 4-6:1. Loop gain scales with it. Hover throttle
-    on the first flight separates the cases: 27% means 100 N is right,
-    54% means it is about 4x high.
-  - **Fore/aft centre of gravity.** Given twice in the measurements, and
-    the two disagree in DIRECTION. The motor-to-CoG arm lengths put it
-    aft of the motor centroid; the separate "1:1.6 rear:front" figure
-    puts it forward. The aft reading is used, as the one taken to the
-    motors, but it is a reconciliation rather than a measurement. One
-    balance test settles it: balance the airframe fore/aft on an edge and
-    measure from the rear motor axis to the balance line.
+  - **Thrust.** 25 N per motor, 100 N total, is a DATASHEET figure and
+    is 13.6:1 on 750 g, where a 7in build is usually 4-6:1. A datasheet
+    number is one motor on a stiff bench supply at full pack voltage;
+    four motors on a sagging 6S1P pack see roughly V^2, so 25.2 V falling
+    to 21 V costs 31% on its own. Rate-loop gain scales as the SQUARE
+    ROOT of it — 20 N to 100 N is 5x the thrust but 2.24x the slope at
+    hover — so a 4x error is a 2x gain error.
+
+    Measure hover throttle instead of trying to confirm the peak: set the
+    airframe on a kitchen scale, secured, props on, and ramp throttle
+    while logging the scale reading. Thrust is the weight the scale
+    loses; the throttle at which it reads zero IS hover throttle, and the
+    whole curve up to that point comes free, with sag and all four motors
+    included. 27% means 100 N is right, 54% means about 25 N.
+  - **Fore/aft centre of gravity.** Settled in DIRECTION, loose in
+    magnitude. Both measurements put it AFT of the motor centroid — the
+    motor-to-CoG arm lengths by 10.2 mm, the stated "1:1.6 rear:front" by
+    30.0 mm. Neither can be a measurement to the motor axes, since the
+    two distances must sum to the 224.5 mm motor span and both overshoot
+    it. The smaller is used, because with the direction certain an
+    under-correction only leaves trim behind while an over-correction
+    reverses it. A fore/aft balance test would pin the magnitude.
 
 ## Sim roadmap
 
@@ -153,9 +164,10 @@ derived column removes it, up to a collective of 0.96 where the rear pair
 clamps.
 
 `mixer::DEADCAT_7IN` is built and tested but NOT wired into flight;
-`main.rs` still uses `QUAD_X`. Switching it is a one-line change, held
-back until the balance test fixes the sign of the CoG offset — applied
-backwards it would double the trim rather than remove it.
+`main.rs` still uses `QUAD_X`. Switching it is a one-line change. The
+sign is no longer in doubt, and the conservative magnitude makes the
+switch safe — it removes 40-100% of the trim and cannot reverse it — so
+this is now a decision to take rather than a measurement to wait for.
 
 ## Retuning against the real plant
 

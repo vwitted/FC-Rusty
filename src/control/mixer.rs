@@ -330,20 +330,24 @@ impl FrameGeometry {
 /// lateral half-spans at 100/150 mm and the longitudinal motor span at
 /// 224.5 mm.
 ///
-/// **The fore/aft centre-of-gravity position is the weak number here.**
-/// The measurements give it twice and the two disagree. Motor-to-CoG arm
-/// lengths (150 mm rear, 200 mm front) put it AFT of the motor centroid,
-/// at 102.8 mm ahead of the rear motors and 121.7 mm behind the front —
-/// but those two projections sum to 224.5 mm only after a 9% rescale, so
-/// they are nominal rather than measured. The separate "1:1.6 rear:front"
-/// figure puts it FORWARD instead, which is the opposite direction; it is
-/// read here as a measurement to the body's edges, not to the motors,
-/// since 100 mm to the rear edge is consistent with rear motors that
-/// overhang the rear plate. The aft reading is used because it is the one
-/// taken to the motors, and because it predicts the right sign of the
-/// front/rear motor-lag difference (see below) — but it is a
-/// reconciliation of inconsistent numbers, not a measurement, and one
-/// balance test would settle it.
+/// **The fore/aft centre of gravity is AFT of the motor centroid.** Both
+/// measurements agree on that, which is what fixes the sign of the thrust
+/// column: the rear motors carry more of the hover load. They disagree
+/// only on how far:
+///
+///  - Motor-to-CoG arm lengths (150 mm rear, 200 mm front) give 111.8 mm
+///    to the rear motors and 132.3 mm to the front — 10.2 mm aft.
+///  - The stated "1:1.6 rear:front", 100 mm and 160 mm, is 30.0 mm aft.
+///
+/// Neither pair can be a measurement to the motor axes, because the two
+/// distances must sum to the 224.5 mm motor span and both overshoot it
+/// (by 19.6 mm and 35.5 mm) — consistent with being taken along the arm
+/// tubes and to the frame's extremities respectively.
+///
+/// The SMALLER offset is used deliberately. With the direction certain,
+/// under-correcting only leaves some trim behind, whereas over-correcting
+/// would push the trim the other way. A fore/aft balance test would pin
+/// the magnitude; it is no longer needed to settle the direction.
 pub const DEADCAT_7IN: FrameGeometry = FrameGeometry {
     //             x fwd    y right
     motor_xy: [

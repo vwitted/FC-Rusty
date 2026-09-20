@@ -91,24 +91,34 @@ impl QuadParams {
     ///
     ///  - `motor_xy` — SOLID laterally. Derived from motor separations
     ///    that are over-determined and agree to 6 mm. The fore/aft centre
-    ///    of gravity is the weakest number in the whole set: the
-    ///    measurements give it twice and the two disagree in DIRECTION.
-    ///    See [`crate::control::mixer::DEADCAT_7IN`]. It matters more
-    ///    than its size suggests — a 19 mm offset from the motor centroid
-    ///    pitches the aircraft through 90 degrees in under a second on
-    ///    four equal throttles.
+    ///    of gravity is the loosest number in the set: both measurements
+    ///    agree it is AFT of the motor centroid, but by 10.2 mm on one
+    ///    reading and 30.0 mm on the other. The smaller is used; see
+    ///    [`crate::control::mixer::DEADCAT_7IN`]. It matters more than
+    ///    its size suggests — even 10 mm pitches the aircraft through 90
+    ///    degrees in under a second on four equal throttles.
     ///  - `mass` — measured, 750 g with a 6S1P pack.
     ///  - `inertia` — COMPUTED, not measured: the four motors as point
     ///    masses at 55 g each plus a uniform slab for everything else.
     ///    Lands within 6% of the 5" guesses in `default()`, which is
     ///    reassuring but is not independent evidence.
-    ///  - `max_thrust` — 25 N per motor as supplied, so 100 N total.
-    ///    TREAT WITH SUSPICION. That is 13.6:1 thrust-to-weight, where a
-    ///    7" build is usually 4-6:1, and it puts hover at 27% throttle.
-    ///    Loop gain scales with it, so if it is wrong every gain the sim
-    ///    recommends is wrong by the same factor. Hover throttle on the
-    ///    first flight is the cheap check: 27% means this is right, and
-    ///    about 54% means it is 4x too high.
+    ///  - `max_thrust` — 25 N per motor from the DATASHEET, so 100 N
+    ///    total. TREAT WITH SUSPICION: 13.6:1 thrust-to-weight where a 7"
+    ///    build is usually 4-6:1. A datasheet figure is one motor on a
+    ///    stiff bench supply at full pack voltage; under four motors on a
+    ///    sagging 6S1P pack, thrust goes as roughly V^2 at fixed throttle,
+    ///    so 25.2 V falling to 21 V alone costs 31%.
+    ///
+    ///    Rate-loop gain scales as the SQUARE ROOT of this, not linearly:
+    ///    raising `max_thrust` lowers the hover command by the same root,
+    ///    and the two partly cancel. 20 N to 100 N is 5x the thrust but
+    ///    2.24x the thrust slope at hover. So a 4x error here is a 2x
+    ///    error in gain — bad, but not the catastrophe a linear reading
+    ///    suggests.
+    ///
+    ///    Hover throttle is the number that actually pins it, and it can
+    ///    be measured on a kitchen scale without flying: 27% means 100 N
+    ///    is right, 54% means about 25 N.
     ///  - `motor_tau` — measured, 12 runs, 2026-09-14.
     ///  - `drag_k` — still a guess, still isotropic, and still sized for
     ///    0.6 kg rather than this airframe.
