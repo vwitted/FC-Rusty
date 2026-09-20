@@ -219,6 +219,143 @@ pub const QUAD_X: Mixer<4> = Mixer {
     ],
 };
 
+/// Where the motors actually are, so a mix matrix can be derived rather
+/// than assumed.
+///
+/// [`QUAD_X`] is the +/-1 matrix for a symmetric X: every motor the same
+/// distance from the centre of gravity on both axes. This airframe is not
+/// that. It is a deadcat — the rear motors are 200 mm apart and the front
+/// pair 300 mm — and its centre of gravity does not sit at the midpoint of
+/// the motors. Two consequences, of which only the second is a defect:
+///
+///  - **The roll and pitch columns should stay at +/-1.** The tempting
+///    change is to scale them by each motor's lever arm, which is what
+///    minimum-effort (pseudo-inverse) allocation gives. On this frame
+///    that is measurably worse on both counts that matter. What limits
+///    torque is the first motor to hit a rail, not total motor effort,
+///    and arm-scaling deliberately under-drives the short arms: it buys
+///    14% less roll moment per unit of saturation (11.6 against 13.4 N·m)
+///    and 7% less pitch. It also makes cross-coupling worse — see
+///    `roll_cross_coupling_is_second_order`. +/-1 is not a symmetric-frame
+///    simplification that this frame has outgrown; it is the right answer
+///    here, and the tests record why so it is not "fixed" later.
+///
+///  - **Collective thrust produces a pitching moment.** This one is a
+///    defect. Four equal thrusts about a centre of gravity that is not
+///    at their centroid do not balance: on this frame, at hover, the
+///    residual is 0.07 N·m, about 1100 deg/s^2 of pitch acceleration at
+///    the estimated Iyy. The rate loop can hold that, but only by
+///    carrying a permanent integrator offset that eats authority and
+///    unwinds differently at every throttle setting.
+///
+/// Positions are measured **from the centre of gravity**, in the body
+/// frame, metres: `[x forward, y right]`. Motor order is the mixer's:
+/// M1 rear-right, M2 front-right, M3 rear-left, M4 front-left.
+pub struct FrameGeometry {
+    /// Per-motor `[x forward, y right]` offset from the centre of gravity.
+    pub motor_xy: [[f32; 2]; 4],
+    /// Rotation sense per motor: `true` for CCW. A CCW rotor reacts
+    /// clockwise on the frame, i.e. towards +yaw, so it takes yaw
+    /// coefficient +1.
+    pub spin_ccw: [bool; 4],
+}
+
+impl FrameGeometry {
+    /// Derive the mix matrix from the geometry.
+    ///
+    /// Roll, pitch and yaw coefficients are +/-1, set by which side of the
+    /// centre of gravity the motor sits on and which way it spins. Yaw is
+    /// +/-1 because reaction torque comes from the rotor's own drag, not
+    /// from where it is bolted; roll and pitch are +/-1 for the
+    /// saturation and cross-coupling reasons argued on [`FrameGeometry`].
+    ///
+    /// The thrust column is the part that is not cosmetic. It is chosen so
+    /// that a pure collective command produces **no net moment** about the
+    /// centre of gravity, and it accounts for the throttle-to-thrust curve
+    /// being quadratic: thrust goes as the square of the command, so a
+    /// thrust share of `k` needs a command share of `sqrt(k)` (see
+    /// `QuadParams::thrust_frac`). The column is normalised to mean 1.0,
+    /// so the meaning of the `thrust` demand — and therefore hover
+    /// throttle — is unchanged.
+    ///
+    /// The thrust balance assumes the frame is **left-right symmetric**,
+    /// which is true of this airframe and of every practical quad: the
+    /// roll moment then cancels by construction and only the pitch balance
+    /// has to be solved. `debug_assert`s enforce it rather than silently
+    /// returning a mix that trims into a roll.
+    pub fn mixer(&self) -> Mixer<4> {
+        let x = |i: usize| self.motor_xy[i][0];
+        let y = |i: usize| self.motor_xy[i][1];
+
+        // Left-right symmetry: M1/M3 are the rear pair, M2/M4 the front.
+        debug_assert!(libm::fabsf(x(0) - x(2)) < 1e-4, "rear pair not level fore/aft");
+        debug_assert!(libm::fabsf(x(1) - x(3)) < 1e-4, "front pair not level fore/aft");
+        debug_assert!(libm::fabsf(y(0) + y(2)) < 1e-4, "rear pair not symmetric");
+        debug_assert!(libm::fabsf(y(1) + y(3)) < 1e-4, "front pair not symmetric");
+
+        // Pitch balance for the collective. The rear pair sits at x_r
+        // (negative), the front at x_f. Zero moment needs
+        // 2*T_f*x_f + 2*T_r*x_r = 0, so the front THRUST share is
+        // k = |x_r| / x_f, and the front COMMAND share is sqrt(k).
+        let x_r = libm::fabsf(x(0));
+        let x_f = libm::fabsf(x(1));
+        let k_cmd = libm::sqrtf(x_r / x_f);
+        // Normalised so the four coefficients average 1.0.
+        let c_front = 2.0 * k_cmd / (1.0 + k_cmd);
+        let c_rear = 2.0 / (1.0 + k_cmd);
+
+        let sign = |v: f32| if v > 0.0 { 1.0 } else { -1.0 };
+        let mut mix = [[0.0f32; 4]; 4];
+        for i in 0..4 {
+            mix[i] = [
+                if x(i) > 0.0 { c_front } else { c_rear },
+                // +roll is right-wing-down, which needs more thrust on the
+                // LEFT, i.e. at negative y.
+                -sign(y(i)),
+                // +pitch lifts the front motors (see conventions.rs).
+                sign(x(i)),
+                if self.spin_ccw[i] { 1.0 } else { -1.0 },
+            ];
+        }
+        Mixer { mix }
+    }
+}
+
+/// This airframe: a 7-inch deadcat, measured 2026-09-20 and recorded in
+/// `docs/motor_body_measurements.md`.
+///
+/// Derived from the measured motor separations — rear pair 200 mm, front
+/// pair 300 mm, sides 230 mm — which are over-determined and agree: they
+/// predict a 336 mm diagonal against 330 mm measured. That fixes the
+/// lateral half-spans at 100/150 mm and the longitudinal motor span at
+/// 224.5 mm.
+///
+/// **The fore/aft centre-of-gravity position is the weak number here.**
+/// The measurements give it twice and the two disagree. Motor-to-CoG arm
+/// lengths (150 mm rear, 200 mm front) put it AFT of the motor centroid,
+/// at 102.8 mm ahead of the rear motors and 121.7 mm behind the front —
+/// but those two projections sum to 224.5 mm only after a 9% rescale, so
+/// they are nominal rather than measured. The separate "1:1.6 rear:front"
+/// figure puts it FORWARD instead, which is the opposite direction; it is
+/// read here as a measurement to the body's edges, not to the motors,
+/// since 100 mm to the rear edge is consistent with rear motors that
+/// overhang the rear plate. The aft reading is used because it is the one
+/// taken to the motors, and because it predicts the right sign of the
+/// front/rear motor-lag difference (see below) — but it is a
+/// reconciliation of inconsistent numbers, not a measurement, and one
+/// balance test would settle it.
+pub const DEADCAT_7IN: FrameGeometry = FrameGeometry {
+    //             x fwd    y right
+    motor_xy: [
+        /* M1 RR */ [-0.1028,  0.100],
+        /* M2 FR */ [ 0.1217,  0.150],
+        /* M3 RL */ [-0.1028, -0.100],
+        /* M4 FL */ [ 0.1217, -0.150],
+    ],
+    //           M1 RR   M2 FR  M3 RL  M4 FL
+    spin_ccw: [false,   true,  true, false],
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,6 +504,220 @@ mod tests {
         assert!(g.update(true, 0.06, 0.05));
         // Stays ON after throttle drops back — now airborne, need authority.
         assert!(g.update(true, 0.0, 0.05));
+    }
+
+    // ---- Geometry-derived mixing ----
+
+    /// Net moment about the centre of gravity, N·m, for a set of motor
+    /// COMMANDS. Commands are converted to thrust through the same
+    /// quadratic curve the plant uses (`QuadParams::thrust_frac`), because
+    /// a balance that only holds in the linear approximation does not hold
+    /// on the aircraft.
+    ///
+    /// Returns `[roll, pitch]` in arbitrary but consistent units: thrust
+    /// is left as a fraction of per-motor maximum, so only the zero
+    /// matters, which is all these tests assert.
+    fn moments(g: &FrameGeometry, cmds: [f32; 4]) -> [f32; 2] {
+        let mut roll = 0.0;
+        let mut pitch = 0.0;
+        for i in 0..4 {
+            let t = cmds[i] * cmds[i];
+            roll += t * g.motor_xy[i][1];
+            pitch += t * g.motor_xy[i][0];
+        }
+        [roll, pitch]
+    }
+
+    /// A geometrically symmetric X frame must reproduce QUAD_X exactly.
+    /// This pins the derivation against the hand-written matrix that has
+    /// been flying the sim, so the new path is a generalisation rather
+    /// than a different convention.
+    #[test]
+    fn symmetric_geometry_reproduces_quad_x() {
+        let sym = FrameGeometry {
+            motor_xy: [
+                [-0.12, 0.12],
+                [0.12, 0.12],
+                [-0.12, -0.12],
+                [0.12, -0.12],
+            ],
+            spin_ccw: [false, true, true, false],
+        };
+        let derived = sym.mixer();
+        for i in 0..4 {
+            for j in 0..4 {
+                assert!(
+                    (derived.mix[i][j] - QUAD_X.mix[i][j]).abs() < 1e-5,
+                    "motor {i} column {j}: derived {} vs QUAD_X {}",
+                    derived.mix[i][j],
+                    QUAD_X.mix[i][j],
+                );
+            }
+        }
+    }
+
+    /// The defect the thrust column exists to fix: on this frame, four
+    /// equal commands do NOT balance. Asserted so the fix below is shown
+    /// to be fixing something real.
+    #[test]
+    fn flat_thrust_column_pitches_the_deadcat() {
+        let [_, pitch] = moments(&DEADCAT_7IN, [0.542; 4]);
+        assert!(
+            pitch.abs() > 1e-3,
+            "equal commands should leave a pitch moment on this frame, got {pitch}",
+        );
+    }
+
+    /// ...and the derived thrust column removes it, at any throttle the
+    /// mixer can actually deliver. The ceiling is set by the rear
+    /// coefficient: above `1/c_rear` the rear pair is asked for more than
+    /// full throttle, clamps, and the balance is lost — see
+    /// `collective_balance_has_a_ceiling`.
+    #[test]
+    fn collective_produces_no_moment_on_the_deadcat() {
+        let m = DEADCAT_7IN.mixer();
+        for thrust in [0.2f32, 0.4, 0.542, 0.8, 0.95] {
+            let out = m.apply_no_airmode(&ControlDemand {
+                thrust,
+                roll: 0.0,
+                pitch: 0.0,
+                yaw: 0.0,
+            });
+            let [roll, pitch] = moments(&DEADCAT_7IN, out.motors);
+            assert!(
+                roll.abs() < 1e-6 && pitch.abs() < 1e-6,
+                "collective at {thrust} left roll={roll} pitch={pitch}",
+            );
+        }
+    }
+
+    /// Hover throttle is unchanged by the rebalance: the thrust column
+    /// averages 1.0, so a `thrust` demand still means what it meant.
+    #[test]
+    fn thrust_column_averages_one() {
+        let m = DEADCAT_7IN.mixer();
+        let mean: f32 = (0..4).map(|i| m.mix[i][0]).sum::<f32>() / 4.0;
+        assert!((mean - 1.0).abs() < 1e-5, "thrust column mean {mean}");
+    }
+
+    /// Above the ceiling the rear pair clamps and the collective balance
+    /// breaks. Recorded because it is a real limit on usable thrust, not
+    /// a rounding artifact: the mixer cannot hold trim at full stick.
+    #[test]
+    fn collective_balance_has_a_ceiling() {
+        let m = DEADCAT_7IN.mixer();
+        let ceiling = 1.0 / m.mix[0][0];
+        assert!(
+            (0.955..0.965).contains(&ceiling),
+            "collective ceiling moved to {ceiling}",
+        );
+        let out = m.apply_no_airmode(&ControlDemand {
+            thrust: 1.0,
+            roll: 0.0,
+            pitch: 0.0,
+            yaw: 0.0,
+        });
+        assert!(
+            moments(&DEADCAT_7IN, out.motors)[1].abs() > 1e-3,
+            "full collective should clamp and lose balance",
+        );
+    }
+
+    /// A pure roll command leaves a small pitch moment, and no linear
+    /// mixer can remove it.
+    ///
+    /// To first order roll and pitch are decoupled: a roll command raises
+    /// both left motors and lowers both right ones, so the fore/aft sums
+    /// are unchanged. But thrust goes as the SQUARE of the command, and
+    /// squaring is convex, so equal-and-opposite command offsets raise
+    /// total thrust rather than leaving it alone. On a frame whose
+    /// fore/aft arms differ that surplus does not balance, and a pitch
+    /// moment appears.
+    ///
+    /// It is genuinely second-order — exactly quadratic in the roll
+    /// command and independent of throttle, which is what this asserts —
+    /// so it is a disturbance for the rate loop to reject during a roll,
+    /// not a trim error the mixer could carry. At a brisk 0.2 roll
+    /// command it is about 0.04 N·m, half the collective trim error that
+    /// the thrust column fixes.
+    ///
+    /// Arm-scaled roll coefficients would make this term four times
+    /// larger, by putting the bigger excursion on the longer pitch arm.
+    /// That is the second reason the roll column stays at +/-1.
+    #[test]
+    fn roll_cross_coupling_is_second_order() {
+        let m = DEADCAT_7IN.mixer();
+        let pitch_at = |thrust: f32, roll: f32| {
+            let out = m.apply_no_airmode(&ControlDemand { thrust, roll, pitch: 0.0, yaw: 0.0 });
+            moments(&DEADCAT_7IN, out.motors)[1]
+        };
+
+        // Quadratic in the roll command: doubling it quadruples the term.
+        let base = pitch_at(0.542, 0.0);
+        assert!(base.abs() < 1e-6, "balanced hover should have no pitch moment");
+        let small = pitch_at(0.542, 0.1) - base;
+        let large = pitch_at(0.542, 0.2) - base;
+        assert!(
+            (large / small - 4.0).abs() < 0.05,
+            "cross term should scale as roll^2; got ratio {}",
+            large / small,
+        );
+
+        // ...and independent of throttle, so it is not a trim error.
+        let at_low = pitch_at(0.3, 0.2) - pitch_at(0.3, 0.0);
+        assert!(
+            (at_low / large - 1.0).abs() < 0.05,
+            "cross term should not depend on throttle; {at_low} vs {large}",
+        );
+
+        // Bounded: under 0.007 in these units at a brisk roll command,
+        // which is 0.17 N·m at this airframe's 25 N per motor.
+        assert!(large.abs() < 0.007, "cross term grew to {large}");
+    }
+
+    /// The derived matrix keeps the firmware's sign conventions: +roll
+    /// lifts the left motors, +pitch lifts the front. Same assertions as
+    /// `conventions.rs` makes of QUAD_X.
+    #[test]
+    fn derived_mixer_keeps_the_sign_conventions() {
+        let m = DEADCAT_7IN.mixer();
+        let r = m.apply_no_airmode(&ControlDemand {
+            thrust: 0.5,
+            roll: 0.2,
+            pitch: 0.0,
+            yaw: 0.0,
+        }).motors;
+        assert!(r[2] + r[3] > r[0] + r[1], "+roll must lift the left motors");
+        let p = m.apply_no_airmode(&ControlDemand {
+            thrust: 0.5,
+            roll: 0.0,
+            pitch: 0.2,
+            yaw: 0.0,
+        }).motors;
+        assert!(p[1] + p[3] > p[0] + p[2], "+pitch must lift the front motors");
+    }
+
+    /// The deadcat mix differs from QUAD_X in the thrust column and
+    /// nowhere else. This is the summary of the whole exercise, and it
+    /// fails loudly if someone later "corrects" the torque columns to
+    /// follow the arm lengths.
+    #[test]
+    fn only_the_thrust_column_differs_from_quad_x() {
+        let m = DEADCAT_7IN.mixer();
+        for i in 0..4 {
+            for j in 1..4 {
+                assert!(
+                    (m.mix[i][j] - QUAD_X.mix[i][j]).abs() < 1e-6,
+                    "motor {i} column {j} should match QUAD_X: {} vs {}",
+                    m.mix[i][j],
+                    QUAD_X.mix[i][j],
+                );
+            }
+            assert!(
+                (m.mix[i][0] - 1.0).abs() > 1e-3,
+                "motor {i} thrust coefficient should NOT be 1.0",
+            );
+        }
     }
 
     #[test]
