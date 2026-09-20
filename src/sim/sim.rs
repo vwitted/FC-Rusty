@@ -89,14 +89,12 @@ impl QuadParams {
     /// Confidence varies sharply by field, and the sim is only as good as
     /// its weakest one:
     ///
-    ///  - `motor_xy` — SOLID laterally. Derived from motor separations
-    ///    that are over-determined and agree to 6 mm. The fore/aft centre
-    ///    of gravity is the loosest number in the set: both measurements
-    ///    agree it is AFT of the motor centroid, but by 10.2 mm on one
-    ///    reading and 30.0 mm on the other. The smaller is used; see
-    ///    [`crate::control::mixer::DEADCAT_7IN`]. It matters more than
-    ///    its size suggests — even 10 mm pitches the aircraft through 90
-    ///    degrees in under a second on four equal throttles.
+    ///  - `motor_xy` — SOLID. The separations are over-determined and
+    ///    agree to 6 mm, and the centre of gravity closes with them: it
+    ///    sits 30 mm AFT of the motor centroid. See
+    ///    [`crate::control::mixer::DEADCAT_7IN`]. That offset dominates
+    ///    the plant's behaviour — on four equal throttles it pitches the
+    ///    aircraft through 90 degrees in well under a second.
     ///  - `mass` — measured, 750 g with a 6S1P pack.
     ///  - `inertia` — COMPUTED, not measured: the four motors as point
     ///    masses at 55 g each plus a uniform slab for everything else.
@@ -127,10 +125,10 @@ impl QuadParams {
             mass: 0.750,
             inertia: [0.0040, 0.0035, 0.0076],
             motor_xy: [
-                /* M1 RR */ [-0.1028, 0.100],
-                /* M2 FR */ [0.1217, 0.150],
-                /* M3 RL */ [-0.1028, -0.100],
-                /* M4 FL */ [0.1217, -0.150],
+                /* M1 RR */ [-0.08225, 0.100],
+                /* M2 FR */ [0.14225, 0.150],
+                /* M3 RL */ [-0.08225, -0.100],
+                /* M4 FL */ [0.14225, -0.150],
             ],
             max_thrust: 100.0, // 25 N per motor, as supplied; see above
             yaw_torque_coeff: 0.015,

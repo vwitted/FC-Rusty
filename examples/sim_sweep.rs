@@ -69,14 +69,20 @@ const GYRO_FLOOR_DPS: f32 = 1.0;
 
 /// Plant parameters, overridable for sensitivity checks.
 ///
-/// QuadParams::default() is labelled "reasonable defaults for a 5in racing
-/// quad" -- plausible textbook values, not measurements of this airframe,
-/// which is a 7in, with one exception: motor_tau is a bench measurement (36 ms, corner at
-/// 4.4 Hz; see QuadParams::motor_tau). It sets the loop's dominant phase
-/// lag, and max_thrust sets loop gain. max_thrust and inertia remain
-/// unmeasured, so sweep them rather than trust them.
+/// The default is still `QuadParams::default()`, the 5in racer, because
+/// the baseline is blessed against it. `PLANT=deadcat` selects the real
+/// measured airframe (`QuadParams::deadcat_7in`) instead. Everything
+/// below then overrides whichever base was chosen.
+///
+/// Only `motor_tau` is a measurement common to both (36.9 ms, corner at
+/// 4.3 Hz). It sets the loop's dominant phase lag; `max_thrust` sets loop
+/// gain, as its square root at the hover operating point.
 fn plant_params() -> QuadParams {
-    let mut p = QuadParams::default();
+    let mut p = match std::env::var("PLANT").as_deref() {
+        Ok("deadcat") => QuadParams::deadcat_7in(),
+        Ok("default") | Err(_) => QuadParams::default(),
+        Ok(other) => panic!("PLANT={other}: expected 'deadcat' or 'default'"),
+    };
     if let Some(v) = std::env::var("PLANT_TAU").ok().and_then(|v| v.parse().ok()) {
         p.motor_tau = v;
     }
@@ -275,6 +281,28 @@ fn tunables() -> Tunables {
     }
     if let Some(v) = std::env::var("RATE_KD").ok().and_then(|v| v.parse().ok()) {
         t.rate.kd = v;
+    }
+    // Altitude gains, in throttle per metre and per m/s. They were not
+    // overridable, which hid a real effect when the plant's thrust changed:
+    // the throttle-to-acceleration gain at hover scales as the SQUARE ROOT
+    // of max_thrust, so a thrust change detunes the altitude loop by the
+    // same factor it detunes the rate loop, and the two must be retuned
+    // together. Sweeping rate gains alone reports an altitude failure that
+    // looks like an attitude problem.
+    if let Some(v) = std::env::var("ALT_KP").ok().and_then(|v| v.parse().ok()) {
+        t.alt.kp = v;
+    }
+    if let Some(v) = std::env::var("ALT_KD").ok().and_then(|v| v.parse().ok()) {
+        t.alt.kd = v;
+    }
+    if let Some(v) = std::env::var("ALT_KI").ok().and_then(|v| v.parse().ok()) {
+        t.alt.ki = v;
+    }
+    // GEOMETRY_MIXER=1 swaps QUAD_X for the geometry-derived matrix. Only
+    // meaningful with PLANT=deadcat: on a symmetric plant the two are the
+    // same matrix.
+    if std::env::var("GEOMETRY_MIXER").is_ok() {
+        t.geometry_mixer = true;
     }
     // D_LPF_MS overrides the D-term filter constant (PidLimits::d_lpf_tau_s,
     // 8 ms in the firmware). It is the other phase lag inside the rate loop,

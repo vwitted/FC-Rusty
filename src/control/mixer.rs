@@ -243,7 +243,7 @@ pub const QUAD_X: Mixer<4> = Mixer {
 ///  - **Collective thrust produces a pitching moment.** This one is a
 ///    defect. Four equal thrusts about a centre of gravity that is not
 ///    at their centroid do not balance: on this frame, at hover, the
-///    residual is 0.07 N·m, about 1100 deg/s^2 of pitch acceleration at
+///    residual is 0.22 N·m, about 3600 deg/s^2 of pitch acceleration at
 ///    the estimated Iyy. The rate loop can hold that, but only by
 ///    carrying a permanent integrator offset that eats authority and
 ///    unwinds differently at every throttle setting.
@@ -330,31 +330,30 @@ impl FrameGeometry {
 /// lateral half-spans at 100/150 mm and the longitudinal motor span at
 /// 224.5 mm.
 ///
-/// **The fore/aft centre of gravity is AFT of the motor centroid.** Both
-/// measurements agree on that, which is what fixes the sign of the thrust
-/// column: the rear motors carry more of the hover load. They disagree
-/// only on how far:
+/// **The centre of gravity is 30 mm AFT of the motor centroid**, so the
+/// rear motors carry more of the hover load. That comes from the measured
+/// 100 mm rear / 160 mm front split, and it is robust: the two are taken
+/// to a common reference, and the OFFSET is half their difference, which
+/// is unchanged by wherever that reference sits.
 ///
-///  - Motor-to-CoG arm lengths (150 mm rear, 200 mm front) give 111.8 mm
-///    to the rear motors and 132.3 mm to the front — 10.2 mm aft.
-///  - The stated "1:1.6 rear:front", 100 mm and 160 mm, is 30.0 mm aft.
+/// The reference is the motors' outer edges, not their axes. Measured
+/// along the centre line the motors are 260 mm apart, 35.5 mm more than
+/// the 224.5 mm axis-to-axis span the separations give — one motor
+/// diameter, which is what edge-to-edge costs. Subtracting one radius
+/// from each end gives 82.5 and 142.5 mm, summing to 225 mm against the
+/// span's 224.5 mm. The set is consistent.
 ///
-/// Neither pair can be a measurement to the motor axes, because the two
-/// distances must sum to the 224.5 mm motor span and both overshoot it
-/// (by 19.6 mm and 35.5 mm) — consistent with being taken along the arm
-/// tubes and to the frame's extremities respectively.
-///
-/// The SMALLER offset is used deliberately. With the direction certain,
-/// under-correcting only leaves some trim behind, whereas over-correcting
-/// would push the trim the other way. A fore/aft balance test would pin
-/// the magnitude; it is no longer needed to settle the direction.
+/// This is 3x the offset that the motor-to-CoG arm lengths (150/200 mm)
+/// suggested. Those are taken along the arm tubes rather than straight to
+/// the centre of gravity, and do not close on the motor span; the
+/// centre-line pair does.
 pub const DEADCAT_7IN: FrameGeometry = FrameGeometry {
     //             x fwd    y right
     motor_xy: [
-        /* M1 RR */ [-0.1028,  0.100],
-        /* M2 FR */ [ 0.1217,  0.150],
-        /* M3 RL */ [-0.1028, -0.100],
-        /* M4 FL */ [ 0.1217, -0.150],
+        /* M1 RR */ [-0.08225,  0.100],
+        /* M2 FR */ [ 0.14225,  0.150],
+        /* M3 RL */ [-0.08225, -0.100],
+        /* M4 FL */ [ 0.14225, -0.150],
     ],
     //           M1 RR   M2 FR  M3 RL  M4 FL
     spin_ccw: [false,   true,  true, false],
@@ -574,13 +573,13 @@ mod tests {
 
     /// ...and the derived thrust column removes it, at any throttle the
     /// mixer can actually deliver. The ceiling is set by the rear
-    /// coefficient: above `1/c_rear` the rear pair is asked for more than
-    /// full throttle, clamps, and the balance is lost — see
+    /// coefficient: above `1/c_rear` — 0.88 here — the rear pair is asked
+    /// for more than full throttle, clamps, and the balance is lost. See
     /// `collective_balance_has_a_ceiling`.
     #[test]
     fn collective_produces_no_moment_on_the_deadcat() {
         let m = DEADCAT_7IN.mixer();
-        for thrust in [0.2f32, 0.4, 0.542, 0.8, 0.95] {
+        for thrust in [0.2f32, 0.4, 0.542, 0.7, 0.85] {
             let out = m.apply_no_airmode(&ControlDemand {
                 thrust,
                 roll: 0.0,
@@ -610,9 +609,13 @@ mod tests {
     #[test]
     fn collective_balance_has_a_ceiling() {
         let m = DEADCAT_7IN.mixer();
+        // 1 / 1.136 at the measured 30 mm centre-of-gravity offset. The
+        // further aft the centre of gravity, the more collective the rear
+        // pair is asked for and the lower this sits, so it is worth
+        // watching: it is thrust the aircraft cannot use while trimmed.
         let ceiling = 1.0 / m.mix[0][0];
         assert!(
-            (0.955..0.965).contains(&ceiling),
+            (0.875..0.885).contains(&ceiling),
             "collective ceiling moved to {ceiling}",
         );
         let out = m.apply_no_airmode(&ControlDemand {

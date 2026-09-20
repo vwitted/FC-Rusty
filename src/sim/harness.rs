@@ -9,7 +9,7 @@
 
 use crate::attitude_mekf::{AttitudeMekf, MekfParams};
 use crate::control::altitude::{AltitudeController, AltitudeGains};
-use crate::control::mixer::{ControlDemand, QUAD_X};
+use crate::control::mixer::{ControlDemand, Mixer, DEADCAT_7IN, QUAD_X};
 use crate::control::mpc::{AttitudeMpc, MpcModel};
 use crate::control::modes::{
     nav_step, FlightMode, NavInputs, NavState, PosEstimate,
@@ -234,6 +234,12 @@ pub struct Tunables {
     /// worse merely for being under-solved.
     pub mpc_max_iter: usize,
     pub alt: AltitudeGains,
+    /// Use the geometry-derived mix matrix (`mixer::DEADCAT_7IN`) instead
+    /// of `QUAD_X`. They differ only in the thrust column, which balances
+    /// the collective against a centre of gravity that is not at the
+    /// motor centroid. Only meaningful against a plant that HAS that
+    /// asymmetry -- on a symmetric frame the two matrices are identical.
+    pub geometry_mixer: bool,
 }
 
 impl Tunables {
@@ -257,6 +263,8 @@ impl Tunables {
             // Read from the firmware's model rather than restated.
             mpc_max_iter: MpcModel::FIRMWARE.max_iter,
             alt: AltitudeGains { kp: 0.15, kd: 0.1, ki: 0.05 },
+            // main.rs flies QUAD_X.
+            geometry_mixer: false,
         }
     }
 }
@@ -566,6 +574,12 @@ pub fn run_case(
 ) -> Metrics {
     let r = h.rates;
     let hover_throttle = h.plant.hover_throttle();
+    // QUAD_X unless asked otherwise; see Tunables::geometry_mixer.
+    let mixer: Mixer<4> = if tun.geometry_mixer {
+        DEADCAT_7IN.mixer()
+    } else {
+        Mixer { mix: QUAD_X.mix }
+    };
     let mut sim = QuadSim::new_hovering(h.plant, h.target_alt);
     let upset = h.initial_attitude_deg != [0.0; 3] || h.initial_rates_dps != [0.0; 3];
     if h.initial_rates_dps != [0.0; 3] {
@@ -950,7 +964,7 @@ pub fn run_case(
             pitch: pid_output[1],
             yaw: pid_output[2],
         };
-        let mixed = QUAD_X.apply(&demand);
+        let mixed = mixer.apply(&demand);
         let motors = deg.motors(mixed.motors);
 
         if trace_due {
