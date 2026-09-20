@@ -306,3 +306,40 @@ Note the sim injects vibration at a FIXED amplitude in dps; it does not
 scale with thrust. A more powerful airframe really does vibrate more, so
 the sim understates this for the 7in, and the 100 Hz regression above
 should be read as a floor on the problem, not a measure of it.
+
+## The pinned genes: do NOT widen those bounds
+
+Both remaining pins were tested directly, holding everything else at the
+GA v2 genome and sweeping the pinned parameter across the sweep:
+
+  rate_ki   0.01 -> 38   0.025 -> 38   0.05 -> 40   0.1 -> 48
+            0.25 -> 744  0.5 -> 760            (failures out of 768)
+  d_tau     0.5ms -> 40  1 -> 40  2 -> 33  4 -> 32  8 -> 39  16 -> 648
+
+Neither pin is a bound constraint, and widening either would be wrong:
+
+  - `rate_ki` sits just below a CLIFF. Past 0.1 the sweep collapses
+    entirely. The bound is not obstructing the search, it is protecting
+    it, and raising it would let the search walk off the edge.
+  - `d_tau`'s optimum is 2-4 ms, comfortably INSIDE the existing 0.5-50 ms
+    range. The search pinned the floor while a better value sat in the
+    middle of the interval it already had. Lowering the floor would
+    achieve nothing.
+
+Adding the missing windup cost (a 90 deg upset case and a half-dead
+motor, with 120 deg and 0.6 in holdout — `Case` gained `roll0_deg` and
+`alt_m` to express them) did NOT dislodge ki: it still improves the GA
+fitness monotonically up to the bound (train 117.4 at ki 0.005 falling to
+111.4 at 0.05). So the disagreement with the sweep is real but small —
+40 failures against 30 — and lives in marginal rows the GA's 24 cases do
+not contain.
+
+Best hand-refined settings, GA v2 genome with ki 0.01 and d_tau 4 ms:
+30/768 failures, ZERO of them on any vibration or resonance row, 92/96
+rows clean. What remains is only `gyro_p_online` 0.4, `upset_roll_deg`
+179, and `motor3_scale` 0.25 and 0 — the physically unrecoverable set.
+The controller is at the sweep's floor.
+
+Treat those two values with more caution than the rest: they are tuned
+against the sweep, which unlike the GA has no holdout, so they carry some
+risk of being fitted to it.

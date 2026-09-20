@@ -151,10 +151,42 @@ struct Case {
     /// only the second and the search filters as hard as it can, because
     /// lag costs nothing when nothing ever asks the aircraft to move.
     cmd: AttitudeStep,
+    /// Initial roll, degrees, for recovery-from-upset cases. 0 starts
+    /// level. Non-zero also needs `alt_m` raised, or the aircraft simply
+    /// runs out of height before it can finish recovering.
+    roll0_deg: f32,
+    /// Target altitude, metres. 0 keeps the shared config's.
+    alt_m: f32,
 }
 
 fn case(deg: Degradation, seed: u64) -> Case {
-    Case { deg, seed, cmd: AttitudeStep::NONE }
+    Case { deg, seed, cmd: AttitudeStep::NONE, roll0_deg: 0.0, alt_m: 0.0 }
+}
+
+/// Start rolled past level and require recovery, with height to do it in.
+///
+/// Added 2026-09-20 because the fitness was missing the cost that keeps
+/// integral gain honest. Every case above starts level and stays near it,
+/// so the integrator never saturates for long, and rate_ki simply drifted
+/// to its ceiling with nothing to push back. The sweep disagreed sharply:
+/// past ki 0.1 its upset and motor-failure rows collapse (744 of 768
+/// failures at ki 0.25). A wound-up integrator is only expensive when the
+/// error has been large for a while, and nothing here asked for that.
+fn upset(roll0_deg: f32, deg: Degradation, seed: u64) -> Case {
+    Case { deg, seed, cmd: AttitudeStep::NONE, roll0_deg, alt_m: 100.0 }
+}
+
+impl Case {
+    /// This case's harness config: the shared one with the per-case
+    /// command, upset and altitude applied.
+    fn cfg(&self, h: &HarnessCfg) -> HarnessCfg {
+        HarnessCfg {
+            cmd: self.cmd,
+            initial_attitude_deg: [self.roll0_deg, 0.0, 0.0],
+            target_alt: if self.alt_m > 0.0 { self.alt_m } else { h.target_alt },
+            ..*h
+        }
+    }
 }
 
 /// Roll out at 5.5 s and back to level at 7.0 s, after both disturbances
@@ -170,6 +202,8 @@ fn tracked(deg: Degradation, seed: u64, roll: f32) -> Case {
             pitch_deg: 0.0,
             return_at_s: 7.0,
         },
+        roll0_deg: 0.0,
+        alt_m: 0.0,
     }
 }
 
@@ -207,6 +241,14 @@ fn training_set() -> Vec<Case> {
         // A search cannot trade off a cost it is never shown.
         v.push(case(gyro(vib(15.0, 30.0)), seed));
         v.push(case(gyro(vib(10.0, 50.0)), seed));
+        // Sustained large error, the cost that prices integral gain. A
+        // 90 deg upset and a half-dead motor both hold the integrator
+        // against its clamp for seconds at a time.
+        v.push(upset(90.0, Degradation::none(), seed));
+        v.push(case(
+            Degradation { motor_scale: [1.0, 1.0, 0.5, 1.0], ..Degradation::none() },
+            seed,
+        ));
         v.push(case(
             Degradation { motor_scale: [1.0, 1.0, 0.8, 1.0], ..Degradation::none() },
             seed,
@@ -234,6 +276,11 @@ fn holdout_set() -> Vec<Case> {
         // checked rather than merely memorised.
         v.push(case(gyro(vib(12.0, 20.0)), seed));
         v.push(case(gyro(vib(15.0, 70.0)), seed));
+        v.push(upset(120.0, Degradation::none(), seed));
+        v.push(case(
+            Degradation { motor_scale: [0.6, 1.0, 1.0, 1.0], ..Degradation::none() },
+            seed,
+        ));
         v.push(case(
             Degradation { motor_scale: [0.85, 1.0, 1.0, 1.0], ..Degradation::none() },
             seed,
@@ -270,7 +317,7 @@ fn cost(m: &Metrics, total_s: f32) -> f64 {
 fn evaluate(h: &HarnessCfg, tun: &Tunables, cases: &[Case]) -> f64 {
     let mut total = 0.0;
     for c in cases {
-        let hc = HarnessCfg { cmd: c.cmd, ..*h };
+        let hc = c.cfg(h);
         total += cost(&run_case(&hc, tun, c.deg, c.seed, None), h.total_s);
     }
     total / cases.len() as f64
@@ -282,7 +329,7 @@ fn survived(h: &HarnessCfg, tun: &Tunables, cases: &[Case]) -> usize {
     cases
         .iter()
         .filter(|c| {
-            let hc = HarnessCfg { cmd: c.cmd, ..*h };
+            let hc = c.cfg(h);
             run_case(&hc, tun, c.deg, c.seed, None).failed_at.is_none()
         })
         .count()
