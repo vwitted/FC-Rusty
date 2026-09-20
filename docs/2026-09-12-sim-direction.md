@@ -5,19 +5,31 @@ specification; PROJECT_STATUS.md holds current state.
 
 ## Prerequisites
 
-- **Magnetometer.** The SE100 V2 compass (IST8310) reads on the bench but
-  has no hard-iron calibration and an unverified mounting orientation.
-  Both are needed before heading is trusted, and before sim work that
-  depends on real sensor figures.
-- **Airframe figures.** All-up weight with the flight battery,
-  motor-to-motor diagonal, cell count, motor size and KV, prop, and hover
-  throttle if known. The sim defaults describe a 5in racer; the airframe
-  is a 7in. Only `motor_tau` (36 ms) is measured.
+- **Magnetometer.** RESOLVED, 2026-09-20. The fitted compass is a
+  QMC5883P alongside an M10 GPS, now running at 10 Hz.
+- **Airframe figures.** SUPPLIED, 2026-09-20, in
+  `docs/motor_body_measurements.md`. Carried into the code as
+  `QuadParams::deadcat_7in()` and `mixer::DEADCAT_7IN`. Two numbers are
+  still open, and both block the retune below:
+  - **Thrust.** 25 N per motor, 100 N total, is 13.6:1 on 750 g where a
+    7in build is usually 4-6:1. Loop gain scales with it. Hover throttle
+    on the first flight separates the cases: 27% means 100 N is right,
+    54% means it is about 4x high.
+  - **Fore/aft centre of gravity.** Given twice in the measurements, and
+    the two disagree in DIRECTION. The motor-to-CoG arm lengths put it
+    aft of the motor centroid; the separate "1:1.6 rear:front" figure
+    puts it forward. The aft reading is used, as the one taken to the
+    motors, but it is a reconciliation rather than a measurement. One
+    balance test settles it: balance the airframe fore/aft on an edge and
+    measure from the rear motor axis to the balance line.
 
 ## Sim roadmap
 
 1. Replace the 5in plant defaults with the 7in figures, and re-bless the
-   sweep baseline once.
+   sweep baseline once. STARTED 2026-09-20: the figures are in the code
+   as `QuadParams::deadcat_7in()`, but the default still describes the
+   5in quad because adopting them requires retuning the whole cascade.
+   See "Retuning against the real plant" below.
 2. Run the PosKF and MEKF in the harness loop by default, with baro and
    GPS noise models. The PosKF is not in the harness today: altitude and
    position control run on true state, so the harness cannot show what
@@ -114,3 +126,52 @@ once bidirectional telemetry worked. The driver already runs DShot600
 `ARR=132`): a DShot300 frame took about 181 us and could not fit the
 8 kHz loop's 125 us period. Two comments still stating DShot300 were
 corrected on this date.
+
+## Frame geometry and the mixer, 2026-09-20
+
+The airframe is a deadcat: rear motors 200 mm apart, front pair 300 mm,
+sides 230 mm. Those separations are over-determined and agree — they
+predict a 336 mm diagonal against 330 mm measured — which fixes the
+lateral half-spans at 100/150 mm and the longitudinal motor span at
+224.5 mm.
+
+**Only the mixer's thrust column should change.** The expected change
+was to scale the roll and pitch columns by lever arm, which is what
+minimum-effort allocation gives. Measured on this frame, that is worse
+on both counts that matter: torque is limited by the first motor to hit
+a rail rather than by total effort, and arm-scaling under-drives the
+short arms, giving 14% less roll moment per unit of saturation and 7%
+less pitch. It also quadruples the roll-to-pitch cross term. `+/-1` is
+the right answer here, and `mixer.rs` has tests recording why.
+
+What is a real defect is the thrust column. Four equal thrusts about a
+centre of gravity that is not their centroid do not balance: at hover the
+residual is 0.07 N.m, about 1100 deg/s^2, enough to carry the aircraft
+through 90 degrees of pitch in under a second open-loop. In the sweep it
+costs a factor of 27 in attitude RMS (1.10 deg against 0.041). The
+derived column removes it, up to a collective of 0.96 where the rear pair
+clamps.
+
+`mixer::DEADCAT_7IN` is built and tested but NOT wired into flight;
+`main.rs` still uses `QUAD_X`. Switching it is a one-line change, held
+back until the balance test fixes the sign of the CoG offset — applied
+backwards it would double the trim rather than remove it.
+
+## Retuning against the real plant
+
+`QuadParams::default()` still describes the 5in quad. Sweeping the
+measured figures in makes every case a flyaway, on every axis and seed.
+Isolated:
+
+- The cause is `max_thrust`, not the geometry. At the old 20 N the real
+  deadcat geometry flies; at 100 N even a symmetric frame flies away.
+- Scaling the rate gains recovers attitude at about 0.2x (attitude RMS
+  0.415) but not altitude. Hover throttle moves from 0.54 to 0.27, so the
+  altitude and position loops are mistuned by the same factor: altitude
+  RMS 13.6 m, airborne 40% of the time.
+
+So adopting the real plant means retuning the whole cascade, not just the
+rate loop, and it is worth doing only once the thrust figure is
+confirmed. Sequence: confirm thrust, settle the CoG by balance test, wire
+the derived mixer, then run the GA jointly over rate gains, filters,
+altitude and position gains, and re-bless.
