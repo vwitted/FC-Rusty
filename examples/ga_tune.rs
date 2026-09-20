@@ -196,6 +196,17 @@ fn training_set() -> Vec<Case> {
         v.push(case(gyro(noise(4.0)), seed));
         v.push(case(gyro(vib(5.0, 80.0)), seed));
         v.push(case(gyro(vib(5.0, 300.0)), seed));
+        // LOW-frequency, high-amplitude vibration. Added 2026-09-20 to
+        // close a measured gap: with only the 80 and 300 Hz cases above,
+        // the search settled on a 58 Hz gyro cutoff across three
+        // independent runs, which passes everything below it straight
+        // through. That genome scored best on this fitness and yet lost
+        // on the sweep -- 90 failures against 74 for a 300 Hz cutoff --
+        // because the sweep spends 51 of its 96 rows on vibration, up to
+        // 20 dps and down to 10 Hz, and this set asked for none of it.
+        // A search cannot trade off a cost it is never shown.
+        v.push(case(gyro(vib(15.0, 30.0)), seed));
+        v.push(case(gyro(vib(10.0, 50.0)), seed));
         v.push(case(
             Degradation { motor_scale: [1.0, 1.0, 0.8, 1.0], ..Degradation::none() },
             seed,
@@ -218,6 +229,11 @@ fn holdout_set() -> Vec<Case> {
         v.push(case(gyro(vib(3.0, 45.0)), seed));
         v.push(case(gyro(vib(8.0, 160.0)), seed));
         v.push(case(gyro(vib(5.0, 600.0)), seed));
+        // Low-frequency holdout, at amplitudes and frequencies the
+        // training set does not use, so the widened spread above is
+        // checked rather than merely memorised.
+        v.push(case(gyro(vib(12.0, 20.0)), seed));
+        v.push(case(gyro(vib(15.0, 70.0)), seed));
         v.push(case(
             Degradation { motor_scale: [0.85, 1.0, 1.0, 1.0], ..Degradation::none() },
             seed,
@@ -360,6 +376,34 @@ fn main() {
         ..HarnessCfg::firmware_rates(plant)
     };
 
+    // GA_EVAL="kp,ki,kd,yaw_kp,yaw_ki,gyro_fc,d_tau" scores one genome
+    // against train and holdout and exits, so two rival answers can be
+    // compared on the SAME fitness the search uses. Without this the only
+    // way to compare was the sweep, which asks a different question and
+    // therefore cannot settle whether a search under-performed or was
+    // merely asked the wrong thing.
+    if let Ok(spec) = std::env::var("GA_EVAL") {
+        let vals: Vec<f32> = spec
+            .split(',')
+            .map(|t| t.trim().parse().expect("GA_EVAL: expected 7 comma-separated numbers"))
+            .collect();
+        assert_eq!(vals.len(), N_GENES, "GA_EVAL needs {N_GENES} values: {}", GENE_NAMES.join(","));
+        let t = Tunables {
+            rate: PidGains { kp: vals[0], ki: vals[1], kd: vals[2] },
+            yaw: PidGains { kp: vals[3], ki: vals[4], kd: 0.0 },
+            limits: PidLimits { integral_max: 0.3, output_max: 0.5, d_lpf_tau_s: vals[6] },
+            gyro_fc_hz: vals[5],
+            alt: AltitudeGains { kp: 0.15, kd: 0.1, ki: 0.05 },
+            geometry_mixer: std::env::var("GEOMETRY_MIXER").is_ok(),
+            ..Tunables::firmware()
+        };
+        let (tr, ho) = (training_set(), holdout_set());
+        println!("GA_EVAL  train {:8.2} ({}/{})   holdout {:8.2} ({}/{})",
+                 evaluate(&h, &t, &tr), survived(&h, &t, &tr), tr.len(),
+                 evaluate(&h, &t, &ho), survived(&h, &t, &ho), ho.len());
+        return;
+    }
+
     let train = training_set();
     let hold = holdout_set();
 
@@ -398,6 +442,9 @@ fn main() {
     }
 
     let mut best_overall = (from_tunables(&base), base_train);
+    // Generation at which the incumbent was last beaten by more than a
+    // rounding error, for the stall warning at the end.
+    let mut last_gain_gen: usize = 0;
 
     for generation in 0..generations {
         // Fitness in parallel: evaluations are independent and this is the
@@ -431,6 +478,11 @@ fn main() {
         pop.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
         if pop[0].1 < best_overall.1 {
+            // 0.1% counts as progress; anything smaller is drift and
+            // should not keep resetting the stall counter.
+            if pop[0].1 < best_overall.1 * 0.999 {
+                last_gain_gen = generation;
+            }
             best_overall = pop[0];
         }
 
@@ -493,6 +545,39 @@ fn main() {
         println!("  A pinned gene means the search wanted to go further. Ask what");
         println!("  cost is MISSING from the fitness function before widening the");
         println!("  bound -- widening it usually just moves the wall.");
+    }
+    // An early stall is worth reporting, but do NOT call it a local
+    // optimum without checking, because the same symptom has a second and
+    // more likely cause: a training set that does not ask for the thing
+    // the genome is bad at.
+    //
+    // 2026-09-20 is the cautionary case. A 64x60 run settled by generation
+    // 19 on gyro_fc 57.9 Hz / d_tau 0.77 ms. A hand scan found gyro_fc
+    // 300 Hz with d_tau 8 ms strictly better ON THE SWEEP -- 74 failures
+    // against 90, vibration failures halved -- which looked exactly like
+    // premature convergence. It was not. Two further runs at 96x140 with
+    // higher mutation and different seeds landed in the same place
+    // (fitness 57.25, 57.31, 57.32), so the search was finding a robust
+    // optimum OF THIS FITNESS FUNCTION.
+    //
+    // The gap was the training set. It carries two vibration cases per
+    // seed, both at 5 dps and at 80 and 300 Hz, while the sweep devotes
+    // 51 of its 96 rows to vibration, up to 20 dps and down to 10 Hz --
+    // right where a 58 Hz cutoff passes everything straight through. The
+    // search was answering a question about vibration that nobody asked
+    // it. Widening the training spread is the fix; re-seeding is not.
+    //
+    // Use GA_EVAL to score a specific genome against train and holdout
+    // before concluding anything about which of two answers is better.
+    let stalled = generations.saturating_sub(last_gain_gen);
+    if generations >= 10 && stalled * 2 >= generations {
+        println!();
+        println!("NOTE: no real improvement for the last {stalled} of {generations} generations.");
+        println!("  That is usually convergence rather than a problem. Before");
+        println!("  treating it as a LOCAL optimum, re-run with another GA_SEED");
+        println!("  and a larger GA_MUT: if they agree, the search is fine and any");
+        println!("  disagreement with the sweep is a TRAINING SET gap, not a search");
+        println!("  failure. Score the rival genome with GA_EVAL to tell which.");
     }
     println!();
     println!("Read the HOLDOUT column. If it did not improve alongside train,");

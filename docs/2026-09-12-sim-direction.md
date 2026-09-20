@@ -249,3 +249,60 @@ filtering at 90. Worth surfacing the effective cutoff if the legacy
 preset is ever tuned seriously — and note a GA on that preset would see a
 flat search space above 90 Hz, since every value there clamps to the same
 filter.
+
+## Reading the sweep: boundaries, not failure counts
+
+A clean sweep is not the target and is not reachable. Several axes run to
+conditions nothing can survive: `motor3_scale` reaches 0, a dead motor,
+which a quad cannot hold attitude and yaw through, and `upset_roll_deg`
+reaches 179 degrees, inverted at 5 m. 40 of the blessed baseline's 43
+failures sit at those settings.
+
+So compare WHERE EACH AXIS STOPS SURVIVING, not how many cases failed.
+An earlier note here compared raw counts across two different plants and
+read a better controller as a worse one.
+
+## GA, corrected: the training set, not the search
+
+The first run's genome (gyro_fc 57.9 Hz, d_tau 0.77 ms) lost on the sweep
+to a hand-found gyro_fc 300 Hz / d_tau 8 ms — 90 failures against 74 —
+which looked like premature convergence, since it had settled by
+generation 19. It was not.
+
+  - Two further runs, 96x140 with higher mutation and fresh seeds, landed
+    in the same basin: fitness 57.25, 57.31, 57.32, cutoffs 57.9, 67.2,
+    66.2 Hz.
+  - `GA_EVAL` (added for this) scores a specific genome on the search's
+    own fitness. The GA genome beats the hand rival there — train 57.25
+    against 60.07, holdout 46.21 against 46.92.
+
+The search was finding a robust optimum of its fitness function. The gap
+was the TRAINING SET: two vibration cases per seed, both 5 dps, at 80 and
+300 Hz, while the sweep spends 51 of its 96 rows on vibration up to
+20 dps and down to 10 Hz — exactly where a 58 Hz cutoff passes everything
+through. A search cannot trade off a cost it is never shown.
+
+Adding low-frequency, high-amplitude vibration to training (15 dps at
+30 Hz, 10 dps at 50 Hz) and to holdout (12 dps at 20 Hz, 15 dps at 70 Hz)
+moved the fitted cutoff to 100.9 Hz and fixed it:
+
+                              total  vib+res  clean  air_frac  att_rms
+  GA v1, narrow vib spread    90/768    56    84/96   0.110    0.072
+  hand rival fc=300 d=8ms     74/768    32    86/96   0.065    0.091
+  GA v2, widened vib spread   40/768     8    91/96   0.019    0.066
+
+GA v2 beats the 5in baseline's 43 failures on a harder plant. Boundaries
+against that baseline: BETTER on gyro dropout (0.8 -> 0.6), upset
+recovery (120 -> 150 deg) and motor failure (0.7 -> 0.5); worse only on
+100 Hz vibration (20 -> 10 dps); identical everywhere else, with both
+resonance axes back to 1600 Hz.
+
+GA v2: rate kp 0.002339, ki 0.050000, kd 0.000028; yaw kp 0.004283,
+ki 0.000353; gyro_fc 100.89 Hz; d_lpf tau 0.5 ms. `rate_ki` and `d_tau`
+are still pinned, so the fitness is still missing a cost — windup and lag
+respectively. Worth resolving before these are flown.
+
+Note the sim injects vibration at a FIXED amplitude in dps; it does not
+scale with thrust. A more powerful airframe really does vibrate more, so
+the sim understates this for the 7in, and the 100 Hz regression above
+should be read as a floor on the problem, not a measure of it.
