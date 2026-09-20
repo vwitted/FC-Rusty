@@ -17,8 +17,6 @@
 // Checksum: XOR of all bytes between '$' and '*' (exclusive).
 
 /// Maximum NMEA sentence length (spec says 82 chars max including $, *, checksum, \r\n)
-use core::Option;
-
 const MAX_SENTENCE_LEN: usize = 83;
 
 /// GPS fix quality (from GGA sentence).
