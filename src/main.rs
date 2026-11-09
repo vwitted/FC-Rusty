@@ -153,7 +153,7 @@ use drivers::nmea::{GpsData, NmeaParser};
 use drivers::wt901b::{
     ImuData, UPDATED_ACCEL, UPDATED_ANGLE, UPDATED_GYRO, UPDATED_QUAT,
 };
-use estimation::{geodetic_to_local_ned, PosKf};
+use estimation::{geodetic_to_local_ned, PosKf, PosKfParams};
 
 // ---- Flight modes ----
 
@@ -1428,7 +1428,7 @@ async fn mekf_task() {
     const RAD2DEG: f32 = 180.0 / PI;
     // 8 kHz predict / 100 Hz update → 80:1 decimation. Tune if accel
     // vibration at ODR aliases into the update band.
-    const ACCEL_DECIMATION: u32 = 80;
+    use attitude_mekf::ACCEL_DECIMATION;
 
     defmt::info!("MEKF task started — waiting for first RAW_IMU sample");
 
@@ -1551,19 +1551,8 @@ async fn mekf_task() {
             // Horizontal only, matching update_gps_velocity: consumer
             // vertical GPS velocity is too noisy to differentiate.
             let a_g = raw.accel_g();
-            let accel_corrected = if gps_accel_ned != [0.0; 2] {
-                let e = mekf.euler();
-                let rot = nalgebra::Rotation3::from_euler_angles(e[0], e[1], e[2]);
-                let ab = rot.inverse()
-                    * nalgebra::Vector3::new(gps_accel_ned[0], gps_accel_ned[1], 0.0);
-                [
-                    a_g[0] - ab.x / G_MPS2,
-                    a_g[1] - ab.y / G_MPS2,
-                    a_g[2] - ab.z / G_MPS2,
-                ]
-            } else {
-                a_g
-            };
+            let accel_corrected =
+                gps_accel::compensate_specific_force_g(a_g, gps_accel_ned, mekf.euler());
             if mekf.update_accel(accel_corrected) {
                 updates_applied = updates_applied.wrapping_add(1);
             } else {
@@ -1812,21 +1801,14 @@ async fn pos_kf_task() {
     // Base σ values fed into `update_gps_scaled`. Scaled by the
     // current HDOP (clamped to [1.0, HDOP_THRESH]) so each fix's
     // influence tracks its reported uncertainty.
-    const BASE_SIGMA_GPS_H: f32 = 2.0;
-    const BASE_SIGMA_GPS_V: f32 = 5.0;
+    const BASE_SIGMA_GPS_H: f32 = PosKfParams::FIRMWARE.sigma_gps_h;
+    const BASE_SIGMA_GPS_V: f32 = PosKfParams::FIRMWARE.sigma_gps_v;
 
-    // σ_a = 0.5 m/s² matches the sim tuning — loose enough to track
-    // gust transients without treating baro noise as truth. σ_baro =
-    // 0.3 m is the SPL06 spec at 1× OSR plus a bit of headroom.
-    // σ_gps_h / σ_gps_v are typical consumer-module noise; the KF will
-    // rightly let baro dominate altitude via the much-smaller σ_baro.
-    let mut kf = PosKf::new_at(
-        [0.0, 0.0, 0.0],
-        0.5, // σ_a
-        BASE_SIGMA_GPS_H,
-        BASE_SIGMA_GPS_V,
-        0.3, // σ_baro
-    );
+    // Noise figures are shared with the host evaluation loop
+    // (sim::est_eval) through PosKfParams, so a value tuned there is the
+    // value that flies. The KF lets baro dominate altitude via the much
+    // smaller σ_baro.
+    let mut kf = PosKf::with_params([0.0, 0.0, 0.0], &PosKfParams::FIRMWARE);
 
     // Baro state. `p_ref_pa` is provisional from the first baro
     // sample, then re-anchored on the Disarmed→Armed event so

@@ -54,6 +54,10 @@ use nalgebra::{Matrix3, SMatrix, Vector3};
 /// Earth gravity used at the MEKF input/output boundary (ISO 2533).
 pub const G_MPS2: f32 = 9.80665;
 
+/// IMU samples per accel update: 8 kHz predict / 100 Hz update. Shared by
+/// main.rs's `mekf_task` and the host evaluation loop (`sim::est_eval`).
+pub const ACCEL_DECIMATION: u32 = 80;
+
 /// Tuning knobs. Defaults are sane starting points for the ICM-42688P
 /// at 8 kHz ODR; expect to re-tune `sigma_a` and `accel_gate` once
 /// prop wash / vibration is known on the target airframe.

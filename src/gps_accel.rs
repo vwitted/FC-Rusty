@@ -55,6 +55,31 @@ pub const DECAY_S: f32 = 1.0;
 /// fix_mode and satellite count, which a corrupted fix passes.
 pub const MAX_PLAUSIBLE_ACCEL_MS2: f32 = 20.0;
 
+/// Remove a GPS-derived horizontal acceleration from a body-frame specific
+/// force reading, leaving (approximately) the gravity direction that
+/// `AttitudeMekf::update_accel` assumes.
+///
+/// `accel_g` is body specific force in g. `accel_ned` is world NED m/s²
+/// from `GpsAccelEstimator::accel_ned`. `euler_rad` is the MEKF's own
+/// [roll, pitch, yaw] (3-2-1), used only to rotate the correction into the
+/// body frame; the magnitude and direction come from GPS, so an attitude
+/// error mis-rotates a small correction rather than cancelling the
+/// innovation. A zero `accel_ned` returns the input unchanged.
+pub fn compensate_specific_force_g(
+    accel_g: [f32; 3],
+    accel_ned: [f32; 2],
+    euler_rad: [f32; 3],
+) -> [f32; 3] {
+    if accel_ned == [0.0; 2] {
+        return accel_g;
+    }
+    let e = euler_rad;
+    let rot = nalgebra::Rotation3::from_euler_angles(e[0], e[1], e[2]);
+    let ab = rot.inverse() * nalgebra::Vector3::new(accel_ned[0], accel_ned[1], 0.0);
+    let g = crate::attitude_mekf::G_MPS2;
+    [accel_g[0] - ab.x / g, accel_g[1] - ab.y / g, accel_g[2] - ab.z / g]
+}
+
 /// Horizontal acceleration estimated by differentiating GPS velocity.
 #[derive(Debug, Clone, Copy)]
 pub struct GpsAccelEstimator {
@@ -271,6 +296,40 @@ mod tests {
             "should have washed out, got {}",
             e.accel_ned()[0]
         );
+    }
+
+    /// Level, accelerating north at 2 m/s²: the accelerometer reads
+    /// R^T(a - g) = (2, 0, -g)/g in g. Compensation must leave pure gravity.
+    #[test]
+    fn compensation_removes_a_known_acceleration_at_level() {
+        let g = crate::attitude_mekf::G_MPS2;
+        let f = [2.0 / g, 0.0, -1.0];
+        let out = compensate_specific_force_g(f, [2.0, 0.0], [0.0; 3]);
+        assert!(out[0].abs() < 1e-6 && out[1].abs() < 1e-6, "{out:?}");
+        assert!((out[2] + 1.0).abs() < 1e-6, "{out:?}");
+        assert_eq!(compensate_specific_force_g(f, [0.0, 0.0], [0.0; 3]), f);
+    }
+
+    /// The compensation rotates with `Rotation3::from_euler_angles(euler)`,
+    /// not with the MEKF quaternion. The two must be the same rotation, or
+    /// the correction is applied along the wrong body axes once tilted.
+    #[test]
+    fn euler_rotation_matches_the_mekf_quaternion() {
+        use crate::attitude_mekf::{AttitudeMekf, MekfParams};
+        let mut m = AttitudeMekf::new(MekfParams::default());
+        // Drive to roll 20 / pitch -15 / yaw 70 deg-ish by integrating rates.
+        for _ in 0..1000 {
+            m.predict([0.35, -0.26, 1.22], 1e-3);
+        }
+        let e = m.euler();
+        let q = m.quaternion();
+        let rq = nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
+            q[0], q[1], q[2], q[3],
+        ));
+        let re = nalgebra::Rotation3::from_euler_angles(e[0], e[1], e[2]);
+        let v = nalgebra::Vector3::new(0.3, -1.1, 0.7);
+        let d = rq.inverse() * v - re.inverse() * v;
+        assert!(d.norm() < 1e-4, "euler/quaternion rotations disagree by {}", d.norm());
     }
 
     /// A real manoeuvre must still pass. The bound is above anything the

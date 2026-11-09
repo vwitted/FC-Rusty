@@ -33,6 +33,39 @@ use nalgebra::{Matrix3, SMatrix, SVector, Vector2, Vector3};
 
 pub const KF_NX: usize = 6;
 
+/// Noise parameters for `PosKf`. One definition shared by the firmware's
+/// `pos_kf_task` and the host evaluation loop (`sim::est_eval`), so a value
+/// tuned in simulation is the value that flies.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PosKfParams {
+    /// Process-noise spectral density on acceleration (m²/s³ as σ, m/s²).
+    /// Loose enough to track gust transients without treating baro noise
+    /// as truth.
+    pub sigma_a: f32,
+    /// Base 1σ GPS horizontal position noise (m), before HDOP scaling.
+    pub sigma_gps_h: f32,
+    /// Base 1σ GPS vertical position noise (m), before HDOP scaling.
+    pub sigma_gps_v: f32,
+    /// 1σ baro altitude noise (m): SPL06/DPS310 at 1x OSR plus headroom.
+    pub sigma_baro: f32,
+}
+
+impl PosKfParams {
+    /// What `pos_kf_task` in main.rs constructs.
+    pub const FIRMWARE: PosKfParams = PosKfParams {
+        sigma_a: 0.5,
+        sigma_gps_h: 2.0,
+        sigma_gps_v: 5.0,
+        sigma_baro: 0.3,
+    };
+}
+
+impl Default for PosKfParams {
+    fn default() -> Self {
+        Self::FIRMWARE
+    }
+}
+
 /// Linear position/velocity Kalman filter.
 pub struct PosKf {
     /// State estimate [px, py, pz, vx, vy, vz] (NED).
@@ -84,6 +117,11 @@ impl PosKf {
             sigma_gps_v,
             sigma_baro,
         }
+    }
+
+    /// `new_at` with the noise figures taken from a `PosKfParams`.
+    pub fn with_params(position_ned: [f32; 3], p: &PosKfParams) -> Self {
+        Self::new_at(position_ned, p.sigma_a, p.sigma_gps_h, p.sigma_gps_v, p.sigma_baro)
     }
 
     /// Current best estimate.
