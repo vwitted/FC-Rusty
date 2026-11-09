@@ -231,7 +231,11 @@ impl Default for MekfParams {
         Self {
             sigma_g:    0.005,   // rad/s/√Hz  — slightly above datasheet
             sigma_bw:   1.0e-5,  // rad/s/√Hz  — slow bias walk
-            sigma_a:    0.08,    // unit vector — accounts for vibration
+            // Unit vector. 0.3 with the accel window mean and GPS-accel tau
+            // 0.35 s, tuned in sim-eval (sim/ITERATIONS.md, iteration 23);
+            // was 0.08. Trusts the gyro more between updates, which costs
+            // ~5-9 % tilt RMS on a mirrored x/y accel axis.
+            sigma_a:    0.3,
             accel_gate: 0.3,
             sigma_m:    0.1,     // unit vector — covers hard/soft iron + EMI
             mag_gate:   0.5,     // ~30° from reference direction

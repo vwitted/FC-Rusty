@@ -2,8 +2,10 @@
 
 Scope: the MEKF attitude estimator, the 6-state PosKF and the GPS-derived
 acceleration compensation, evaluated in closed loop by `sim-eval`
-(src/sim/est_eval.rs, examples/sim_eval.rs). 22 iterations were run; 6 were
-accepted and committed. Every candidate is logged in sim/ITERATIONS.md.
+(src/sim/est_eval.rs, examples/sim_eval.rs). 22 iterations were run under the
+acceptance rule; 6 were accepted and committed. Iteration 23, the joint retune the
+rule blocked, was then adopted on the user's instruction (see "Adopted outside the
+rule"). Every candidate is logged in sim/ITERATIONS.md.
 
 **All results are host simulation. None of these changes has flown.**
 
@@ -41,40 +43,40 @@ accepted and committed. Every candidate is logged in sim/ITERATIONS.md.
 
 ## Results
 
-Exam (seeds 1–4), baseline → final. Against the baseline, 21 metrics improve and none regresses.
+Exam (seeds 1–4), baseline → final. Against the baseline, 28 metrics improve and two regress, both
+from iteration 23: `accel_sign_x` and `accel_sign_y` tilt RMSE.
 
 | Scenario | tilt RMSE (deg) | alt RMSE (m) | max overshoot | diverged (of 4) | pass |
 |---|---|---|---|---|---|
-| accel_saturation | 15.61 → 0.94 | 4.32 → 0.32 | 0.000 → 0.000 | 2 → 0 | no → yes |
-| accel_sign_x | 5.59 → 5.54 | 0.20 → 0.20 | 0.000 → 0.000 | 0 → 0 | no → no |
-| accel_sign_y | 5.81 → 5.78 | 0.21 → 0.21 | 0.000 → 0.000 | 0 → 0 | no → no |
-| accel_sign_z | — → 2.82 | — → 0.22 | — → 0.000 | 4 → 0 | no → no |
-| airmode_transitions | 4.77 → 3.41 | 0.21 → 0.19 | 0.091 → 0.073 | 0 → 0 | no → no |
-| altitude_steps | 6.16 → 2.02 | 0.58 → 0.25 | 0.306 → 0.122 | 0 → 0 | no → no |
-| gps_dropout_10s | 7.17 → 5.25 | 0.49 → 0.32 | 0.000 → 0.000 | 3 → 1 | no → no |
+| accel_saturation | 15.61 → 0.86 | 4.32 → 0.32 | 0.000 → 0.000 | 2 → 0 | no → yes |
+| accel_sign_x | 5.59 → 6.10 | 0.20 → 0.20 | 0.000 → 0.000 | 0 → 0 | no → no |
+| accel_sign_y | 5.81 → 6.12 | 0.21 → 0.20 | 0.000 → 0.000 | 0 → 0 | no → no |
+| accel_sign_z | — → 2.78 | — → 0.22 | — → 0.000 | 4 → 0 | no → no |
+| airmode_transitions | 4.77 → 1.63 | 0.21 → 0.19 | 0.091 → 0.072 | 0 → 0 | no → yes |
+| altitude_steps | 6.16 → 0.74 | 0.58 → 0.21 | 0.306 → 0.142 | 0 → 0 | no → yes |
+| gps_dropout_10s | 7.17 → 2.46 | 0.49 → 0.23 | 0.000 → 0.000 | 3 → 0 | no → yes |
 | gyro_sign_x | — → — | — → — | — → — | 4 → 4 | no → no |
 | gyro_sign_y | — → — | — → — | — → — | 4 → 4 | no → no |
-| gyro_sign_z | — → — | — → — | — → — | 4 → 4 | no → no |
-| nominal_hover | 2.43 → 1.35 | 0.25 → 0.21 | 0.000 → 0.000 | 0 → 0 | no → yes |
+| gyro_sign_z | — → 16.77 | — → 0.67 | — → 0.000 | 4 → 3 | no → no |
+| nominal_hover | 2.43 → 0.58 | 0.25 → 0.20 | 0.000 → 0.000 | 0 → 0 | no → yes |
 
-"—" means every seed failed, so there is nothing to average. `altitude_steps` misses its 2.0° threshold
-by 0.02°.
+"—" means every seed failed, so there is nothing to average.
 
 Held-out seeds 5–12, baseline-equivalent parameters → final:
 
 | Scenario | tilt RMSE (deg) | alt RMSE (m) | diverged (of 8) | pass |
 |---|---|---|---|---|
-| accel_saturation | 20.39 → 0.99 | 4.18 → 0.34 | 7 → 0 | no → yes |
-| accel_sign_x | 5.69 → 5.98 | 0.18 → 0.21 | 3 → 0 | no → no |
-| accel_sign_y | 5.44 → 6.17 | 0.18 → 0.24 | 1 → 0 | no → no |
-| accel_sign_z | — → 2.91 | — → 0.22 | 8 → 0 | no → no |
-| airmode_transitions | 4.35 → 3.37 | 0.20 → 0.20 | 0 → 0 | no → no |
-| altitude_steps | 6.54 → 2.37 | 0.51 → 0.21 | 0 → 0 | no → no |
-| gps_dropout_10s | — → 8.99 | — → 0.45 | 8 → 6 | no → no |
+| accel_saturation | 20.39 → 0.92 | 4.18 → 0.34 | 7 → 0 | no → yes |
+| accel_sign_x | 5.69 → 6.20 | 0.18 → 0.19 | 3 → 0 | no → no |
+| accel_sign_y | 5.44 → 6.31 | 0.18 → 0.19 | 1 → 0 | no → no |
+| accel_sign_z | — → 2.86 | — → 0.22 | 8 → 0 | no → no |
+| airmode_transitions | 4.35 → 1.56 | 0.20 → 0.20 | 0 → 0 | no → yes |
+| altitude_steps | 6.54 → 0.90 | 0.51 → 0.20 | 0 → 0 | no → yes |
+| gps_dropout_10s | — → 2.76 | — → 0.27 | 8 → 0 | no → yes |
 | gyro_sign_x | — → — | — → — | 8 → 8 | no → no |
 | gyro_sign_y | — → — | — → — | 8 → 8 | no → no |
-| gyro_sign_z | — → — | — → — | 8 → 8 | no → no |
-| nominal_hover | 2.36 → 1.42 | 0.21 → 0.20 | 0 → 0 | no → yes |
+| gyro_sign_z | — → 13.57 | — → 0.60 | 8 → 6 | no → no |
+| nominal_hover | 2.36 → 0.60 | 0.21 → 0.19 | 0 → 0 | no → yes |
 
 ## Accepted changes
 
@@ -144,26 +146,28 @@ TRUE attitude (`sim.state.q`), has no clamp or stale handling, and closes altitu
 - **Nominal hover** carried +0.92 % from iteration 20 (2.4311 → 2.4534°), inside the 1 % floor.
   Iteration 21 then more than recovered it (2.45 → 1.35°).
 
-## Blocked by the rule
+## Adopted outside the rule
 
-**The largest gain found was not committed.** It is a joint MEKF retune, iteration 11:
+**Iteration 23 fails the acceptance rule and was adopted on the user's instruction.** It is the joint
+MEKF retune first found at iteration 11:
 
 ```
-est.accel_window_mean = true
-gps_accel.tau_s = 0.35
-mekf.sigma_a = 0.3
+accel update and PosKF input = mean of the 80-sample window   (was: the current sample)
+gps_accel::DEFAULT_TAU_S     = 0.35 s                         (was 0.5)
+MekfParams::default sigma_a  = 0.3                            (was 0.08)
 ```
 
-Applied to the baseline estimator:
+Against iteration 21's estimator:
 
-- **Gains:** nominal tilt 2.43 → 0.69°, altitude-step tilt 6.16 → 0.97°, GPS-dropout divergences 3/4 → 0.
-  Held-out, dropout divergences fall 8/8 → 0.
-- **Cost:** tilt RMSE on the mirrored-accelerometer scenarios rises 8–18 %.
-
-The mechanism: trusting the gyro more slightly worsens how the MEKF settles on the mirror image of a
-sign-inverted accel axis. Whether that trade is acceptable is your call. Re-tested against the final
-estimator (iteration 21), it is still blocked by `accel_sign_x/y` alone. The same trade blocks
-`mekf.sigma_a` alone and the GPS-accel τ; see iterations 15 and 22.
+- **Gains:** nominal tilt 1.35 → 0.58°, altitude-step tilt 2.02 → 0.74°, airmode 3.41 → 1.63°, GPS
+  dropout 1/4 → 0 diverged and 5.25 → 2.46°. Held out: dropout 6/8 → 0 diverged. Four more scenarios
+  pass.
+- **Costs:** tilt RMSE on the mirrored x/y accelerometer scenarios +5–10 % (exam and held out), and
+  `altitude_steps` overshoot 0.12 → 0.14 (held out 0.10 → 0.13), still under its 0.25 threshold and half the
+  baseline.
+- **Mechanism.** A larger σ_a makes the MEKF trust the gyro more between accel updates, and the window mean
+  removes the vibration residual that the single sample carried. That rides through manoeuvres and the
+  GPS outage, but settles marginally worse on the mirror image of a sign-inverted x/y axis.
 
 ## Unresolved
 
@@ -179,7 +183,8 @@ estimator (iteration 21), it is still blocked by `accel_sign_x/y` alone. The sam
    body specific force is drag only, so a mirrored axis is self-consistent with a mirrored tilt. The MEKF
    settles about 2× the wind-holding tilt away, and no innovation gate fires (iteration 2). Detecting it
    needs a dynamic GPS/IMU correlation monitor, which was not built.
-3. **GPS dropout in wind: 1/4 (exam) and 6/8 (held-out) still diverge.**
+3. **GPS dropout in wind.** After iteration 23 the 10 s dropout no longer diverges (0/4 exam, 0/8
+   held out). The underlying limit stands for longer outages:
    - Once the GPS compensation decays, the accel update pulls the estimate toward the thrust axis. A
      multirotor accelerometer reads thrust plus drag, not gravity. Traced (`sim-eval --trace`): the truth
      reaches −10° roll / −19° pitch while the estimate reads about 0°.
@@ -199,9 +204,12 @@ estimator (iteration 21), it is still blocked by `accel_sign_x/y` alone. The sam
    - RMSE over surviving seeds is not monotone in survival: more survivors can read as a regression. A
      future metric should score failed seeds rather than drop them.
    - The pass thresholds were set before the baseline and were not changed. No scenario passed at
-     baseline; 2 pass now (accel_saturation, nominal_hover).
+     baseline; 5 pass now (accel_saturation, airmode_transitions, altitude_steps, gps_dropout_10s,
+     nominal_hover).
 7. **Not verified on hardware, and not executed in Renode.**
    - The firmware changes compile (`cargo build --release`) and host tests pass (448).
+   - After iteration 23: host tests 448/448, sim-baseline unchanged, Renode quick tier 5/5 on
+     restaged ELFs. Before it:
    - The full Renode suite passes, 10/10, on freshly staged ELFs (`stage-firmware.sh`,
      `tests/run-tests.sh`): boot-smoke, logger-uart, dshot-gpio, esc-model and sim-baseline.
    - Under Renode the flight build logs only through "RC task started" and then stalls at IMU bring-up,

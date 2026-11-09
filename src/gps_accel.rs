@@ -28,13 +28,12 @@
 // firmware-faithful closed loop (sim-eval, sim/REPORT.md) the position loop
 // produces real accelerations on the timescale of the filter, and a LONGER
 // tau is worse: 1.0 s took nominal-hover tilt RMS from 2.4 to 8.2 deg.
-// Shorter tau helps hover but costs the fault and manoeuvre scenarios, so
-// DEFAULT_TAU_S stays 0.5 (sim/ITERATIONS.md, iterations 11 and 22).
+// 0.35 s was adopted together with the accel window mean and MEKF sigma_a
+// 0.3; alone it costs the fault scenarios (sim/ITERATIONS.md, iterations
+// 11, 22 and 23).
 
-/// Smoothing time constant, seconds. Chosen so ~5 fixes at 10 Hz are
-/// averaged: enough to halve the differentiation noise, short enough that
-/// a multi-second manoeuvre is still tracked.
-pub const DEFAULT_TAU_S: f32 = 0.5;
+/// Smoothing time constant, seconds: ~3.5 fixes at 10 Hz averaged.
+pub const DEFAULT_TAU_S: f32 = 0.35;
 
 /// Seconds without a fix after which the estimate is no longer trusted and
 /// decays away.
@@ -363,7 +362,10 @@ mod tests {
         let f_g = (truth.inverse() * (a_true - Vector3::new(0.0, 0.0, g))) / g;
         let f = [f_g.x, f_g.y, f_g.z];
 
-        let mut circ = AttitudeMekf::new(MekfParams::default());
+        // sigma_a pinned: the property under test is structural, and the
+        // 50-update convergence bound below should not move with tuning.
+        let params = MekfParams { sigma_a: 0.08, ..MekfParams::default() };
+        let mut circ = AttitudeMekf::new(params);
         let before = tilt_err(&circ, &truth);
         let e = circ.euler();
         let r_est = Rotation3::from_euler_angles(e[0], e[1], e[2]);
@@ -378,7 +380,7 @@ mod tests {
             assert!((q0[i] - q1[i]).abs() < 1e-6, "circular reference moved q: {q0:?} -> {q1:?}");
         }
 
-        let mut gps = AttitudeMekf::new(MekfParams::default());
+        let mut gps = AttitudeMekf::new(params);
         for _ in 0..50 {
             let c = compensate_specific_force_g(f, [a_true.x, a_true.y], gps.euler());
             gps.update_accel(c);

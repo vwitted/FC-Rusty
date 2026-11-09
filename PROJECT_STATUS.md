@@ -167,7 +167,9 @@ d`).
    wiring in closed loop over 11 fault scenarios. Accepted: skip/coast on
    clipped accel windows; exclude the accel when body-z specific force
    violates the thrust-axis invariant (defmt warning); GPS thrust-axis tilt
-   aiding; rate-scaled accel R. The invariant and the thrust aid act only
+   aiding; rate-scaled accel R. Adopted on instruction despite failing the
+   rule: accel window mean, GPS-accel tau 0.35 s, MEKF sigma_a 0.3 (+5-10 %
+   tilt RMS on a mirrored x/y accel axis). The invariant and the thrust aid act only
    while armed (they assume thrust). Bench-verify the clip flag, the armed
    gate and the invariant warning; mekf_task does not run under Renode. Open: position hold has no GPS-staleness fallback (modes.rs);
    gyro-sign faults are unrecoverable because the rate loop shares the

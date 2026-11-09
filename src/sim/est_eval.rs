@@ -124,7 +124,7 @@ impl EstParams {
             poskf: PosKfParams::FIRMWARE,
             gps_accel_tau_s: crate::gps_accel::DEFAULT_TAU_S,
             imu_filter: ImuFilterParams::default(),
-            accel_window_mean: false,
+            accel_window_mean: true,
             accel_window_mean_kf: false,
             clip_skip_update: true,
             clip_kf_coast: true,

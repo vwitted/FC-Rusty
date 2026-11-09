@@ -1493,9 +1493,12 @@ async fn mekf_task() {
     // Latest GPS-derived horizontal acceleration, world NED (m/s²). Held
     // between fixes; zero when GPS is absent or has faded out.
     let mut gps_accel_ned = [0.0f32; 2];
-    // Window mean of the accelerometer, for the specific-force invariant,
-    // and the run of consecutive windows violating it.
+    // Window mean of the accelerometer, for the accel update, the PosKF and
+    // the specific-force invariant, and the run of consecutive windows
+    // violating it.
     let mut accel_win = attitude_mekf::AccelDecimator::new();
+    // Latest window mean, g: the PosKF predict input.
+    let mut kf_accel_g = [0.0f32, 0.0, -1.0];
     let mut sf_run: u32 = 0;
     let mut anchor_pending = false;
     let mut last_cal_log = Instant::now();
@@ -1586,9 +1589,15 @@ async fn mekf_task() {
             //
             // Horizontal only, matching update_gps_velocity: consumer
             // vertical GPS velocity is too noisy to differentiate.
-            let a_g = raw.accel_g();
+            // The update and the PosKF take the mean of the 80 samples since
+            // the last update, not the current sample: a single sample
+            // carries the vibration residual of the 25 Hz front-end
+            // low-pass. Measured in sim-eval jointly with sigma_a 0.3 and
+            // GPS-accel tau 0.35 s (sim/ITERATIONS.md, iteration 23).
+            let mean_g = accel_win.take(raw.accel_g());
+            kf_accel_g = mean_g;
             let accel_corrected =
-                gps_accel::compensate_specific_force_g(a_g, gps_accel_ned, mekf.euler());
+                gps_accel::compensate_specific_force_g(mean_g, gps_accel_ned, mekf.euler());
             // A window containing a clipped raw sample is biased: skip the
             // update and tell the PosKF to coast. Measured in sim-eval
             // (accel_saturation): 2/4 diverged -> 0/4.
@@ -1600,7 +1609,6 @@ async fn mekf_task() {
             // attitude_mekf::accel_window_excluded. Measured in sim-eval
             // (accel_sign_z): 4/4 diverged -> 0/4.
             let armed = ARMED_FLAG.load(core::sync::atomic::Ordering::Relaxed);
-            let mean_g = accel_win.take(a_g);
             if attitude_mekf::specific_force_implausible(mean_g) {
                 sf_run = sf_run.saturating_add(1);
                 if armed && sf_run == attitude_mekf::SF_INVARIANT_PERSIST {
@@ -1773,7 +1781,10 @@ async fn mekf_task() {
         // Feed the position KF at 100 Hz — matches the accel-update
         // cadence so the signalled sample is the freshest fused one.
         if on_kf_tick {
-            IMU_DATA_FOR_KF.signal(imu);
+            IMU_DATA_FOR_KF.signal(ImuData {
+                accel: [kf_accel_g[0] * G_MPS2, kf_accel_g[1] * G_MPS2, kf_accel_g[2] * G_MPS2],
+                ..imu
+            });
         }
 
         // 1 Hz health log. Includes sample count (should be ~8000),
