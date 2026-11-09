@@ -11,7 +11,9 @@
 //   mekf_task          predict every 8 kHz sample on filtered gyro; every
 //                      ACCEL_DECIMATION-th sample an accel update on filtered
 //                      accel -- skipped if any raw sample in the window
-//                      clipped, in which case the PosKF coasts -- compensated by gps_accel::GpsAccelEstimator
+//                      clipped or the window mean violates the multirotor
+//                      specific-force invariant for SF_INVARIANT_PERSIST
+//                      windows, in which case the PosKF coasts -- compensated by gps_accel::GpsAccelEstimator
 //                      through gps_accel::compensate_specific_force_g, which
 //                      rotates with the MEKF's OWN attitude, as main.rs does
 //   pos_kf_task        100 Hz: gps_accel.tick, predict on R(q_mekf)*f + g,
@@ -26,7 +28,9 @@
 //
 // no_std, like the rest of `sim`: the caller parses configs and prints.
 
-use crate::attitude_mekf::{AccelDecimator, AttitudeMekf, MekfParams, ACCEL_DECIMATION, G_MPS2};
+use crate::attitude_mekf::{
+    specific_force_implausible, AccelDecimator, AttitudeMekf, MekfParams, ACCEL_DECIMATION, G_MPS2,
+};
 use crate::control::altitude::AltitudeController;
 use crate::control::mixer::{ControlDemand, Mixer, QUAD_X};
 use crate::control::mpc::{AttitudeMpc, MpcModel};
@@ -75,6 +79,22 @@ pub struct EstParams {
     /// Predict the PosKF with zero acceleration when the window held a
     /// clipped sample: a clipped mean is biased, baro and GPS are not.
     pub clip_kf_coast: bool,
+    /// Accel-update σ once the GPS acceleration reference has been fresh
+    /// and then gone stale (GPS lost in flight). 0 = mekf.sigma_a always.
+    pub sigma_a_uncompensated: f32,
+    /// While GPS is lost in flight, fuse a zero-velocity pseudo-measurement
+    /// into the PosKF at 10 Hz with this σ, m/s. 0 = off.
+    pub lost_zero_vel_sigma: f32,
+    /// Treat a window whose mean violates the multirotor specific-force
+    /// invariant (attitude_mekf::specific_force_implausible) like a clipped
+    /// one: skip the accel update and coast the PosKF.
+    pub sf_invariant_check: bool,
+    /// Consecutive violating windows before the invariant acts.
+    pub sf_invariant_persist: u32,
+    /// Windows after one containing a clipped raw sample that are still
+    /// treated as clipped: the front-end low-pass carries the clipped bias
+    /// forward. 0 = only the window itself.
+    pub clip_holdoff_windows: u32,
 }
 
 impl EstParams {
@@ -88,6 +108,11 @@ impl EstParams {
             accel_window_mean: false,
             clip_skip_update: true,
             clip_kf_coast: true,
+            sigma_a_uncompensated: 0.0,
+            lost_zero_vel_sigma: 0.0,
+            sf_invariant_check: true,
+            sf_invariant_persist: crate::attitude_mekf::SF_INVARIANT_PERSIST,
+            clip_holdoff_windows: 0,
         }
     }
 }
@@ -173,6 +198,9 @@ pub struct EstRun {
     /// Evidence that the scenario's fault actually fired.
     pub accel_clipped: u64,
     pub gps_fixes_dropped: u64,
+    /// Windows failing the specific-force invariant / of those, not clipped.
+    pub accel_implausible: u64,
+    pub accel_implausible_unclipped: u64,
     pub accel_updates_applied: u64,
     pub accel_updates_rejected: u64,
     pub rail_steps: u64,
@@ -208,8 +236,39 @@ fn quat_rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
     [o.x, o.y, o.z]
 }
 
+/// One outer-tick sample for diagnosis. Observability only: tracing does
+/// not change the run.
+#[derive(Debug, Clone, Copy)]
+pub struct TraceRow {
+    pub t: f32,
+    pub tilt_err_deg: f32,
+    pub roll_true: f32,
+    pub pitch_true: f32,
+    pub roll_est: f32,
+    pub pitch_est: f32,
+    pub pos_true: [f32; 2],
+    pub pos_est: [f32; 2],
+    pub vel_true: [f32; 2],
+    pub vel_est: [f32; 2],
+    pub gps_accel: [f32; 2],
+    pub accel_true: [f32; 2],
+    pub alt_err: f32,
+    pub accel_update_applied: bool,
+}
+
 /// Fly one seed of one scenario with the given estimator parameters.
 pub fn run(sc: &EstScenario, p: &EstParams, tun: &Tunables, seed: u64) -> EstRun {
+    run_traced(sc, p, tun, seed, &mut |_| {})
+}
+
+/// `run`, calling `trace` once per outer tick.
+pub fn run_traced(
+    sc: &EstScenario,
+    p: &EstParams,
+    tun: &Tunables,
+    seed: u64,
+    trace: &mut dyn FnMut(TraceRow),
+) -> EstRun {
     let r = Rates::FIRMWARE;
     let dt = r.dt;
     let dt_outer = dt * ACCEL_DECIMATION as f32;
@@ -258,6 +317,10 @@ pub fn run(sc: &EstScenario, p: &EstParams, tun: &Tunables, seed: u64) -> EstRun
     let mut a_upd = [0.0f32; 3];
     let mut clipped_in_window = false;
     let mut kf_coast = false;
+    let mut gps_was_fresh = false;
+    let mut last_applied = false;
+    let mut holdoff = 0u32;
+    let mut sf_run = 0u32;
 
     let mut alt_ctrl = AltitudeController::new(tun.alt, hover);
     let mut pos_ctrl = PositionController::new(PositionGains {
@@ -343,11 +406,37 @@ pub fn run(sc: &EstScenario, p: &EstParams, tun: &Tunables, seed: u64) -> EstRun
             a_upd = if p.accel_window_mean { m } else { a_est };
             let a_g = [a_upd[0] / G_MPS2, a_upd[1] / G_MPS2, a_upd[2] / G_MPS2];
             let a_c = compensate_specific_force_g(a_g, gps_accel.accel_ned(), mekf.euler());
-            let window_clipped = clipped_in_window;
+            if specific_force_implausible([m[0] / G_MPS2, m[1] / G_MPS2, m[2] / G_MPS2]) {
+                sf_run = sf_run.saturating_add(1);
+            } else {
+                sf_run = 0;
+            }
+            let implausible = p.sf_invariant_check && sf_run >= p.sf_invariant_persist.max(1);
+            if implausible {
+                out.accel_implausible += 1;
+                if !clipped_in_window {
+                    out.accel_implausible_unclipped += 1;
+                }
+            }
+            if clipped_in_window {
+                holdoff = p.clip_holdoff_windows;
+            } else if holdoff > 0 {
+                holdoff -= 1;
+                clipped_in_window = true;
+            }
+            let window_clipped = clipped_in_window || implausible;
             clipped_in_window = false;
             let skip = p.clip_skip_update && window_clipped;
             kf_coast = p.clip_kf_coast && window_clipped;
-            if !skip && mekf.update_accel(a_c) {
+            gps_was_fresh |= gps_accel.is_fresh();
+            let gps_lost = gps_was_fresh && !gps_accel.is_fresh();
+            let sig = if p.sigma_a_uncompensated > 0.0 && gps_lost {
+                p.sigma_a_uncompensated
+            } else {
+                p.mekf.sigma_a
+            };
+            last_applied = !skip && mekf.update_accel_sigma(a_c, sig);
+            if last_applied {
                 out.accel_updates_applied += 1;
             } else {
                 out.accel_updates_rejected += 1;
@@ -386,6 +475,13 @@ pub fn run(sc: &EstScenario, p: &EstParams, tun: &Tunables, seed: u64) -> EstRun
             }
             if let Some(b) = pending_baro.take() {
                 kf.update_baro(b);
+            }
+            if p.lost_zero_vel_sigma > 0.0
+                && gps_was_fresh
+                && !gps_accel.is_fresh()
+                && (step / ACCEL_DECIMATION as usize) % 10 == 0
+            {
+                kf.update_gps_velocity_scaled(0.0, 0.0, p.lost_zero_vel_sigma);
             }
 
             // ---- Schedules ----
@@ -467,6 +563,23 @@ pub fn run(sc: &EstScenario, p: &EstParams, tun: &Tunables, seed: u64) -> EstRun
                 (kf.x[0] - sim.state.x) * (kf.x[0] - sim.state.x)
                     + (kf.x[1] - sim.state.y) * (kf.x[1] - sim.state.y),
             );
+            let e = mekf.euler();
+            trace(TraceRow {
+                t,
+                tilt_err_deg: tilt,
+                roll_true: roll,
+                pitch_true: pitch,
+                roll_est: e[0] * RAD2DEG,
+                pitch_est: e[1] * RAD2DEG,
+                pos_true: [sim.state.x, sim.state.y],
+                pos_est: [kf.x[0], kf.x[1]],
+                vel_true: [sim.state.vx, sim.state.vy],
+                vel_est: [kf.x[3], kf.x[4]],
+                gps_accel: gps_accel.accel_ned(),
+                accel_true: [sim.last_accel_world[0], sim.last_accel_world[1]],
+                alt_err: ae,
+                accel_update_applied: last_applied,
+            });
             out.tilt_sq += (tilt * tilt) as f64;
             out.alt_sq += (ae * ae) as f64;
             out.samples += 1;

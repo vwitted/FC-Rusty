@@ -4,7 +4,7 @@
     "accel_saturation": {"rmse_attitude": 6.718621, "rmse_altitude": 0.316574, "max_overshoot": 0.000000, "divergence_count": 0, "pass": false},
     "accel_sign_x": {"rmse_attitude": 5.591355, "rmse_altitude": 0.203809, "max_overshoot": 0.000000, "divergence_count": 0, "pass": false},
     "accel_sign_y": {"rmse_attitude": 5.806353, "rmse_altitude": 0.209012, "max_overshoot": 0.000000, "divergence_count": 0, "pass": false},
-    "accel_sign_z": {"rmse_attitude": null, "rmse_altitude": null, "max_overshoot": null, "divergence_count": 4, "pass": false},
+    "accel_sign_z": {"rmse_attitude": 6.727588, "rmse_altitude": 0.222186, "max_overshoot": 0.000000, "divergence_count": 0, "pass": false},
     "airmode_transitions": {"rmse_attitude": 4.769482, "rmse_altitude": 0.210495, "max_overshoot": 0.091034, "divergence_count": 0, "pass": false},
     "altitude_steps": {"rmse_attitude": 6.161616, "rmse_altitude": 0.577413, "max_overshoot": 0.306323, "divergence_count": 0, "pass": false},
     "gps_dropout_10s": {"rmse_attitude": 7.172456, "rmse_altitude": 0.485154, "max_overshoot": 0.000000, "divergence_count": 3, "pass": false},

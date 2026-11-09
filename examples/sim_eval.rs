@@ -172,6 +172,11 @@ fn apply_param(p: &mut EstParams, k: &str, v: &Val) -> bool {
         "est.clip_skip_update" => p.clip_skip_update = v.boolean(k),
         "est.clip_kf_coast" => p.clip_kf_coast = v.boolean(k),
         "poskf.coast_sigma_a" => p.poskf.coast_sigma_a = x(),
+        "est.sigma_a_uncompensated" => p.sigma_a_uncompensated = x(),
+        "est.lost_zero_vel_sigma" => p.lost_zero_vel_sigma = x(),
+        "est.sf_invariant_check" => p.sf_invariant_check = v.boolean(k),
+        "est.sf_invariant_persist" => p.sf_invariant_persist = x() as u32,
+        "est.clip_holdoff_windows" => p.clip_holdoff_windows = x() as u32,
         _ => return false,
     }
     true
@@ -359,7 +364,7 @@ fn run_scenario(s: &Scenario, detail: bool) -> Score {
         for (seed, r) in s.seeds.iter().zip(&runs) {
             eprintln!(
                 "{:<22} seed {seed}: fail={:?} est_div={} tilt_max={:.2}deg alt_max={:.2}m \
-                 horiz_max={:.2}m clipped={} gps_dropped={} acc_upd={}/{} rail={:.1}% bias_err={:.3}dps",
+                 horiz_max={:.2}m clipped={} implausible={}/{} gps_dropped={} acc_upd={}/{} rail={:.1}% bias_err={:.3}dps",
                 s.name,
                 r.failed,
                 r.est_diverged,
@@ -367,6 +372,8 @@ fn run_scenario(s: &Scenario, detail: bool) -> Score {
                 r.alt_err_max_m,
                 r.horiz_err_max_m,
                 r.accel_clipped,
+                r.accel_implausible,
+                r.accel_implausible_unclipped,
                 r.gps_fixes_dropped,
                 r.accel_updates_applied,
                 r.accel_updates_applied + r.accel_updates_rejected,
@@ -538,6 +545,7 @@ fn compare(old: &str, new: &str, base: Option<&str>) -> ExitCode {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut detail = false;
+    let mut trace = false;
     let mut suite: Option<String> = None;
     let mut params: Option<String> = None;
     let mut cmp: Option<(String, String)> = None;
@@ -551,6 +559,7 @@ fn main() -> ExitCode {
     while i < args.len() {
         match args[i].as_str() {
             "--detail" => detail = true,
+            "--trace" => trace = true,
             "--suite" => suite = Some(next(&mut i)),
             "--params" => params = Some(next(&mut i)),
             "--baseline" => base = Some(next(&mut i)),
@@ -598,6 +607,24 @@ fn main() -> ExitCode {
     }
     let Some(cfg) = config else { die("no config file (see --help)") };
     let s = load_scenario(&cfg, &overrides);
+    if trace {
+        // CSV of the first seed to stderr, every 10th outer tick (10 Hz).
+        eprintln!("t,tilt_err,roll,pitch,roll_est,pitch_est,n,e,n_est,e_est,vn,ve,vn_est,ve_est,gacc_n,gacc_e,acc_n,acc_e,alt_err,upd");
+        let mut k = 0u32;
+        est_eval::run_traced(&s.sc, &s.params, &s.tun, s.seeds[0], &mut |r| {
+            k += 1;
+            if k % 10 == 1 {
+                eprintln!(
+                    "{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{}",
+                    r.t, r.tilt_err_deg, r.roll_true, r.pitch_true, r.roll_est, r.pitch_est,
+                    r.pos_true[0], r.pos_true[1], r.pos_est[0], r.pos_est[1],
+                    r.vel_true[0], r.vel_true[1], r.vel_est[0], r.vel_est[1],
+                    r.gps_accel[0], r.gps_accel[1], r.accel_true[0], r.accel_true[1],
+                    r.alt_err, r.accel_update_applied as u8
+                );
+            }
+        });
+    }
     let sc = run_scenario(&s, detail);
     println!("{}", score_json(&sc));
     if sc.pass { ExitCode::SUCCESS } else { ExitCode::from(1) }

@@ -67,6 +67,27 @@ pub fn accel_counts_saturated(counts: &[i16; 3]) -> bool {
     counts.iter().any(|&c| c == i16::MAX || c == i16::MIN)
 }
 
+/// Largest body-z specific force a multirotor can physically produce, g.
+///
+/// Thrust acts along body -z in every orientation, inverted included, so
+/// body-z specific force is -T/m <= 0 plus drag; free fall reads ~0. A
+/// window mean above this is not flight, it is a fault: a sign-inverted or
+/// mis-mapped z axis reads +1 g at hover.
+pub const SF_Z_MAX_G: f32 = 0.5;
+
+/// Consecutive accel-update windows (10 ms each) that must violate
+/// `SF_Z_MAX_G` before the accelerometer is excluded. A single window can
+/// be an impact or the first sample landing on a vibration peak; a mounting
+/// or sign fault persists. Measured on accel_sign_z: 2 and 3 recover 4/4,
+/// 10 recovers late (38 deg RMS).
+pub const SF_INVARIANT_PERSIST: u32 = 3;
+
+/// Whether a window-mean accelerometer reading (body FRD/NED, g) violates
+/// the multirotor specific-force invariant. See `SF_Z_MAX_G`.
+pub fn specific_force_implausible(mean_accel_g: [f32; 3]) -> bool {
+    mean_accel_g[2] > SF_Z_MAX_G
+}
+
 /// Mean of the accelerometer over one accel-update window.
 ///
 /// The accel update runs at 1/ACCEL_DECIMATION of the IMU rate. Taking
@@ -312,6 +333,13 @@ impl AttitudeMekf {
     /// Gravity-reference accel update. `accel_body_g` is in units of g.
     /// Returns true if the update was applied (innovation gate passed).
     pub fn update_accel(&mut self, accel_body_g: [f32; 3]) -> bool {
+        self.update_accel_sigma(accel_body_g, self.params.sigma_a)
+    }
+
+    /// `update_accel` with a per-call measurement σ (unit-vector scale), for
+    /// callers that know the gravity assumption is weaker than usual -- e.g.
+    /// no independent acceleration reference is available to compensate it.
+    pub fn update_accel_sigma(&mut self, accel_body_g: [f32; 3], sigma_a: f32) -> bool {
         let a = Vector3::new(accel_body_g[0], accel_body_g[1], accel_body_g[2]);
         let norm = a.norm();
         if norm < 1e-6 {
@@ -343,7 +371,7 @@ impl AttitudeMekf {
         let p_tb = self.p.fixed_view::<3, 3>(0, 3).into_owned();
         let hp_tt = hx * p_tt;
         let mut s = hp_tt * hx.transpose();
-        let r_meas = self.params.sigma_a * self.params.sigma_a;
+        let r_meas = sigma_a * sigma_a;
         for i in 0..3 {
             s[(i, i)] += r_meas;
         }
@@ -751,6 +779,14 @@ fn quat_to_euler(q: &[f32; 4]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hover_and_inverted_flight_are_plausible_and_an_inverted_axis_is_not() {
+        assert!(!specific_force_implausible([0.0, 0.0, -1.0])); // hover
+        assert!(!specific_force_implausible([0.3, -0.2, -2.5])); // pulling g
+        assert!(!specific_force_implausible([0.0, 0.0, 0.0])); // free fall
+        assert!(specific_force_implausible([0.0, 0.0, 1.0])); // z inverted
+    }
 
     #[test]
     fn saturation_is_detected_on_either_rail_only() {

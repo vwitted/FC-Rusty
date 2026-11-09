@@ -309,9 +309,10 @@ static GPS_ACCEL_FRESH: core::sync::atomic::AtomicBool =
 /// A clipped window's mean is biased, so the accel update is skipped.
 static ACCEL_CLIPPED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
-/// Whether the most recent accel-update window clipped: mekf_task ->
-/// pos_kf_task, which then coasts its predict on zero acceleration with
-/// PosKfParams::coast_sigma_a instead of integrating the biased reading.
+/// Whether the most recent accel-update window was invalid (clipped, or
+/// failing the specific-force invariant): mekf_task -> pos_kf_task, which
+/// then coasts its predict on zero acceleration with
+/// PosKfParams::coast_sigma_a instead of integrating the bad reading.
 static KF_ACCEL_CLIPPED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 /// Flight samples awaiting a flash write: control loop → persist task.
@@ -1486,6 +1487,10 @@ async fn mekf_task() {
     // Latest GPS-derived horizontal acceleration, world NED (m/s²). Held
     // between fixes; zero when GPS is absent or has faded out.
     let mut gps_accel_ned = [0.0f32; 2];
+    // Window mean of the accelerometer, for the specific-force invariant,
+    // and the run of consecutive windows violating it.
+    let mut accel_win = attitude_mekf::AccelDecimator::new();
+    let mut sf_run: u32 = 0;
     let mut anchor_pending = false;
     let mut last_cal_log = Instant::now();
     let mut last_mag_log = Instant::now();
@@ -1558,6 +1563,7 @@ async fn mekf_task() {
         let gyro_rad = [g_dps[0] * DEG2RAD, g_dps[1] * DEG2RAD, g_dps[2] * DEG2RAD];
         mekf.predict(gyro_rad, dt);
 
+        accel_win.push(raw.accel_g());
         let on_kf_tick = sample_count % ACCEL_DECIMATION == 0;
         if on_kf_tick {
             // Subtract the GPS-derived horizontal acceleration before the
@@ -1580,10 +1586,26 @@ async fn mekf_task() {
             // A window containing a clipped raw sample is biased: skip the
             // update and tell the PosKF to coast. Measured in sim-eval
             // (accel_saturation): 2/4 diverged -> 0/4.
-            let window_clipped =
-                ACCEL_CLIPPED.swap(false, core::sync::atomic::Ordering::Relaxed);
-            KF_ACCEL_CLIPPED.store(window_clipped, core::sync::atomic::Ordering::Relaxed);
-            if !window_clipped && mekf.update_accel(accel_corrected) {
+            let clipped = ACCEL_CLIPPED.swap(false, core::sync::atomic::Ordering::Relaxed);
+            // Thrust acts along body -z in every orientation, so a sustained
+            // positive body-z specific force is a sensor fault (inverted or
+            // mis-mapped axis), not flight. Excluded like a clipped window.
+            // Measured in sim-eval (accel_sign_z): 4/4 diverged -> 0/4.
+            let mean_g = accel_win.take(a_g);
+            if attitude_mekf::specific_force_implausible(mean_g) {
+                sf_run = sf_run.saturating_add(1);
+                if sf_run == attitude_mekf::SF_INVARIANT_PERSIST {
+                    defmt::warn!(
+                        "accel: body-z specific force {=f32} g violates the multirotor invariant -- accelerometer excluded (check IMU orientation)",
+                        mean_g[2],
+                    );
+                }
+            } else {
+                sf_run = 0;
+            }
+            let window_invalid = clipped || sf_run >= attitude_mekf::SF_INVARIANT_PERSIST;
+            KF_ACCEL_CLIPPED.store(window_invalid, core::sync::atomic::Ordering::Relaxed);
+            if !window_invalid && mekf.update_accel(accel_corrected) {
                 updates_applied = updates_applied.wrapping_add(1);
             } else {
                 updates_rejected = updates_rejected.wrapping_add(1);
