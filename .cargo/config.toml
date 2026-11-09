@@ -37,3 +37,8 @@ target = "thumbv7em-none-eabihf"
 # "trace" = everything, "info" = normal, "warn" = quiet
 # Set to "info" once things are working to reduce log traffic.
 DEFMT_LOG = "info"
+
+[alias]
+# Host estimator evaluation, identical in PowerShell and bash: `host-tuple`
+# overrides the thumbv7em [build] target above. See examples/sim_eval.rs.
+sim-eval = "run --release --quiet --no-default-features --target host-tuple --example sim_eval --"

@@ -1,0 +1,26 @@
+# Bang-bang +/-40 deg attitude commands, roll then pitch then both, every
+# 0.5 s, overlapping throttle chops (altitude-target drops of 12 m and 10 m)
+# so differential demand meets low collective: the mixer goes onto its rails
+# (airmode) and the MEKF sees large rates and non-gravity specific force.
+# Realistic sensor floor shared by every scenario: vibration-dominated gyro
+# noise (see sim_sweep NOISE_FLOOR note), a modest gyro bias for the MEKF to
+# learn, and accel white noise.
+seeds = [1, 2, 3, 4]
+gyro.sigma = 1.0
+gyro.bias = [0.5, -0.3, 0.2]
+accel.sigma = 0.5
+# Controller: the GA-fitted rate gains. The firmware's 0.020/0.001 put this
+# plant in a saturated 41 Hz limit cycle (PROJECT_STATUS item 3, an open
+# pre-flight item), which would make every estimator number a property of
+# that pathology. Firmware Tunables otherwise (MPC, altitude, position).
+ctrl.rate_kp = 0.009
+ctrl.rate_kd = 0.00015
+total_s = 16
+start_alt = 20
+alt_steps = [[2.8, 8], [5.8, 20], [8.8, 10], [12, 15]]
+pos_hold = false
+att_steps = [[3.0, 40, 0], [3.5, -40, 0], [4.0, 40, 0], [4.5, -40, 0], [5.0, 0, 0], [6.0, 0, 40], [6.5, 0, -40], [7.0, 0, 40], [7.5, 0, -40], [8.0, 0, 0], [9.0, 30, 30], [9.5, -30, -30], [10.0, 30, -30], [10.5, -30, 30], [11.0, 0, 0]]
+pass.max_rmse_attitude = 2.0
+pass.max_rmse_altitude = 0.5
+pass.max_overshoot = 0.25
+pass.max_divergence = 0

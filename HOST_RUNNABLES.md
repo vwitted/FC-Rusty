@@ -23,3 +23,17 @@ cargo run --release --example sim_sweep    --no-default-features --target $TRIPL
 # sweep is well under a second -- it is the host sim, not the emulator, and
 # is the right tool for degradation statistics. See src/sim/degrade.rs.
 ```
+
+## Estimator evaluation (sim-eval)
+```
+cargo sim-eval sim/scenarios/nominal_hover.toml     # one scenario -> one JSON object
+cargo sim-eval --suite sim/scenarios --detail       # all scenarios; fault evidence on stderr
+cargo sim-eval --compare sim/latest.json new.json --baseline sim/baseline.json
+scripts/sim-eval.sh ... / scripts\sim-eval.cmd ...  # same, from bash / PowerShell
+```
+`cargo sim-eval` is an alias (.cargo/config.toml) using `--target host-tuple`,
+so it is identical in both shells. The loop (src/sim/est_eval.rs) runs the
+firmware estimator wiring end to end -- MEKF, PosKF, gps_accel, IMU front-end
+filters -- and closes altitude and position on the estimates. Metric
+definitions and the acceptance rule are in examples/sim_eval.rs; results and
+history in sim/.

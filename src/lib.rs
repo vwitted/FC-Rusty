@@ -89,5 +89,7 @@ pub mod sim {
     pub mod dual_imu;
     #[path = "harness.rs"]
     pub mod harness;
+    #[path = "est_eval.rs"]
+    pub mod est_eval;
     pub use sim::*;
 }

@@ -1,0 +1,24 @@
+# Position hold against an 8.5 m/s wind; GPS lost from 10 s to 20 s. The wind
+# forces a sustained ~15 deg tilt, so losing the GPS acceleration reference
+# matters to the MEKF, and the PosKF must dead-reckon horizontally.
+# Realistic sensor floor shared by every scenario: vibration-dominated gyro
+# noise (see sim_sweep NOISE_FLOOR note), a modest gyro bias for the MEKF to
+# learn, and accel white noise.
+seeds = [1, 2, 3, 4]
+gyro.sigma = 1.0
+gyro.bias = [0.5, -0.3, 0.2]
+accel.sigma = 0.5
+# Controller: the GA-fitted rate gains. The firmware's 0.020/0.001 put this
+# plant in a saturated 41 Hz limit cycle (PROJECT_STATUS item 3, an open
+# pre-flight item), which would make every estimator number a property of
+# that pathology. Firmware Tunables otherwise (MPC, altitude, position).
+ctrl.rate_kp = 0.009
+ctrl.rate_kd = 0.00015
+total_s = 30
+pos_hold = true
+wind_ned = [8, 3, 0]
+gps_outage_s = [10, 20]
+pass.max_rmse_attitude = 3.0
+pass.max_rmse_altitude = 1.0
+pass.max_overshoot = 0.25
+pass.max_divergence = 0

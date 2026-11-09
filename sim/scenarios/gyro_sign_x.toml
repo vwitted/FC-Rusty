@@ -1,0 +1,24 @@
+# Gyro x axis sign-inverted at the ESTIMATOR input only. The rate PID keeps
+# the true sign: a rate-loop inversion is positive feedback no estimator can
+# survive, so it would not be an estimator test.
+# Realistic sensor floor shared by every scenario: vibration-dominated gyro
+# noise (see sim_sweep NOISE_FLOOR note), a modest gyro bias for the MEKF to
+# learn, and accel white noise.
+seeds = [1, 2, 3, 4]
+gyro.sigma = 1.0
+gyro.bias = [0.5, -0.3, 0.2]
+accel.sigma = 0.5
+# Controller: the GA-fitted rate gains. The firmware's 0.020/0.001 put this
+# plant in a saturated 41 Hz limit cycle (PROJECT_STATUS item 3, an open
+# pre-flight item), which would make every estimator number a property of
+# that pathology. Firmware Tunables otherwise (MPC, altitude, position).
+ctrl.rate_kp = 0.009
+ctrl.rate_kd = 0.00015
+total_s = 20
+pos_hold = true
+wind_ned = [6, 0, 0]
+est_gyro_sign = [-1, 1, 1]
+pass.max_rmse_attitude = 2.0
+pass.max_rmse_altitude = 0.5
+pass.max_overshoot = 0.25
+pass.max_divergence = 0

@@ -1,0 +1,25 @@
+# 20 g, 237 Hz accel vibration (an unbalanced prop near motor rate) against
+# the ICM-42688P's 16 g full scale: every axis clips each cycle, so the
+# clipped mean is biased. Gyro is clean of it.
+# Realistic sensor floor shared by every scenario: vibration-dominated gyro
+# noise (see sim_sweep NOISE_FLOOR note), a modest gyro bias for the MEKF to
+# learn, and accel white noise.
+seeds = [1, 2, 3, 4]
+gyro.sigma = 1.0
+gyro.bias = [0.5, -0.3, 0.2]
+accel.sigma = 0.5
+# Controller: the GA-fitted rate gains. The firmware's 0.020/0.001 put this
+# plant in a saturated 41 Hz limit cycle (PROJECT_STATUS item 3, an open
+# pre-flight item), which would make every estimator number a property of
+# that pathology. Firmware Tunables otherwise (MPC, altitude, position).
+ctrl.rate_kp = 0.009
+ctrl.rate_kd = 0.00015
+total_s = 20
+pos_hold = true
+wind_ned = [2, 1, 0]
+accel.vib_amplitude = 196
+accel.vib_hz = 237
+pass.max_rmse_attitude = 3.0
+pass.max_rmse_altitude = 1.0
+pass.max_overshoot = 0.25
+pass.max_divergence = 0
