@@ -159,8 +159,6 @@ fn apply_param(p: &mut EstParams, k: &str, v: &Val) -> bool {
         "mekf.sigma_a" => p.mekf.sigma_a = x(),
         "mekf.accel_gate" => p.mekf.accel_gate = x(),
         "mekf.init_sigma_bias" => p.mekf.init_sigma_bias = x(),
-        "mekf.accel_nis_gate" => p.mekf.accel_nis_gate = x(),
-        "mekf.accel_nis_release" => p.mekf.accel_nis_release = x() as u32,
         "poskf.sigma_a" => p.poskf.sigma_a = x(),
         "poskf.sigma_gps_h" => p.poskf.sigma_gps_h = x(),
         "poskf.sigma_gps_v" => p.poskf.sigma_gps_v = x(),
@@ -178,9 +176,7 @@ fn apply_param(p: &mut EstParams, k: &str, v: &Val) -> bool {
         "est.sf_invariant_check" => p.sf_invariant_check = v.boolean(k),
         "est.sf_invariant_persist" => p.sf_invariant_persist = x() as u32,
         "est.clip_holdoff_windows" => p.clip_holdoff_windows = x() as u32,
-        "est.accel_comp_delay_windows" => p.accel_comp_delay_windows = x() as u32,
         "poskf.gps_vel_sigma" => p.gps_vel_sigma = x(),
-        "est.bias_watchdog_dps" => p.bias_watchdog_dps = x(),
         "est.r_k_norm" => p.r_k_norm = x(),
         "mekf.accel_r_rate_gain" | "est.r_k_rate" => p.mekf.accel_r_rate_gain = x(),
         "est.r_k_gacc" => p.r_k_gacc = x(),
@@ -373,7 +369,7 @@ fn run_scenario(s: &Scenario, detail: bool) -> Score {
         for (seed, r) in s.seeds.iter().zip(&runs) {
             eprintln!(
                 "{:<22} seed {seed}: fail={:?} est_div={} tilt_max={:.2}deg alt_max={:.2}m \
-                 horiz_max={:.2}m clipped={} implausible={}/{} gps_dropped={} acc_upd={}/{} rail={:.1}% bias_err={:.3}dps resets={}",
+                 horiz_max={:.2}m clipped={} implausible={}/{} gps_dropped={} acc_upd={}/{} rail={:.1}% bias_err={:.3}dps",
                 s.name,
                 r.failed,
                 r.est_diverged,
@@ -388,7 +384,6 @@ fn run_scenario(s: &Scenario, detail: bool) -> Score {
                 r.accel_updates_applied + r.accel_updates_rejected,
                 100.0 * r.rail_steps as f64 / r.steps.max(1) as f64,
                 r.bias_err_dps,
-                r.mekf_resets,
             );
         }
     }

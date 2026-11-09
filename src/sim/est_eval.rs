@@ -31,8 +31,8 @@
 // no_std, like the rest of `sim`: the caller parses configs and prints.
 
 use crate::attitude_mekf::{
-    rotate_body_to_current, specific_force_implausible, thrust_axis_nav, AccelDecimator, AccelHistory,
-    AttitudeMekf, MekfParams, ACCEL_DECIMATION, G_MPS2,
+    specific_force_implausible, thrust_axis_nav, AccelDecimator, AttitudeMekf, MekfParams,
+    ACCEL_DECIMATION, G_MPS2,
 };
 use crate::control::altitude::AltitudeController;
 use crate::control::mixer::{ControlDemand, Mixer, QUAD_X};
@@ -100,15 +100,8 @@ pub struct EstParams {
     /// treated as clipped: the front-end low-pass carries the clipped bias
     /// forward. 0 = only the window itself.
     pub clip_holdoff_windows: u32,
-    /// Delay-match the GPS compensation: compensate the specific force from
-    /// this many update windows ago, then rotate it into the current body
-    /// frame. 0 = compensate the current sample (firmware today).
-    pub accel_comp_delay_windows: u32,
     /// 1σ GPS horizontal-velocity noise for the PosKF update, m/s.
     pub gps_vel_sigma: f32,
-    /// Re-initialise the MEKF from the window-mean accel when any gyro-bias
-    /// estimate exceeds this, deg/s. 0 = off.
-    pub bias_watchdog_dps: f32,
     /// Adaptive accel-update noise: σ = mekf.sigma_a * (1 + k_norm*| |a|-1 |
     /// + accel_r_rate_gain*|ω| (rad/s) + k_gacc*|a_gps|/g).
     /// (The rate term is MekfParams::accel_r_rate_gain.)
@@ -139,9 +132,7 @@ impl EstParams {
             sf_invariant_check: true,
             sf_invariant_persist: crate::attitude_mekf::SF_INVARIANT_PERSIST,
             clip_holdoff_windows: 0,
-            accel_comp_delay_windows: 0,
             gps_vel_sigma: PosKf::SIGMA_GPS_VEL_DEFAULT,
-            bias_watchdog_dps: 0.0,
             r_k_norm: 0.0,
             r_k_gacc: 0.0,
             thrust_aid_sigma: crate::attitude_mekf::THRUST_AID_SIGMA,
@@ -235,7 +226,6 @@ pub struct EstRun {
     pub accel_implausible: u64,
     pub accel_implausible_unclipped: u64,
     pub accel_updates_applied: u64,
-    pub mekf_resets: u64,
     pub thrust_aid_updates: u64,
     pub accel_updates_rejected: u64,
     pub rail_steps: u64,
@@ -261,14 +251,6 @@ impl Edge {
         let past = (y[0] - self.target[0]) * self.dir[0] + (y[1] - self.target[1]) * self.dir[1];
         (past / self.mag).max(0.0)
     }
-}
-
-fn quat_euler(q: [f32; 4]) -> [f32; 3] {
-    let r = nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
-        q[0], q[1], q[2], q[3],
-    ));
-    let (a, b, c) = r.euler_angles();
-    [a, b, c]
 }
 
 fn quat_rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
@@ -357,7 +339,6 @@ pub fn run_traced(
     let mut pending_baro = None;
     let mut last_fix_t = 0.0f32;
     let mut accel_dec = AccelDecimator::new();
-    let mut a_upd = [0.0f32; 3];
     let mut a_kf = [0.0f32; 3];
     let mut clipped_in_window = false;
     let mut kf_coast = false;
@@ -365,7 +346,6 @@ pub fn run_traced(
     let mut last_applied = false;
     let mut holdoff = 0u32;
     let mut sf_run = 0u32;
-    let mut hist = AccelHistory::new();
 
     let mut alt_ctrl = AltitudeController::new(tun.alt, hover);
     let mut pos_ctrl = PositionController::new(PositionGains {
@@ -448,18 +428,10 @@ pub fn run_traced(
         accel_dec.push(a_est);
         if outer {
             let m = accel_dec.take(a_est);
-            a_upd = if p.accel_window_mean { m } else { a_est };
+            let a_upd = if p.accel_window_mean { m } else { a_est };
             a_kf = if p.accel_window_mean || p.accel_window_mean_kf { m } else { a_est };
             let a_g = [a_upd[0] / G_MPS2, a_upd[1] / G_MPS2, a_upd[2] / G_MPS2];
-            let a_c = if p.accel_comp_delay_windows > 0 {
-                let q_now = mekf.quaternion();
-                hist.push(a_g, q_now);
-                let (a_then, q_then) = hist.get(p.accel_comp_delay_windows as usize).unwrap();
-                let c = compensate_specific_force_g(a_then, gps_accel.accel_ned(), quat_euler(q_then));
-                rotate_body_to_current(c, q_then, q_now)
-            } else {
-                compensate_specific_force_g(a_g, gps_accel.accel_ned(), mekf.euler())
-            };
+            let a_c = compensate_specific_force_g(a_g, gps_accel.accel_ned(), mekf.euler());
             if specific_force_implausible([m[0] / G_MPS2, m[1] / G_MPS2, m[2] / G_MPS2]) {
                 sf_run = sf_run.saturating_add(1);
             } else {
@@ -510,15 +482,6 @@ pub fn run_traced(
                 out.accel_updates_applied += 1;
             } else {
                 out.accel_updates_rejected += 1;
-            }
-        }
-        if outer && p.bias_watchdog_dps > 0.0 {
-            let b = mekf.bias();
-            let lim = p.bias_watchdog_dps * DEG2RAD;
-            if b.iter().any(|x| x.abs() > lim) {
-                let m = a_upd;
-                mekf.reinitialize_from_accel([m[0] / G_MPS2, m[1] / G_MPS2, m[2] / G_MPS2]);
-                out.mekf_resets += 1;
             }
         }
         let bias = mekf.bias();

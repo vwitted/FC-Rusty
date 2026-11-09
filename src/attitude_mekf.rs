@@ -88,69 +88,6 @@ pub fn specific_force_implausible(mean_accel_g: [f32; 3]) -> bool {
     mean_accel_g[2] > SF_Z_MAX_G
 }
 
-/// Accel-update history for delay-matched GPS compensation.
-///
-/// The GPS-derived acceleration describes the aircraft some time ago (half
-/// a fix interval of finite difference plus the low-pass lag), but it is
-/// subtracted from the CURRENT specific force -- during any manoeuvre the
-/// two disagree and the difference is injected as tilt. Storing the
-/// specific force and attitude per update lets the caller compensate the
-/// sample the GPS figure actually describes, then rotate the result into
-/// the current body frame (`rotate_body_to_current`) for the update.
-pub const ACCEL_HISTORY_LEN: usize = 64;
-
-#[derive(Debug, Clone, Copy)]
-pub struct AccelHistory {
-    accel_g: [[f32; 3]; ACCEL_HISTORY_LEN],
-    q: [[f32; 4]; ACCEL_HISTORY_LEN],
-    head: usize,
-    len: usize,
-}
-
-impl AccelHistory {
-    pub const fn new() -> Self {
-        Self {
-            accel_g: [[0.0; 3]; ACCEL_HISTORY_LEN],
-            q: [[1.0, 0.0, 0.0, 0.0]; ACCEL_HISTORY_LEN],
-            head: 0,
-            len: 0,
-        }
-    }
-
-    /// Record the current update window's specific force and attitude.
-    pub fn push(&mut self, accel_g: [f32; 3], q: [f32; 4]) {
-        self.head = (self.head + 1) % ACCEL_HISTORY_LEN;
-        self.accel_g[self.head] = accel_g;
-        self.q[self.head] = q;
-        self.len = (self.len + 1).min(ACCEL_HISTORY_LEN);
-    }
-
-    /// The entry `back` pushes ago (0 = latest), clamped to the oldest held.
-    pub fn get(&self, back: usize) -> Option<([f32; 3], [f32; 4])> {
-        if self.len == 0 {
-            return None;
-        }
-        let b = back.min(self.len - 1).min(ACCEL_HISTORY_LEN - 1);
-        let i = (self.head + ACCEL_HISTORY_LEN - b) % ACCEL_HISTORY_LEN;
-        Some((self.accel_g[i], self.q[i]))
-    }
-}
-
-impl Default for AccelHistory {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Express a body-frame vector measured at attitude `q_then` in the body
-/// frame of `q_now` (both body -> nav): v_now = R(q_now)^T R(q_then) v.
-pub fn rotate_body_to_current(v: [f32; 3], q_then: [f32; 4], q_now: [f32; 4]) -> [f32; 3] {
-    let v = Vector3::new(v[0], v[1], v[2]);
-    let n = r_bn_mul(&q_then, &v);
-    let o = r_nb_mul(&q_now, &n);
-    [o[0], o[1], o[2]]
-}
-
 /// World (NED) direction of the body +z axis implied by a multirotor's
 /// thrust model and a GPS-derived acceleration: m·a = thrust + m·g with
 /// thrust along body -z, so R·e3 = (g·e3 - a)/|g·e3 - a|. Independent of
@@ -245,16 +182,6 @@ pub struct MekfParams {
     pub init_sigma_att: [f32; 3],
     /// Initial bias 1σ (rad/s) per axis.
     pub init_sigma_bias: f32,
-    /// Reject an accel update whose normalised innovation squared,
-    /// yᵀ S⁻¹ y, exceeds this. 0 disables. The norm gate above cannot see
-    /// a measurement that has the right magnitude and the wrong direction
-    /// -- a sign-inverted axis, or uncompensated sustained acceleration --
-    /// and an update built on one drives the estimate toward it.
-    pub accel_nis_gate: f32,
-    /// After this many consecutive NIS rejections, accept the next update
-    /// regardless. A gate can otherwise lock out a genuinely wrong estimate:
-    /// covariance grows only by σ_g² per second while it waits.
-    pub accel_nis_release: u32,
     /// Accel-update σ grows with body rate: σ = sigma_a·(1 + gain·|ω|),
     /// ω in rad/s. Rotation brings centripetal and tangential specific
     /// force the gravity model does not have, and during manoeuvres the
@@ -277,8 +204,6 @@ impl Default for MekfParams {
             // Seeded from accel → roll/pitch ~observable (~2°), yaw not (~90°).
             init_sigma_att: [0.035, 0.035, FRAC_PI_2],
             init_sigma_bias: 0.02, // ~1.1 °/s
-            accel_nis_gate: 0.0,
-            accel_nis_release: 100,
             accel_r_rate_gain: 3.0,
         }
     }
@@ -304,8 +229,6 @@ pub struct AttitudeMekf {
     /// as the input, µT). Zero until calibrated.
     hard_iron: Vector3<f32>,
     params: MekfParams,
-    /// Consecutive accel updates rejected by the NIS gate.
-    nis_rejected_run: u32,
 }
 
 impl AttitudeMekf {
@@ -323,7 +246,6 @@ impl AttitudeMekf {
             mag_ref_set: false,
             hard_iron: Vector3::zeros(),
             params,
-            nis_rejected_run: 0,
         }
     }
 
@@ -377,23 +299,6 @@ impl AttitudeMekf {
         self.q = euler_to_quat(roll, pitch, yaw);
         // Bias starts at zero; the filter learns it via predict/update.
         self.bias = Vector3::zeros();
-    }
-
-    /// Re-seed attitude from an accel reading and reset bias and covariance
-    /// to their initial values, keeping the magnetometer state. Recovery for
-    /// a filter whose state is no longer credible.
-    pub fn reinitialize_from_accel(&mut self, accel_body_g: [f32; 3]) {
-        let yaw = quat_to_euler(&self.q)[2];
-        self.initialize_from_accel(accel_body_g);
-        let e = quat_to_euler(&self.q);
-        self.q = euler_to_quat(e[0], e[1], yaw);
-        let p = self.params;
-        self.p = SMatrix::<f32, 6, 6>::zeros();
-        for i in 0..3 {
-            self.p[(i, i)] = p.init_sigma_att[i] * p.init_sigma_att[i];
-            self.p[(3 + i, 3 + i)] = p.init_sigma_bias * p.init_sigma_bias;
-        }
-        self.nis_rejected_run = 0;
     }
 
     /// Predict one step. `gyro_body` is measured gyro in rad/s (body NED).
@@ -509,19 +414,6 @@ impl AttitudeMekf {
             Some(m) => m,
             None => return false, // ill-conditioned — skip rather than diverge
         };
-        // Innovation gate on direction, with a release so a sustained
-        // rejection cannot become a permanent lockout.
-        if self.params.accel_nis_gate > 0.0 {
-            let nis = y.dot(&(s_inv * y));
-            if nis > self.params.accel_nis_gate
-                && self.nis_rejected_run < self.params.accel_nis_release
-            {
-                self.nis_rejected_run += 1;
-                return false;
-            }
-            self.nis_rejected_run = 0;
-        }
-
         let k_top = ph_top * s_inv;
         let k_bot = ph_bot * s_inv;
 
@@ -956,24 +848,6 @@ mod tests {
         assert!(!specific_force_implausible([0.3, -0.2, -2.5])); // pulling g
         assert!(!specific_force_implausible([0.0, 0.0, 0.0])); // free fall
         assert!(specific_force_implausible([0.0, 0.0, 1.0])); // z inverted
-    }
-
-    #[test]
-    fn history_returns_past_entries_and_rotation_is_consistent() {
-        let mut h = AccelHistory::new();
-        for k in 0..10 {
-            h.push([k as f32, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]);
-        }
-        assert_eq!(h.get(0).unwrap().0[0], 9.0);
-        assert_eq!(h.get(3).unwrap().0[0], 6.0);
-        assert_eq!(h.get(99).unwrap().0[0], 0.0); // clamped to oldest
-        // Same attitude: identity. 90 deg yaw between: x_then -> -y_now.
-        let q0 = [1.0, 0.0, 0.0, 0.0];
-        assert_eq!(rotate_body_to_current([1.0, 2.0, 3.0], q0, q0), [1.0, 2.0, 3.0]);
-        let s = core::f32::consts::FRAC_1_SQRT_2;
-        let qy = [s, 0.0, 0.0, s];
-        let v = rotate_body_to_current([1.0, 0.0, 0.0], q0, qy);
-        assert!(v[0].abs() < 1e-6 && (v[1] + 1.0).abs() < 1e-6, "{v:?}");
     }
 
     /// Thrust-axis aiding must pull a wrong estimate toward the truth when
