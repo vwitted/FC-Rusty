@@ -58,6 +58,56 @@ pub const G_MPS2: f32 = 9.80665;
 /// main.rs's `mekf_task` and the host evaluation loop (`sim::est_eval`).
 pub const ACCEL_DECIMATION: u32 = 80;
 
+/// True when any axis of a raw accelerometer sample sits at the i16 rail,
+/// i.e. the true specific force exceeded full scale (+/-16 g on the
+/// ICM-42688P as configured). A clipped sample, and anything filtered or
+/// averaged from it, is biased: vibration riding on the 1 g offset clips
+/// asymmetrically, which shifts the mean.
+pub fn accel_counts_saturated(counts: &[i16; 3]) -> bool {
+    counts.iter().any(|&c| c == i16::MAX || c == i16::MIN)
+}
+
+/// Mean of the accelerometer over one accel-update window.
+///
+/// The accel update runs at 1/ACCEL_DECIMATION of the IMU rate. Taking
+/// one sample per window point-samples the stream, so anything the front-end
+/// low-pass passes above the update Nyquist (50 Hz) aliases straight into
+/// the update: 20 g of prop vibration at 237 Hz leaves ~0.2 g through the
+/// 25 Hz Butterworth, which is ~12 deg of apparent tilt per sample. A
+/// boxcar over the window nulls every multiple of the update rate and
+/// attenuates the rest by roughly 1/(pi*f*T).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AccelDecimator {
+    sum: [f32; 3],
+    n: u32,
+}
+
+impl AccelDecimator {
+    pub const fn new() -> Self {
+        Self { sum: [0.0; 3], n: 0 }
+    }
+
+    /// Accumulate one sample (any consistent unit).
+    pub fn push(&mut self, a: [f32; 3]) {
+        for i in 0..3 {
+            self.sum[i] += a[i];
+        }
+        self.n += 1;
+    }
+
+    /// Mean since the last take, and reset. `fallback` (normally the
+    /// current sample) when nothing was accumulated.
+    pub fn take(&mut self, fallback: [f32; 3]) -> [f32; 3] {
+        if self.n == 0 {
+            return fallback;
+        }
+        let k = 1.0 / self.n as f32;
+        let m = [self.sum[0] * k, self.sum[1] * k, self.sum[2] * k];
+        *self = Self::new();
+        m
+    }
+}
+
 /// Tuning knobs. Defaults are sane starting points for the ICM-42688P
 /// at 8 kHz ODR; expect to re-tune `sigma_a` and `accel_gate` once
 /// prop wash / vibration is known on the target airframe.
@@ -86,6 +136,16 @@ pub struct MekfParams {
     pub init_sigma_att: [f32; 3],
     /// Initial bias 1σ (rad/s) per axis.
     pub init_sigma_bias: f32,
+    /// Reject an accel update whose normalised innovation squared,
+    /// yᵀ S⁻¹ y, exceeds this. 0 disables. The norm gate above cannot see
+    /// a measurement that has the right magnitude and the wrong direction
+    /// -- a sign-inverted axis, or uncompensated sustained acceleration --
+    /// and an update built on one drives the estimate toward it.
+    pub accel_nis_gate: f32,
+    /// After this many consecutive NIS rejections, accept the next update
+    /// regardless. A gate can otherwise lock out a genuinely wrong estimate:
+    /// covariance grows only by σ_g² per second while it waits.
+    pub accel_nis_release: u32,
 }
 
 impl Default for MekfParams {
@@ -100,6 +160,8 @@ impl Default for MekfParams {
             // Seeded from accel → roll/pitch ~observable (~2°), yaw not (~90°).
             init_sigma_att: [0.035, 0.035, FRAC_PI_2],
             init_sigma_bias: 0.02, // ~1.1 °/s
+            accel_nis_gate: 0.0,
+            accel_nis_release: 100,
         }
     }
 }
@@ -124,6 +186,8 @@ pub struct AttitudeMekf {
     /// as the input, µT). Zero until calibrated.
     hard_iron: Vector3<f32>,
     params: MekfParams,
+    /// Consecutive accel updates rejected by the NIS gate.
+    nis_rejected_run: u32,
 }
 
 impl AttitudeMekf {
@@ -141,6 +205,7 @@ impl AttitudeMekf {
             mag_ref_set: false,
             hard_iron: Vector3::zeros(),
             params,
+            nis_rejected_run: 0,
         }
     }
 
@@ -295,6 +360,19 @@ impl AttitudeMekf {
             Some(m) => m,
             None => return false, // ill-conditioned — skip rather than diverge
         };
+        // Innovation gate on direction, with a release so a sustained
+        // rejection cannot become a permanent lockout.
+        if self.params.accel_nis_gate > 0.0 {
+            let nis = y.dot(&(s_inv * y));
+            if nis > self.params.accel_nis_gate
+                && self.nis_rejected_run < self.params.accel_nis_release
+            {
+                self.nis_rejected_run += 1;
+                return false;
+            }
+            self.nis_rejected_run = 0;
+        }
+
         let k_top = ph_top * s_inv;
         let k_bot = ph_bot * s_inv;
 
@@ -673,6 +751,13 @@ fn quat_to_euler(q: &[f32; 4]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saturation_is_detected_on_either_rail_only() {
+        assert!(accel_counts_saturated(&[0, i16::MAX, 0]));
+        assert!(accel_counts_saturated(&[i16::MIN, 0, 0]));
+        assert!(!accel_counts_saturated(&[i16::MAX - 1, i16::MIN + 1, -2048]));
+    }
 
     /// Level, with the nose at heading psi, a north-and-down field reads as
     /// psi, with the hard-iron offset removed first.

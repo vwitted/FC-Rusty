@@ -1,7 +1,7 @@
 {
   "rules": {"rel_eps": 0.01, "abs_eps": {"rmse_attitude": 0.002, "rmse_altitude": 0.002, "max_overshoot": 0.002}, "lower_is_better": true},
   "scenarios": {
-    "accel_saturation": {"rmse_attitude": 15.611193, "rmse_altitude": 4.323740, "max_overshoot": 0.000000, "divergence_count": 2, "pass": false},
+    "accel_saturation": {"rmse_attitude": 6.718621, "rmse_altitude": 0.316574, "max_overshoot": 0.000000, "divergence_count": 0, "pass": false},
     "accel_sign_x": {"rmse_attitude": 5.591355, "rmse_altitude": 0.203809, "max_overshoot": 0.000000, "divergence_count": 0, "pass": false},
     "accel_sign_y": {"rmse_attitude": 5.806353, "rmse_altitude": 0.209012, "max_overshoot": 0.000000, "divergence_count": 0, "pass": false},
     "accel_sign_z": {"rmse_attitude": null, "rmse_altitude": null, "max_overshoot": null, "divergence_count": 4, "pass": false},

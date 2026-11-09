@@ -159,6 +159,8 @@ fn apply_param(p: &mut EstParams, k: &str, v: &Val) -> bool {
         "mekf.sigma_a" => p.mekf.sigma_a = x(),
         "mekf.accel_gate" => p.mekf.accel_gate = x(),
         "mekf.init_sigma_bias" => p.mekf.init_sigma_bias = x(),
+        "mekf.accel_nis_gate" => p.mekf.accel_nis_gate = x(),
+        "mekf.accel_nis_release" => p.mekf.accel_nis_release = x() as u32,
         "poskf.sigma_a" => p.poskf.sigma_a = x(),
         "poskf.sigma_gps_h" => p.poskf.sigma_gps_h = x(),
         "poskf.sigma_gps_v" => p.poskf.sigma_gps_v = x(),
@@ -166,6 +168,10 @@ fn apply_param(p: &mut EstParams, k: &str, v: &Val) -> bool {
         "gps_accel.tau_s" => p.gps_accel_tau_s = x(),
         "imu.gyro_fc_hz" => p.imu_filter.gyro_fc_hz = x(),
         "imu.accel_fc_hz" => p.imu_filter.accel_fc_hz = x(),
+        "est.accel_window_mean" => p.accel_window_mean = v.boolean(k),
+        "est.clip_skip_update" => p.clip_skip_update = v.boolean(k),
+        "est.clip_kf_coast" => p.clip_kf_coast = v.boolean(k),
+        "poskf.coast_sigma_a" => p.poskf.coast_sigma_a = x(),
         _ => return false,
     }
     true

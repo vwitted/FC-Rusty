@@ -48,6 +48,12 @@ pub struct PosKfParams {
     pub sigma_gps_v: f32,
     /// 1σ baro altitude noise (m): SPL06/DPS310 at 1x OSR plus headroom.
     pub sigma_baro: f32,
+    /// Process-noise σ (m/s²) for a predict step that coasts on zero
+    /// acceleration because the accelerometer window clipped. Large, so
+    /// baro and GPS carry the state; at the normal σ_a a coasting filter is
+    /// too confident to follow the aircraft and the altitude loop goes
+    /// unstable (measured: 4/4 diverged at 2 m/s², 0/4 from 12 to 24).
+    pub coast_sigma_a: f32,
 }
 
 impl PosKfParams {
@@ -57,6 +63,7 @@ impl PosKfParams {
         sigma_gps_h: 2.0,
         sigma_gps_v: 5.0,
         sigma_baro: 0.3,
+        coast_sigma_a: 16.0,
     };
 }
 
@@ -150,6 +157,14 @@ impl PosKf {
     /// for rotating body-frame specific force by the attitude and
     /// adding gravity before calling this.
     pub fn predict(&mut self, accel_world_ned: [f32; 3], dt: f32) {
+        self.predict_with_sigma(accel_world_ned, dt, self.sigma_a);
+    }
+
+    /// `predict` with a per-call process-noise σ (m/s²). For steps whose
+    /// acceleration input is known to be poor -- coasting on zero through
+    /// an accelerometer fault -- so the covariance admits it and the
+    /// position updates regain authority.
+    pub fn predict_with_sigma(&mut self, accel_world_ned: [f32; 3], dt: f32, sigma_a: f32) {
         // --- State mean: x ← F·x + G·u ---
         let ax = accel_world_ned[0];
         let ay = accel_world_ned[1];
@@ -197,7 +212,7 @@ impl PosKf {
         // --- CWNA process noise ---
         //   Qpp = σ_a²·¼·dt⁴·I   Qpv = σ_a²·½·dt³·I
         //   Qvp = σ_a²·½·dt³·I   Qvv = σ_a²·    dt²·I
-        let s = self.sigma_a * self.sigma_a;
+        let s = sigma_a * sigma_a;
         let q_pp = 0.25 * dt * dt * dt * dt * s;
         let q_pv = 0.5 * dt * dt * dt * s;
         let q_vv = dt * dt * s;

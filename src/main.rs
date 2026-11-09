@@ -304,6 +304,16 @@ static GPS_ACCEL_NED: Signal<CriticalSectionRawMutex, [f32; 2]> = Signal::new();
 /// control::position::PositionGains::max_tilt_rad_degraded.
 static GPS_ACCEL_FRESH: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+/// Set by the IMU read task when any raw accelerometer sample sits at full
+/// scale; swapped back to false by mekf_task once per accel-update window.
+/// A clipped window's mean is biased, so the accel update is skipped.
+static ACCEL_CLIPPED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+/// Whether the most recent accel-update window clipped: mekf_task ->
+/// pos_kf_task, which then coasts its predict on zero acceleration with
+/// PosKfParams::coast_sigma_a instead of integrating the biased reading.
+static KF_ACCEL_CLIPPED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 /// Flight samples awaiting a flash write: control loop → persist task.
 ///
 /// A bounded channel, and the control loop uses `try_send` so a slow or
@@ -1215,6 +1225,11 @@ async fn dual_icm_read_task(
 
         match (r1, r2) {
             (Ok(a), Ok(b)) => {
+                if attitude_mekf::accel_counts_saturated(&a.accel)
+                    || attitude_mekf::accel_counts_saturated(&b.accel)
+                {
+                    ACCEL_CLIPPED.store(true, Ordering::Relaxed);
+                }
                 let fused = drivers::icm42688::RawImu::averaged(&a, &b);
                 if !filter_primed {
                     filter.prime(fused.accel, fused.gyro);
@@ -1257,6 +1272,9 @@ async fn dual_icm_read_task(
                     filter.prime(a.accel, a.gyro);
                     filter_primed = true;
                 }
+                if attitude_mekf::accel_counts_saturated(&a.accel) {
+                    ACCEL_CLIPPED.store(true, Ordering::Relaxed);
+                }
                 let (a_filt, g_filt) = filter.apply(a.accel, a.gyro);
                 let filtered = drivers::icm42688::RawImu {
                     accel: a_filt,
@@ -1272,6 +1290,9 @@ async fn dual_icm_read_task(
                 if !filter_primed {
                     filter.prime(b.accel, b.gyro);
                     filter_primed = true;
+                }
+                if attitude_mekf::accel_counts_saturated(&b.accel) {
+                    ACCEL_CLIPPED.store(true, Ordering::Relaxed);
                 }
                 let (a_filt, g_filt) = filter.apply(b.accel, b.gyro);
                 let filtered = drivers::icm42688::RawImu {
@@ -1314,6 +1335,9 @@ async fn single_icm_read_task(
                 if !filter_primed {
                     filter.prime(r.accel, r.gyro);
                     filter_primed = true;
+                }
+                if attitude_mekf::accel_counts_saturated(&r.accel) {
+                    ACCEL_CLIPPED.store(true, Ordering::Relaxed);
                 }
                 let (a_filt, g_filt) = filter.apply(r.accel, r.gyro);
                 let filtered = drivers::icm42688::RawImu {
@@ -1553,7 +1577,13 @@ async fn mekf_task() {
             let a_g = raw.accel_g();
             let accel_corrected =
                 gps_accel::compensate_specific_force_g(a_g, gps_accel_ned, mekf.euler());
-            if mekf.update_accel(accel_corrected) {
+            // A window containing a clipped raw sample is biased: skip the
+            // update and tell the PosKF to coast. Measured in sim-eval
+            // (accel_saturation): 2/4 diverged -> 0/4.
+            let window_clipped =
+                ACCEL_CLIPPED.swap(false, core::sync::atomic::Ordering::Relaxed);
+            KF_ACCEL_CLIPPED.store(window_clipped, core::sync::atomic::Ordering::Relaxed);
+            if !window_clipped && mekf.update_accel(accel_corrected) {
                 updates_applied = updates_applied.wrapping_add(1);
             } else {
                 updates_rejected = updates_rejected.wrapping_add(1);
@@ -1901,7 +1931,11 @@ async fn pos_kf_task() {
             let sf_world = q * sf_body;
             // NED: +Z down, so kinematic = specific force + [0, 0, +g].
             let a_world = [sf_world.x, sf_world.y, sf_world.z + G_MPS2];
-            kf.predict(a_world, DT);
+            if KF_ACCEL_CLIPPED.load(core::sync::atomic::Ordering::Relaxed) {
+                kf.predict_with_sigma([0.0; 3], DT, PosKfParams::FIRMWARE.coast_sigma_a);
+            } else {
+                kf.predict(a_world, DT);
+            }
         } else {
             kf.predict([0.0, 0.0, 0.0], DT);
         }

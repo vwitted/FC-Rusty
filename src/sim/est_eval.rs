@@ -10,7 +10,8 @@
 //                      the firmware's ImuFilter (gyro 150 Hz, accel 25 Hz)
 //   mekf_task          predict every 8 kHz sample on filtered gyro; every
 //                      ACCEL_DECIMATION-th sample an accel update on filtered
-//                      accel, compensated by gps_accel::GpsAccelEstimator
+//                      accel -- skipped if any raw sample in the window
+//                      clipped, in which case the PosKF coasts -- compensated by gps_accel::GpsAccelEstimator
 //                      through gps_accel::compensate_specific_force_g, which
 //                      rotates with the MEKF's OWN attitude, as main.rs does
 //   pos_kf_task        100 Hz: gps_accel.tick, predict on R(q_mekf)*f + g,
@@ -25,7 +26,7 @@
 //
 // no_std, like the rest of `sim`: the caller parses configs and prints.
 
-use crate::attitude_mekf::{AttitudeMekf, MekfParams, ACCEL_DECIMATION, G_MPS2};
+use crate::attitude_mekf::{AccelDecimator, AttitudeMekf, MekfParams, ACCEL_DECIMATION, G_MPS2};
 use crate::control::altitude::AltitudeController;
 use crate::control::mixer::{ControlDemand, Mixer, QUAD_X};
 use crate::control::mpc::{AttitudeMpc, MpcModel};
@@ -66,6 +67,14 @@ pub struct EstParams {
     pub gps_accel_tau_s: f32,
     /// Firmware IMU front-end low-pass cutoffs, Hz (0 = bypass).
     pub imu_filter: ImuFilterParams,
+    /// Feed the accel update and the PosKF the window mean
+    /// (attitude_mekf::AccelDecimator) rather than the tick's sample.
+    pub accel_window_mean: bool,
+    /// Skip the MEKF accel update when the window held a clipped sample.
+    pub clip_skip_update: bool,
+    /// Predict the PosKF with zero acceleration when the window held a
+    /// clipped sample: a clipped mean is biased, baro and GPS are not.
+    pub clip_kf_coast: bool,
 }
 
 impl EstParams {
@@ -76,6 +85,9 @@ impl EstParams {
             poskf: PosKfParams::FIRMWARE,
             gps_accel_tau_s: crate::gps_accel::DEFAULT_TAU_S,
             imu_filter: ImuFilterParams::default(),
+            accel_window_mean: false,
+            clip_skip_update: true,
+            clip_kf_coast: true,
         }
     }
 }
@@ -242,6 +254,10 @@ pub fn run(sc: &EstScenario, p: &EstParams, tun: &Tunables, seed: u64) -> EstRun
     let mut pending_fix = None;
     let mut pending_baro = None;
     let mut last_fix_t = 0.0f32;
+    let mut accel_dec = AccelDecimator::new();
+    let mut a_upd = [0.0f32; 3];
+    let mut clipped_in_window = false;
+    let mut kf_coast = false;
 
     let mut alt_ctrl = AltitudeController::new(tun.alt, hover);
     let mut pos_ctrl = PositionController::new(PositionGains {
@@ -294,6 +310,7 @@ pub fn run(sc: &EstScenario, p: &EstParams, tun: &Tunables, seed: u64) -> EstRun
         for i in 0..3 {
             if a_raw[i].abs() >= full_a {
                 out.accel_clipped += 1;
+                clipped_in_window = true;
             }
             a_clip[i] = a_raw[i].clamp(-full_a, full_a);
             g_clip[i] = g_raw[i].clamp(-GYRO_FULL_SCALE_DPS, GYRO_FULL_SCALE_DPS);
@@ -320,10 +337,17 @@ pub fn run(sc: &EstScenario, p: &EstParams, tun: &Tunables, seed: u64) -> EstRun
 
         // ---- mekf_task ----
         mekf.predict(g_est, dt);
+        accel_dec.push(a_est);
         if outer {
-            let a_g = [a_est[0] / G_MPS2, a_est[1] / G_MPS2, a_est[2] / G_MPS2];
+            let m = accel_dec.take(a_est);
+            a_upd = if p.accel_window_mean { m } else { a_est };
+            let a_g = [a_upd[0] / G_MPS2, a_upd[1] / G_MPS2, a_upd[2] / G_MPS2];
             let a_c = compensate_specific_force_g(a_g, gps_accel.accel_ned(), mekf.euler());
-            if mekf.update_accel(a_c) {
+            let window_clipped = clipped_in_window;
+            clipped_in_window = false;
+            let skip = p.clip_skip_update && window_clipped;
+            kf_coast = p.clip_kf_coast && window_clipped;
+            if !skip && mekf.update_accel(a_c) {
                 out.accel_updates_applied += 1;
             } else {
                 out.accel_updates_rejected += 1;
@@ -340,8 +364,13 @@ pub fn run(sc: &EstScenario, p: &EstParams, tun: &Tunables, seed: u64) -> EstRun
             // ---- pos_kf_task (100 Hz) ----
             gps_accel.tick(dt_outer);
             let q = mekf.quaternion();
-            let sf_w = quat_rotate(q, a_est);
-            kf.predict([sf_w[0], sf_w[1], sf_w[2] + G_MPS2], dt_outer);
+            let sf_w = quat_rotate(q, a_upd);
+            let a_w = if kf_coast { [0.0; 3] } else { [sf_w[0], sf_w[1], sf_w[2] + G_MPS2] };
+            if kf_coast {
+                kf.predict_with_sigma(a_w, dt_outer, p.poskf.coast_sigma_a);
+            } else {
+                kf.predict(a_w, dt_outer);
+            }
             if let Some(fix) = pending_fix.take() {
                 kf.update_gps_scaled(fix.position_ned, p.poskf.sigma_gps_h, p.poskf.sigma_gps_v);
                 // As main.rs: the receiver reports ground speed and course,
