@@ -755,6 +755,26 @@ impl AttitudeMekf {
     pub fn bias(&self) -> [f32; 3] {
         [self.bias[0], self.bias[1], self.bias[2]]
     }
+
+    /// Attitude block of the error-state covariance, rad^2. Body-frame
+    /// error convention: q_true = q_est * dq(dtheta). Read-only; used by
+    /// the host simulation's consistency (NEES) check.
+    pub fn attitude_cov(&self) -> [[f32; 3]; 3] {
+        let mut c = [[0.0f32; 3]; 3];
+        for (i, row) in c.iter_mut().enumerate() {
+            for (j, v) in row.iter_mut().enumerate() {
+                *v = self.p[(i, j)];
+            }
+        }
+        c
+    }
+
+    /// Overwrite the attitude estimate (normalised); covariance unchanged.
+    /// For tests and the host simulation.
+    pub fn set_quaternion(&mut self, q: [f32; 4]) {
+        self.q = q;
+        quat_normalize(&mut self.q);
+    }
 }
 
 // ---- Quaternion helpers ----

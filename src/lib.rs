@@ -83,6 +83,8 @@ pub mod sim {
     mod sim;
     #[path = "sensors.rs"]
     pub mod sensors;
+    #[path = "mag_sim.rs"]
+    pub mod mag_sim;
     #[path = "degrade.rs"]
     pub mod degrade;
     #[path = "dual_imu.rs"]

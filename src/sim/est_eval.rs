@@ -25,6 +25,14 @@
 //                      MPC and the rate PID close on the MEKF and on
 //                      bias-corrected filtered gyro
 //
+// Optional, default off so the v1 exam is unchanged:
+//   magnetometer       sim::mag_sim at 100 Hz, fused as mekf_task does: seed
+//                      the reference from the first sample, anchor to true
+//                      north once level-and-still when a stored cal is
+//                      loaded, then update_mag on every sample
+//   control_on_truth   the controllers close on the TRUE state, so an
+//                      estimator is scored on a trajectory it cannot perturb
+//
 // Kept separate from run_case deliberately: run_case's numbers are the
 // committed sim-baseline, and changing its loop would move them.
 //
@@ -45,6 +53,7 @@ use crate::gps_accel::{compensate_specific_force_g, GpsAccelEstimator};
 use crate::imu_filter::{Biquad, ImuFilterParams};
 use crate::sim::degrade::{Degradation, Degrader};
 use crate::sim::harness::{FailCause, Rates, Tunables, FLYAWAY_MARGIN_M};
+use crate::sim::mag_sim::{MagSim, MagSimParams};
 use crate::sim::sensors::{BaroSim, GpsSim};
 use crate::sim::{MotorForces, QuadParams, QuadSim};
 
@@ -177,6 +186,22 @@ pub struct EstScenario {
     pub baro_sigma: f32,
     pub baro_drift_sigma: f32,
     pub baro_drift_tau_s: f32,
+    /// Magnetometer. `MagSimParams::OFF` (the default) produces no samples.
+    pub mag: MagSimParams,
+    /// A stored mag calibration is loaded at boot (`mag_cal_ut` as the
+    /// hard-iron estimate) and the heading is anchored to true north once
+    /// level and still. False: no cal, relative boot heading, as mekf_task
+    /// without a stored config.
+    pub mag_calibrated: bool,
+    /// The stored hard-iron estimate, uT. Its difference from
+    /// `mag.hard_iron_ut` is the calibration residual.
+    pub mag_cal_ut: [f32; 3],
+    /// Yaw reference schedule: (time s, yaw deg). Before the first edge 0.
+    pub yaw_steps: [(f32, f32); MAX_ALT_STEPS],
+    pub n_yaw_steps: usize,
+    /// Close every controller on the true state instead of the estimates.
+    /// The estimator still runs on the same sensor stream and is scored.
+    pub control_on_truth: bool,
 }
 
 impl EstScenario {
@@ -202,6 +227,12 @@ impl EstScenario {
             baro_sigma: 0.2,
             baro_drift_sigma: 0.3,
             baro_drift_tau_s: 60.0,
+            mag: MagSimParams::OFF,
+            mag_calibrated: true,
+            mag_cal_ut: [0.0; 3],
+            yaw_steps: [(f32::INFINITY, 0.0); MAX_ALT_STEPS],
+            n_yaw_steps: 0,
+            control_on_truth: false,
         }
     }
 }
@@ -233,6 +264,74 @@ pub struct EstRun {
     pub steps: u64,
     /// Final gyro-bias estimate error magnitude, deg/s.
     pub bias_err_dps: f32,
+    /// Heading error (estimated minus true yaw, wrapped), deg.
+    pub yaw_sq: f64,
+    pub yaw_err_max_deg: f32,
+    pub mag_updates_applied: u64,
+    pub mag_updates_rejected: u64,
+    /// Consistency (NEES) sums at the outer rate. Tilt: the nav-frame
+    /// horizontal components of the attitude error against the matching
+    /// 2x2 block of the MEKF covariance, 2 dof. Attitude: the full body
+    /// error, 3 dof. PosKF: altitude, 1 dof, and position+velocity, 6 dof.
+    /// `*_in95`: samples under the chi-square 95 % bound for that dof.
+    pub nees_tilt: f64,
+    pub nees_tilt_in95: u64,
+    pub nees_att: f64,
+    pub nees_att_in95: u64,
+    pub nees_alt: f64,
+    pub nees_alt_in95: u64,
+    pub nees_pv: f64,
+    pub nees_pv_in95: u64,
+    pub nees_samples: u64,
+    /// Tilt error per outer sample, deg, held at DIVERGED_TILT_DEG from a
+    /// failure to the end of the run. Sum of squares over ALL scheduled
+    /// samples, so a failed seed is scored rather than dropped.
+    pub tilt_sq_penalised: f64,
+    pub samples_scheduled: u64,
+}
+
+/// Chi-square 95 % quantiles for 1, 2, 3 and 6 degrees of freedom.
+pub const CHI2_95: [(u32, f64); 4] = [(1, 3.841), (2, 5.991), (3, 7.815), (6, 12.592)];
+
+fn chi2_95(dof: u32) -> f64 {
+    CHI2_95.iter().find(|(d, _)| *d == dof).map(|(_, v)| *v).unwrap_or(f64::INFINITY)
+}
+
+/// x^T A^-1 x for a symmetric positive-definite A; None when singular.
+fn nees<const N: usize>(x: &[f64; N], a: &[[f64; N]; N]) -> Option<f64> {
+    let m = nalgebra::SMatrix::<f64, N, N>::from_fn(|i, j| a[i][j]);
+    let v = nalgebra::SVector::<f64, N>::from_fn(|i, _| x[i]);
+    let chol = m.cholesky()?;
+    Some(v.dot(&chol.solve(&v)))
+}
+
+/// Yaw of a body -> nav quaternion, rad (heading of body x).
+fn quat_yaw(q: [f32; 4]) -> f32 {
+    let (w, x, y, z) = (q[0], q[1], q[2], q[3]);
+    libm::atan2f(2.0 * (x * y + w * z), w * w + x * x - y * y - z * z)
+}
+
+fn wrap_deg(d: f32) -> f32 {
+    let mut d = d % 360.0;
+    if d > 180.0 {
+        d -= 360.0;
+    } else if d < -180.0 {
+        d += 360.0;
+    }
+    d
+}
+
+/// Small-angle attitude error, body frame, rad: q_true = q_est * dq.
+fn attitude_error_body(q_est: [f32; 4], q_true: [f32; 4]) -> [f32; 3] {
+    let e = nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
+        q_est[0], q_est[1], q_est[2], q_est[3],
+    ));
+    let t = nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
+        q_true[0], q_true[1], q_true[2], q_true[3],
+    ));
+    let d = e.inverse() * t;
+    let s = if d.w < 0.0 { -2.0 } else { 2.0 };
+    [d.i * s, d.j * s, d.k * s]
 }
 
 /// Overshoot bookkeeping for one commanded edge.
@@ -280,6 +379,8 @@ pub struct TraceRow {
     pub accel_true: [f32; 2],
     pub alt_err: f32,
     pub accel_update_applied: bool,
+    /// Estimated minus true yaw, wrapped, deg.
+    pub yaw_err_deg: f32,
 }
 
 /// Fly one seed of one scenario with the given estimator parameters.
@@ -347,6 +448,15 @@ pub fn run_traced(
     let mut last_applied = false;
     let mut holdoff = 0u32;
     let mut sf_run = 0u32;
+    let mut mag = MagSim::new(sc.mag, seed ^ 0x3A65_0000);
+    let mut anchor_pending = false;
+    if sc.mag.enabled() && sc.mag_calibrated {
+        mekf.set_hard_iron(sc.mag_cal_ut);
+        anchor_pending = true;
+    }
+    let mut motor_mean = hover;
+    let mut yaw_ref = 0.0f32;
+    let mut yaw_i = 0usize;
 
     let mut alt_ctrl = AltitudeController::new(tun.alt, hover);
     let mut pos_ctrl = PositionController::new(PositionGains {
@@ -370,6 +480,7 @@ pub fn run_traced(
     let mut out = EstRun::default();
     let steps = (sc.total_s / dt) as usize;
     out.steps = steps as u64;
+    out.samples_scheduled = steps.div_ceil(ACCEL_DECIMATION as usize) as u64;
 
     for step in 0..steps {
         let t = step as f32 * dt;
@@ -492,6 +603,27 @@ pub fn run_traced(
                 out.accel_updates_rejected += 1;
             }
         }
+        // ---- mekf_task magnetometer branch ----
+        if let Some(ut) = mag.tick(dt, sim.state.q, motor_mean) {
+            if !mekf.mag_initialized() {
+                mekf.initialize_mag_from_first(ut);
+            } else {
+                // As main.rs mag_anchor_ready, on the estimator's copy of
+                // the filtered sensors.
+                let an = libm::sqrtf(a_est[0] * a_est[0] + a_est[1] * a_est[1] + a_est[2] * a_est[2]) / G_MPS2;
+                let gn = libm::sqrtf(g_est[0] * g_est[0] + g_est[1] * g_est[1] + g_est[2] * g_est[2]) * RAD2DEG;
+                if anchor_pending && (an - 1.0).abs() < 0.1 && gn < 5.0 {
+                    mekf.anchor_heading(ut, crate::control::mag_cal::DECLINATION_DEG.to_radians());
+                    anchor_pending = false;
+                }
+                if mekf.update_mag(ut) {
+                    out.mag_updates_applied += 1;
+                } else {
+                    out.mag_updates_rejected += 1;
+                }
+            }
+        }
+
         let bias = mekf.bias();
         let gyro_corr = [
             gyro[0] - sc.est_gyro_sign[0] * bias[0] * RAD2DEG,
@@ -551,19 +683,42 @@ pub fn run_traced(
                 }
             }
 
-            // ---- Control, closed on the estimates ----
-            let e = mekf.euler();
-            thrust = alt_ctrl.update(alt_target, kf.altitude_up(), kf.vz_up(), dt_outer);
+            while yaw_i < sc.n_yaw_steps && t >= sc.yaw_steps[yaw_i].0 {
+                yaw_ref = sc.yaw_steps[yaw_i].1 * DEG2RAD;
+                yaw_i += 1;
+                if !sc.pos_hold {
+                    mpc.set_reference([att_ref[0] * DEG2RAD, att_ref[1] * DEG2RAD, yaw_ref], [0.0; 3]);
+                }
+            }
+
+            // ---- Control, closed on the estimates (or on truth) ----
+            let (e, pos, vel, alt_up, vz_up, rates) = if sc.control_on_truth {
+                (
+                    [sim.state.roll * DEG2RAD, sim.state.pitch * DEG2RAD, sim.state.yaw * DEG2RAD],
+                    [sim.state.x, sim.state.y],
+                    [sim.state.vx, sim.state.vy],
+                    -sim.state.z,
+                    -sim.state.vz,
+                    [truth.gyro[0] * DEG2RAD, truth.gyro[1] * DEG2RAD, truth.gyro[2] * DEG2RAD],
+                )
+            } else {
+                (
+                    mekf.euler(),
+                    [kf.x[0], kf.x[1]],
+                    [kf.x[3], kf.x[4]],
+                    kf.altitude_up(),
+                    kf.vz_up(),
+                    [gyro_corr[0] * DEG2RAD, gyro_corr[1] * DEG2RAD, gyro_corr[2] * DEG2RAD],
+                )
+            };
+            thrust = alt_ctrl.update(alt_target, alt_up, vz_up, dt_outer);
             if sc.pos_hold {
                 pos_ctrl.set_compensation(gps_accel.is_fresh(), dt_outer);
-                let po = pos_ctrl.update([kf.x[0], kf.x[1]], [kf.x[3], kf.x[4]], [0.0, 0.0], e[2]);
+                let po = pos_ctrl.update(pos, vel, [0.0, 0.0], e[2]);
                 att_ref = [po.roll_rad * RAD2DEG, po.pitch_rad * RAD2DEG];
-                mpc.set_reference([po.roll_rad, po.pitch_rad, 0.0], [0.0; 3]);
+                mpc.set_reference([po.roll_rad, po.pitch_rad, yaw_ref], [0.0; 3]);
             }
-            let mo = mpc.solve(
-                e,
-                [gyro_corr[0] * DEG2RAD, gyro_corr[1] * DEG2RAD, gyro_corr[2] * DEG2RAD],
-            );
+            let mo = mpc.solve(e, rates);
             rate_sp = [
                 mo.rate_setpoints_rads[0] * RAD2DEG,
                 mo.rate_setpoints_rads[1] * RAD2DEG,
@@ -571,9 +726,11 @@ pub fn run_traced(
             ];
         }
 
-        let pid = rate_pid.update(rate_sp, gyro_corr, dt);
+        let pid_gyro = if sc.control_on_truth { truth.gyro } else { gyro_corr };
+        let pid = rate_pid.update(rate_sp, pid_gyro, dt);
         let mixed = mixer.apply(&ControlDemand { thrust, roll: pid[0], pitch: pid[1], yaw: pid[2] });
         let motors = deg.motors(mixed.motors);
+        motor_mean = (motors[0] + motors[1] + motors[2] + motors[3]) * 0.25;
         if motors.iter().any(|&m| m <= 0.001 || m >= 0.999) {
             out.rail_steps += 1;
         }
@@ -599,6 +756,8 @@ pub fn run_traced(
         };
         if let Some(c) = cause {
             out.failed = Some((t, c));
+            let remaining = out.samples_scheduled.saturating_sub(out.samples);
+            out.tilt_sq_penalised += remaining as f64 * (DIVERGED_TILT_DEG as f64) * (DIVERGED_TILT_DEG as f64);
             break;
         }
 
@@ -614,6 +773,7 @@ pub fn run_traced(
                     + (kf.x[1] - sim.state.y) * (kf.x[1] - sim.state.y),
             );
             let e = mekf.euler();
+            let ye = wrap_deg((quat_yaw(mekf.quaternion()) - quat_yaw(sim.state.q)) * RAD2DEG);
             trace(TraceRow {
                 t,
                 tilt_err_deg: tilt,
@@ -629,10 +789,55 @@ pub fn run_traced(
                 accel_true: [sim.last_accel_world[0], sim.last_accel_world[1]],
                 alt_err: ae,
                 accel_update_applied: last_applied,
+                yaw_err_deg: ye,
             });
             out.tilt_sq += (tilt * tilt) as f64;
             out.alt_sq += (ae * ae) as f64;
             out.samples += 1;
+            let tp = tilt.min(DIVERGED_TILT_DEG);
+            out.tilt_sq_penalised += (tp * tp) as f64;
+            out.yaw_sq += (ye * ye) as f64;
+            out.yaw_err_max_deg = out.yaw_err_max_deg.max(ye.abs());
+
+            // ---- Consistency (NEES) ----
+            let qe = mekf.quaternion();
+            let eb = attitude_error_body(qe, sim.state.q);
+            let pb = mekf.attitude_cov();
+            let eb64 = [eb[0] as f64, eb[1] as f64, eb[2] as f64];
+            let pb64 = [
+                [pb[0][0] as f64, pb[0][1] as f64, pb[0][2] as f64],
+                [pb[1][0] as f64, pb[1][1] as f64, pb[1][2] as f64],
+                [pb[2][0] as f64, pb[2][1] as f64, pb[2][2] as f64],
+            ];
+            // Tilt: rotate error and covariance to nav, keep N and E.
+            let r = nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
+                qe[0], qe[1], qe[2], qe[3],
+            ))
+            .to_rotation_matrix();
+            let rm = nalgebra::Matrix3::<f64>::from_fn(|i, j| r[(i, j)] as f64);
+            let en = rm * nalgebra::Vector3::new(eb64[0], eb64[1], eb64[2]);
+            let pn = rm * nalgebra::Matrix3::from_fn(|i, j| pb64[i][j]) * rm.transpose();
+            let et = [en[0], en[1]];
+            let pt = [[pn[(0, 0)], pn[(0, 1)]], [pn[(1, 0)], pn[(1, 1)]]];
+            let pk = &kf.p_cov;
+            let ealt = [(kf.x[2] - sim.state.z) as f64];
+            let palt = [[pk[(2, 2)] as f64]];
+            let truth_pv = [sim.state.x, sim.state.y, sim.state.z, sim.state.vx, sim.state.vy, sim.state.vz];
+            let epv: [f64; 6] = core::array::from_fn(|i| (kf.x[i] - truth_pv[i]) as f64);
+            let ppv: [[f64; 6]; 6] = core::array::from_fn(|i| core::array::from_fn(|j| pk[(i, j)] as f64));
+            if let (Some(nt), Some(na), Some(nh), Some(npv)) =
+                (nees(&et, &pt), nees(&eb64, &pb64), nees(&ealt, &palt), nees(&epv, &ppv))
+            {
+                out.nees_tilt += nt;
+                out.nees_tilt_in95 += (nt <= chi2_95(2)) as u64;
+                out.nees_att += na;
+                out.nees_att_in95 += (na <= chi2_95(3)) as u64;
+                out.nees_alt += nh;
+                out.nees_alt_in95 += (nh <= chi2_95(1)) as u64;
+                out.nees_pv += npv;
+                out.nees_pv_in95 += (npv <= chi2_95(6)) as u64;
+                out.nees_samples += 1;
+            }
             out.tilt_err_max_deg = out.tilt_err_max_deg.max(tilt);
             out.alt_err_max_m = out.alt_err_max_m.max(ae.abs());
             out.horiz_err_max_m = out.horiz_err_max_m.max(he);
@@ -682,6 +887,95 @@ mod tests {
         let alt = libm::sqrt(r.alt_sq / r.samples as f64);
         assert!(tilt < 0.5, "tilt rmse {tilt}");
         assert!(alt < 0.1, "alt rmse {alt}");
+    }
+
+    /// The GA-fitted rate gains every scenario file declares.
+    fn ga() -> Tunables {
+        let f = Tunables::firmware();
+        Tunables { rate: crate::control::pid::PidGains { kp: 0.009, kd: 0.00015, ..f.rate }, ..f }
+    }
+
+    fn yaw_rmse(r: &EstRun) -> f64 {
+        libm::sqrt(r.yaw_sq / r.samples as f64)
+    }
+
+    /// A gyro z bias is unobservable without a heading reference, so yaw
+    /// drifts; with the magnetometer fused it does not. Attitude hold, not
+    /// position hold: in position hold the accelerations the loop produces
+    /// make yaw observable through the GPS acceleration compensation, and
+    /// the drift stays bounded without a magnetometer.
+    #[test]
+    fn magnetometer_bounds_the_yaw_drift_of_a_gyro_z_bias() {
+        let mut sc = EstScenario::nominal();
+        sc.total_s = 10.0;
+        sc.pos_hold = false;
+        sc.deg.gyro.bias = [0.0, 0.0, 3.0];
+        let p = EstParams::firmware();
+        let t = ga();
+        let off = run(&sc, &p, &t, 1);
+        sc.mag = MagSimParams::PLACEHOLDER;
+        sc.mag_cal_ut = sc.mag.hard_iron_ut;
+        let on = run(&sc, &p, &t, 1);
+        assert!(off.failed.is_none() && on.failed.is_none());
+        assert_eq!(off.mag_updates_applied, 0);
+        assert!(on.mag_updates_applied > 900, "{}", on.mag_updates_applied);
+        assert!(off.yaw_err_max_deg > 20.0, "no-mag yaw max {}", off.yaw_err_max_deg);
+        assert!(yaw_rmse(&on) < 3.0 && on.yaw_err_max_deg < 8.0, "mag yaw rmse {} max {}", yaw_rmse(&on), on.yaw_err_max_deg);
+        assert!(on.bias_err_dps < 1.0, "mag bias err {}", on.bias_err_dps);
+    }
+
+    /// With the controllers closed on truth, a broken estimator cannot take
+    /// the aircraft down: an inverted gyro axis in the estimator's copy
+    /// destroys the closed-loop flight, while on truth the flight completes
+    /// and the estimator's error is measured on it.
+    #[test]
+    fn control_on_truth_decouples_the_trajectory_from_the_estimator() {
+        let mut sc = EstScenario::nominal();
+        sc.total_s = 8.0;
+        sc.plant.wind_ned = [6.0, 2.0, 0.0];
+        sc.deg.gyro.sigma = 1.0;
+        sc.deg.accel.sigma = 0.5;
+        sc.est_gyro_sign = [-1.0, 1.0, 1.0];
+        let p = EstParams::firmware();
+        let t = ga();
+        let closed = run(&sc, &p, &t, 1);
+        sc.control_on_truth = true;
+        let truth = run(&sc, &p, &t, 1);
+        assert!(closed.failed.is_some() || closed.est_diverged, "the fault must bite in closed loop");
+        assert!(truth.failed.is_none(), "{:?}", truth.failed);
+        assert!(truth.samples == truth.samples_scheduled);
+        // Open loop the same fault costs only a few degrees: the v1
+        // gyro_sign divergences are the estimator error fed back through
+        // the controller, not the estimator alone.
+        assert!(truth.tilt_err_max_deg < DIVERGED_TILT_DEG, "{}", truth.tilt_err_max_deg);
+    }
+
+    /// NEES is accumulated and finite on a nominal run, and a failed run's
+    /// penalised tilt covers every scheduled sample.
+    #[test]
+    fn consistency_and_penalised_scores_are_accumulated() {
+        let mut sc = EstScenario::nominal();
+        sc.total_s = 3.0;
+        let r = run(&sc, &EstParams::firmware(), &ga(), 1);
+        assert!(r.nees_samples > 250, "{}", r.nees_samples);
+        assert!((r.nees_tilt / r.nees_samples as f64).is_finite());
+        assert!(r.samples_scheduled >= r.samples);
+        assert!(r.tilt_sq_penalised >= 0.0);
+    }
+
+    #[test]
+    fn nees_and_attitude_error_helpers() {
+        // Identity covariance: NEES is the squared norm.
+        let v = nees(&[1.0, 2.0], &[[1.0, 0.0], [0.0, 1.0]]).unwrap();
+        assert!((v - 5.0).abs() < 1e-12);
+        let v = nees(&[2.0], &[[4.0]]).unwrap();
+        assert!((v - 1.0).abs() < 1e-12);
+        assert!(nees(&[1.0], &[[0.0]]).is_none());
+        // A 2 deg rotation about body x is a 2 deg body error on x.
+        let h = 1f32.to_radians();
+        let e = attitude_error_body([1.0, 0.0, 0.0, 0.0], [libm::cosf(h), libm::sinf(h), 0.0, 0.0]);
+        assert!((e[0] - 2f32.to_radians()).abs() < 1e-5 && e[1].abs() < 1e-6 && e[2].abs() < 1e-6);
+        assert!((wrap_deg(350.0) + 10.0).abs() < 1e-4 && (wrap_deg(-190.0) - 170.0).abs() < 1e-4);
     }
 
     /// The overshoot measure: past the target along the step, as a fraction.
