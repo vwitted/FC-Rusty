@@ -31,7 +31,8 @@
 // no_std, like the rest of `sim`: the caller parses configs and prints.
 
 use crate::attitude_mekf::{
-    specific_force_implausible, thrust_axis_nav, AccelDecimator, AttitudeMekf, MekfParams,
+    accel_window_excluded, specific_force_implausible, thrust_aid_sigma, thrust_axis_nav,
+    AccelDecimator, AttitudeMekf, MekfParams,
     ACCEL_DECIMATION, G_MPS2,
 };
 use crate::control::altitude::AltitudeController;
@@ -450,7 +451,12 @@ pub fn run_traced(
                 holdoff -= 1;
                 clipped_in_window = true;
             }
-            let window_clipped = clipped_in_window || implausible;
+            // The sim always flies: armed throughout, as the firmware's
+            // ARMED_FLAG would be. The invariant and the thrust aid are
+            // gated on it through the same helpers main.rs calls.
+            let armed = true;
+            let window_clipped = clipped_in_window
+                || (implausible && accel_window_excluded(false, sf_run, armed));
             clipped_in_window = false;
             let skip = p.clip_skip_update && window_clipped;
             kf_coast = p.clip_kf_coast && window_clipped;
@@ -468,15 +474,17 @@ pub fn run_traced(
             let k_rate = p.mekf.accel_r_rate_gain;
             let sig = sig0 * (1.0 + p.r_k_norm * (an - 1.0).abs() + k_rate * w + p.r_k_gacc * gm);
             last_applied = !skip && mekf.update_accel_sigma(a_c, sig);
-            if skip && p.thrust_aid_sigma > 0.0 && gps_accel.is_fresh() {
-                mekf.update_vector(thrust_axis_nav(gps_accel.accel_ned()), [0.0, 0.0, 1.0], p.thrust_aid_sigma);
-                out.thrust_aid_updates += 1;
-            } else if !skip && p.thrust_aid_always_sigma > 0.0 && gps_accel.is_fresh() {
-                mekf.update_vector(
-                    thrust_axis_nav(gps_accel.accel_ned()),
-                    [0.0, 0.0, 1.0],
-                    p.thrust_aid_always_sigma,
-                );
+            // Firmware: attitude_mekf::thrust_aid_sigma(excluded, armed,
+            // fresh). The σ values are overridable here for scans.
+            if let Some(fw) = thrust_aid_sigma(skip, armed, gps_accel.is_fresh()) {
+                let sigma = if skip { p.thrust_aid_sigma } else { p.thrust_aid_always_sigma };
+                debug_assert!(fw > 0.0);
+                if sigma > 0.0 {
+                    mekf.update_vector(thrust_axis_nav(gps_accel.accel_ned()), [0.0, 0.0, 1.0], sigma);
+                    if skip {
+                        out.thrust_aid_updates += 1;
+                    }
+                }
             }
             if last_applied {
                 out.accel_updates_applied += 1;

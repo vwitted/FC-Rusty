@@ -67,12 +67,18 @@ pub fn accel_counts_saturated(counts: &[i16; 3]) -> bool {
     counts.iter().any(|&c| c == i16::MAX || c == i16::MIN)
 }
 
-/// Largest body-z specific force a multirotor can physically produce, g.
+/// Largest body-z specific force a multirotor can produce IN POWERED
+/// FLIGHT, g.
 ///
-/// Thrust acts along body -z in every orientation, inverted included, so
-/// body-z specific force is -T/m <= 0 plus drag; free fall reads ~0. A
-/// window mean above this is not flight, it is a fault: a sign-inverted or
-/// mis-mapped z axis reads +1 g at hover.
+/// While the motors produce thrust it acts along body -z in every attitude,
+/// so body-z specific force is -T/m <= 0 plus drag; free fall reads ~0. A
+/// sustained window mean above this, while flying, is a sensor fault: a
+/// sign-inverted or mis-mapped z axis reads +1 g at hover.
+///
+/// NOT true without thrust. On the bench upside down, on its back after a
+/// crash, or rotated through all axes for mag calibration, the accelerometer
+/// correctly reads up to +1 g on z. Callers must gate on armed; see
+/// `accel_window_excluded`.
 pub const SF_Z_MAX_G: f32 = 0.5;
 
 /// Consecutive accel-update windows (10 ms each) that must violate
@@ -83,17 +89,37 @@ pub const SF_Z_MAX_G: f32 = 0.5;
 pub const SF_INVARIANT_PERSIST: u32 = 3;
 
 /// Whether a window-mean accelerometer reading (body FRD/NED, g) violates
-/// the multirotor specific-force invariant. See `SF_Z_MAX_G`.
+/// the powered-flight specific-force invariant. See `SF_Z_MAX_G`.
 pub fn specific_force_implausible(mean_accel_g: [f32; 3]) -> bool {
     mean_accel_g[2] > SF_Z_MAX_G
 }
 
-/// World (NED) direction of the body +z axis implied by a multirotor's
-/// thrust model and a GPS-derived acceleration: m·a = thrust + m·g with
-/// thrust along body -z, so R·e3 = (g·e3 - a)/|g·e3 - a|. Independent of
-/// the accelerometer and of the attitude estimate. Biased by aerodynamic
-/// drag: holding station in wind needs tilt with a = 0, which this reads as
-/// level. `accel_ned` is horizontal GPS acceleration, m/s².
+/// Whether this accel-update window is excluded from the MEKF (and the
+/// PosKF coasts). `clipped`: a raw sample in the window hit full scale --
+/// invalid in any state. `sf_run`: consecutive windows failing
+/// `specific_force_implausible`. That invariant holds only in powered
+/// flight, so it acts only while `armed`: disarmed, an inverted board is a
+/// legitimate +1 g and must keep its accel update, or the arming gate's
+/// level check would be fed an estimate pulled toward level.
+pub fn accel_window_excluded(clipped: bool, sf_run: u32, armed: bool) -> bool {
+    clipped || (armed && sf_run >= SF_INVARIANT_PERSIST)
+}
+
+/// Measurement σ for thrust-axis aiding this window, or None for no aid.
+/// The thrust model needs thrust, so never while disarmed; it needs a fresh
+/// GPS acceleration. Strong (`THRUST_AID_SIGMA`) when the accel window is
+/// excluded and it is the only tilt reference, weak
+/// (`THRUST_AID_SIGMA_VALID`) beside a valid accel update.
+pub fn thrust_aid_sigma(window_excluded: bool, armed: bool, gps_accel_fresh: bool) -> Option<f32> {
+    if !armed || !gps_accel_fresh {
+        None
+    } else if window_excluded {
+        Some(THRUST_AID_SIGMA)
+    } else {
+        Some(THRUST_AID_SIGMA_VALID)
+    }
+}
+
 /// Measurement σ (unit-vector scale) for thrust-axis aiding. Measured in
 /// sim-eval: 0.2..0.8 is a plateau (accel_saturation 6.7 -> 0.9..1.1 deg,
 /// accel_sign_z 6.7 -> 2.7..3.0 deg); 0.03 over-trusts the lagged GPS figure.
@@ -104,9 +130,17 @@ pub const THRUST_AID_SIGMA: f32 = 0.3;
 /// says little about tilt; the GPS-implied axis does not share that blind
 /// spot. Weak because in hover it is the worse reference (drag bias, GPS
 /// lag). Measured in sim-eval: airmode_transitions 4.77 -> 3.86 deg RMS
-/// (held-out seeds -4 %); 1.0 and 1.5 cost nominal hover >1 %, 2.0 ~0.5 %.
+/// (held-out seeds -4 %), at a nominal-hover cost of +0.9 %, inside the 1 %
+/// noise floor; 1.0 and 1.5 cost more than the floor.
 pub const THRUST_AID_SIGMA_VALID: f32 = 2.0;
 
+/// World (NED) direction of the body +z axis implied by a multirotor's
+/// thrust model and a GPS-derived acceleration: m·a = thrust + m·g with
+/// thrust along body -z, so R·e3 = (g·e3 - a)/|g·e3 - a|. Independent of
+/// the accelerometer and of the attitude estimate. Valid only in powered
+/// flight (see `thrust_aid_sigma`). Biased by aerodynamic drag: holding
+/// station in wind needs tilt with a = 0, which this reads as level.
+/// `accel_ned` is horizontal GPS acceleration, m/s².
 pub fn thrust_axis_nav(accel_ned: [f32; 2]) -> [f32; 3] {
     let v = [-accel_ned[0], -accel_ned[1], G_MPS2];
     let n = libm::sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
@@ -841,6 +875,23 @@ fn quat_to_euler(q: &[f32; 4]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Disarmed, an inverted board legitimately reads +1 g: it must keep its
+    /// accel update and get no thrust aid, or a board lying upside down
+    /// would be estimated level and could pass the arming tilt gate.
+    #[test]
+    fn the_invariant_and_thrust_aid_act_only_while_armed() {
+        let run = SF_INVARIANT_PERSIST + 5;
+        assert!(!accel_window_excluded(false, run, false), "disarmed inverted excluded");
+        assert!(accel_window_excluded(false, run, true));
+        assert!(!accel_window_excluded(false, SF_INVARIANT_PERSIST - 1, true));
+        assert!(accel_window_excluded(true, 0, false), "clipping excludes in any state");
+        assert_eq!(thrust_aid_sigma(true, false, true), None);
+        assert_eq!(thrust_aid_sigma(false, false, true), None);
+        assert_eq!(thrust_aid_sigma(true, true, false), None);
+        assert_eq!(thrust_aid_sigma(true, true, true), Some(THRUST_AID_SIGMA));
+        assert_eq!(thrust_aid_sigma(false, true, true), Some(THRUST_AID_SIGMA_VALID));
+    }
 
     #[test]
     fn hover_and_inverted_flight_are_plausible_and_an_inverted_axis_is_not() {

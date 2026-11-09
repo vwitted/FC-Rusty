@@ -309,6 +309,12 @@ static GPS_ACCEL_FRESH: core::sync::atomic::AtomicBool =
 /// A clipped window's mean is biased, so the accel update is skipped.
 static ACCEL_CLIPPED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+/// Whether the aircraft is armed: navigation task -> mekf_task. Gates the
+/// estimator mechanisms that assume powered flight (the thrust-axis
+/// specific-force invariant and thrust-axis aiding), which are wrong on the
+/// bench, upside down, or during mag calibration.
+static ARMED_FLAG: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 /// Whether the most recent accel-update window was invalid (clipped, or
 /// failing the specific-force invariant): mekf_task -> pos_kf_task, which
 /// then coasts its predict on zero acceleration with
@@ -1587,23 +1593,26 @@ async fn mekf_task() {
             // update and tell the PosKF to coast. Measured in sim-eval
             // (accel_saturation): 2/4 diverged -> 0/4.
             let clipped = ACCEL_CLIPPED.swap(false, core::sync::atomic::Ordering::Relaxed);
-            // Thrust acts along body -z in every orientation, so a sustained
-            // positive body-z specific force is a sensor fault (inverted or
-            // mis-mapped axis), not flight. Excluded like a clipped window.
-            // Measured in sim-eval (accel_sign_z): 4/4 diverged -> 0/4.
+            // In powered flight thrust acts along body -z in every attitude,
+            // so a sustained positive body-z specific force is a sensor fault
+            // (inverted or mis-mapped axis). Only while armed: disarmed, an
+            // upside-down board legitimately reads +1 g. See
+            // attitude_mekf::accel_window_excluded. Measured in sim-eval
+            // (accel_sign_z): 4/4 diverged -> 0/4.
+            let armed = ARMED_FLAG.load(core::sync::atomic::Ordering::Relaxed);
             let mean_g = accel_win.take(a_g);
             if attitude_mekf::specific_force_implausible(mean_g) {
                 sf_run = sf_run.saturating_add(1);
-                if sf_run == attitude_mekf::SF_INVARIANT_PERSIST {
+                if armed && sf_run == attitude_mekf::SF_INVARIANT_PERSIST {
                     defmt::warn!(
-                        "accel: body-z specific force {=f32} g violates the multirotor invariant -- accelerometer excluded (check IMU orientation)",
+                        "accel: body-z specific force {=f32} g in flight violates the thrust-axis invariant -- accelerometer excluded (check IMU orientation)",
                         mean_g[2],
                     );
                 }
             } else {
                 sf_run = 0;
             }
-            let window_invalid = clipped || sf_run >= attitude_mekf::SF_INVARIANT_PERSIST;
+            let window_invalid = attitude_mekf::accel_window_excluded(clipped, sf_run, armed);
             KF_ACCEL_CLIPPED.store(window_invalid, core::sync::atomic::Ordering::Relaxed);
             // σ grows with body rate (MekfParams::accel_r_rate_gain).
             let sigma_a = mekf.accel_sigma(gyro_rad);
@@ -1612,19 +1621,18 @@ async fn mekf_task() {
             } else {
                 updates_rejected = updates_rejected.wrapping_add(1);
             }
-            // With the accelerometer excluded, the GPS acceleration still
-            // fixes tilt through the thrust model: thrust is along body z,
-            // so R·e3 = (g·e3 - a)/|g·e3 - a|. Independent of the IMU.
-            // Measured in sim-eval: accel_saturation 6.7 -> 0.9 deg RMS,
-            // accel_sign_z 6.7 -> 2.8 deg. Biased by drag in wind. Also fused
-            // weakly beside a valid update (THRUST_AID_SIGMA_VALID), where it
-            // covers the manoeuvres in which the accel reads only thrust.
-            if GPS_ACCEL_FRESH.load(core::sync::atomic::Ordering::Relaxed) {
-                let sigma = if window_invalid {
-                    attitude_mekf::THRUST_AID_SIGMA
-                } else {
-                    attitude_mekf::THRUST_AID_SIGMA_VALID
-                };
+            // GPS acceleration also fixes tilt through the thrust model:
+            // thrust is along body z, so R·e3 = (g·e3 - a)/|g·e3 - a|,
+            // independent of the IMU. Strong when the accel window is
+            // excluded, weak beside a valid update; never while disarmed,
+            // where there is no thrust. Measured in sim-eval:
+            // accel_saturation 6.7 -> 0.9 deg RMS, accel_sign_z 6.7 -> 2.8,
+            // airmode 4.8 -> 3.9. Biased by drag in wind.
+            if let Some(sigma) = attitude_mekf::thrust_aid_sigma(
+                window_invalid,
+                armed,
+                GPS_ACCEL_FRESH.load(core::sync::atomic::Ordering::Relaxed),
+            ) {
                 mekf.update_vector(
                     attitude_mekf::thrust_axis_nav(gps_accel_ned),
                     [0.0, 0.0, 1.0],
@@ -2751,6 +2759,7 @@ async fn navigation_task() {
             gps_home_latched,
         );
         let armed = arm_state == ArmState::Armed;
+        ARMED_FLAG.store(armed, core::sync::atomic::Ordering::Relaxed);
         if armed && !last_armed {
             // Tell the PosKF to latch p_ref against the current baro
             // sample (if any) and zero the vertical KF state.
