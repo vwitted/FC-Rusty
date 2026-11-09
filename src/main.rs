@@ -153,7 +153,7 @@ use drivers::nmea::{GpsData, NmeaParser};
 use drivers::wt901b::{
     ImuData, UPDATED_ACCEL, UPDATED_ANGLE, UPDATED_GYRO, UPDATED_QUAT,
 };
-use estimation::{geodetic_to_local_ned, PosKf, PosKfParams};
+use estimation::{geodetic_to_local_ned, gps_velocity_ned, PosKf, PosKfParams};
 
 // ---- Flight modes ----
 
@@ -2018,15 +2018,7 @@ async fn pos_kf_task() {
             // which is correct: NED velocity needs no local origin. It is
             // the quality bar that had to match, not the latch.
             if vel_fresh && gps.velocity_quality_ok(MIN_SATS, MAX_S_ACC_MS, HDOP_THRESH) {
-                let (vn, ve) = if gps.ground_speed_ms < 0.3 {
-                    (0.0, 0.0)
-                } else {
-                    let crs = gps.course_deg.to_radians();
-                    (
-                        gps.ground_speed_ms * libm::cosf(crs),
-                        gps.ground_speed_ms * libm::sinf(crs),
-                    )
-                };
+                let (vn, ve) = gps_velocity_ned(gps.ground_speed_ms, gps.course_deg);
                 // σ from the receiver's sAcc where it exists, clamped so
                 // an optimistic estimate cannot let one fix dominate and
                 // an accepted fix always retains some influence.

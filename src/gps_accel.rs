@@ -332,6 +332,54 @@ mod tests {
         assert!(d.norm() < 1e-4, "euler/quaternion rotations disagree by {}", d.norm());
     }
 
+    /// The circularity audit, as arithmetic rather than prose.
+    ///
+    /// An acceleration reference built from the IMU itself -- the PosKF
+    /// predict input a = R(q_est) f + g -- makes the corrected measurement
+    /// f - R(q_est)^T a / g = -R(q_est)^T e3, which IS the predicted gravity:
+    /// the innovation is zero and the update cannot move the estimate.
+    /// The GPS-derived reference has no such identity: from the same wrong
+    /// estimate, the update moves the tilt toward the truth.
+    #[test]
+    fn imu_derived_reference_is_circular_and_gps_derived_is_not() {
+        use crate::attitude_mekf::{AttitudeMekf, MekfParams};
+        use nalgebra::{Rotation3, UnitQuaternion, Vector3};
+        let tilt_err = |m: &AttitudeMekf, truth: &Rotation3<f32>| {
+            let q = m.quaternion();
+            let rq = UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(q[0], q[1], q[2], q[3]));
+            (rq * Vector3::z()).angle(&(truth * Vector3::z()))
+        };
+        // Truth: rolled 15 deg, accelerating 3 m/s2 east. Estimate: level.
+        let truth = Rotation3::from_euler_angles(15f32.to_radians(), 0.0, 0.0);
+        let g = crate::attitude_mekf::G_MPS2;
+        let a_true = Vector3::new(0.0, 3.0, 0.0);
+        let f_g = (truth.inverse() * (a_true - Vector3::new(0.0, 0.0, g))) / g;
+        let f = [f_g.x, f_g.y, f_g.z];
+
+        let mut circ = AttitudeMekf::new(MekfParams::default());
+        let before = tilt_err(&circ, &truth);
+        let e = circ.euler();
+        let r_est = Rotation3::from_euler_angles(e[0], e[1], e[2]);
+        let a_imu = r_est * f_g * g + Vector3::new(0.0, 0.0, g);
+        let ab = r_est.inverse() * a_imu / g;
+        let q0 = circ.quaternion();
+        for _ in 0..50 {
+            circ.update_accel([f[0] - ab.x, f[1] - ab.y, f[2] - ab.z]);
+        }
+        let q1 = circ.quaternion();
+        for i in 0..4 {
+            assert!((q0[i] - q1[i]).abs() < 1e-6, "circular reference moved q: {q0:?} -> {q1:?}");
+        }
+
+        let mut gps = AttitudeMekf::new(MekfParams::default());
+        for _ in 0..50 {
+            let c = compensate_specific_force_g(f, [a_true.x, a_true.y], gps.euler());
+            gps.update_accel(c);
+        }
+        let after = tilt_err(&gps, &truth);
+        assert!(after < 0.2 * before, "GPS reference failed to correct tilt: {before} -> {after} rad");
+    }
+
     /// A real manoeuvre must still pass. The bound is above anything the
     /// airframe can do, not a limit on normal flight.
     #[test]

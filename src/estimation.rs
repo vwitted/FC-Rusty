@@ -392,6 +392,24 @@ impl PosKf {
     }
 }
 
+// ---- GPS ground velocity → NED ----
+
+/// Ground speed below which the receiver's course is treated as
+/// meaningless and the velocity reported as zero, m/s.
+pub const GPS_VEL_DEADBAND_MS: f32 = 0.3;
+
+/// NED horizontal velocity from receiver ground speed and course over
+/// ground, as fused by `pos_kf_task` and differentiated by `gps_accel`.
+/// Zero below `GPS_VEL_DEADBAND_MS`, where course is noise.
+pub fn gps_velocity_ned(ground_speed_ms: f32, course_deg: f32) -> (f32, f32) {
+    if ground_speed_ms < GPS_VEL_DEADBAND_MS {
+        (0.0, 0.0)
+    } else {
+        let crs = course_deg.to_radians();
+        (ground_speed_ms * libm::cosf(crs), ground_speed_ms * libm::sinf(crs))
+    }
+}
+
 // ---- Geodetic → local NED ----
 
 /// Convert a WGS84 geodetic fix to a local NED offset from a reference
