@@ -162,6 +162,16 @@ d`).
    hardware. Real mass, inertia, arm length and thrust are still
    unmeasured. Evidence in commits e7f614f, 0e17a9e and 1409259.
 
+4. **Estimator hardening (2026-11-09), sim-only, not yet flown.** `sim-eval`
+   (src/sim/est_eval.rs, `cargo sim-eval`) scores the firmware estimator
+   wiring in closed loop over 11 fault scenarios. Accepted: skip/coast on
+   clipped accel windows; exclude the accel when body-z specific force
+   violates the thrust-axis invariant (defmt warning); GPS thrust-axis tilt
+   aiding; rate-scaled accel R. Bench-verify the clip flag and the invariant
+   warning. Open: position hold has no GPS-staleness fallback (modes.rs);
+   gyro-sign faults are unrecoverable because the rate loop shares the
+   signal. Full record: sim/REPORT.md, sim/ITERATIONS.md.
+
 ## ****Alpha Complete 03-05-2026****
 
 ### post-Alpha tweaks
