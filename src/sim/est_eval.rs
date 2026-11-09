@@ -118,6 +118,8 @@ pub struct EstParams {
     /// fresh, aid tilt with the thrust axis implied by GPS acceleration
     /// (attitude_mekf::thrust_axis_nav), at this σ. 0 = off (gyro only).
     pub thrust_aid_sigma: f32,
+    /// Also fuse thrust-axis aiding on VALID windows, at this σ. 0 = off.
+    pub thrust_aid_always_sigma: f32,
 }
 
 impl EstParams {
@@ -144,6 +146,7 @@ impl EstParams {
             r_k_rate: 0.0,
             r_k_gacc: 0.0,
             thrust_aid_sigma: crate::attitude_mekf::THRUST_AID_SIGMA,
+            thrust_aid_always_sigma: crate::attitude_mekf::THRUST_AID_SIGMA_VALID,
         }
     }
 }
@@ -496,6 +499,12 @@ pub fn run_traced(
             if skip && p.thrust_aid_sigma > 0.0 && gps_accel.is_fresh() {
                 mekf.update_vector(thrust_axis_nav(gps_accel.accel_ned()), [0.0, 0.0, 1.0], p.thrust_aid_sigma);
                 out.thrust_aid_updates += 1;
+            } else if !skip && p.thrust_aid_always_sigma > 0.0 && gps_accel.is_fresh() {
+                mekf.update_vector(
+                    thrust_axis_nav(gps_accel.accel_ned()),
+                    [0.0, 0.0, 1.0],
+                    p.thrust_aid_always_sigma,
+                );
             }
             if last_applied {
                 out.accel_updates_applied += 1;

@@ -2,15 +2,15 @@
   "rules": {"rel_eps": 0.01, "abs_eps": {"rmse_attitude": 0.002, "rmse_altitude": 0.002, "max_overshoot": 0.002}, "lower_is_better": true},
   "scenarios": {
     "accel_saturation": {"rmse_attitude": 0.942968, "rmse_altitude": 0.316073, "max_overshoot": 0.000000, "divergence_count": 0, "pass": true},
-    "accel_sign_x": {"rmse_attitude": 5.591355, "rmse_altitude": 0.203809, "max_overshoot": 0.000000, "divergence_count": 0, "pass": false},
-    "accel_sign_y": {"rmse_attitude": 5.806353, "rmse_altitude": 0.209012, "max_overshoot": 0.000000, "divergence_count": 0, "pass": false},
-    "accel_sign_z": {"rmse_attitude": 2.827846, "rmse_altitude": 0.221506, "max_overshoot": 0.000000, "divergence_count": 0, "pass": false},
-    "airmode_transitions": {"rmse_attitude": 4.769482, "rmse_altitude": 0.210495, "max_overshoot": 0.091034, "divergence_count": 0, "pass": false},
-    "altitude_steps": {"rmse_attitude": 6.161616, "rmse_altitude": 0.577413, "max_overshoot": 0.306323, "divergence_count": 0, "pass": false},
-    "gps_dropout_10s": {"rmse_attitude": 7.172456, "rmse_altitude": 0.485154, "max_overshoot": 0.000000, "divergence_count": 3, "pass": false},
+    "accel_sign_x": {"rmse_attitude": 5.594785, "rmse_altitude": 0.203943, "max_overshoot": 0.000000, "divergence_count": 0, "pass": false},
+    "accel_sign_y": {"rmse_attitude": 5.819330, "rmse_altitude": 0.209120, "max_overshoot": 0.000000, "divergence_count": 0, "pass": false},
+    "accel_sign_z": {"rmse_attitude": 2.827162, "rmse_altitude": 0.221509, "max_overshoot": 0.000000, "divergence_count": 0, "pass": false},
+    "airmode_transitions": {"rmse_attitude": 3.856374, "rmse_altitude": 0.199368, "max_overshoot": 0.071607, "divergence_count": 0, "pass": false},
+    "altitude_steps": {"rmse_attitude": 6.220707, "rmse_altitude": 0.579936, "max_overshoot": 0.308156, "divergence_count": 0, "pass": false},
+    "gps_dropout_10s": {"rmse_attitude": 6.873833, "rmse_altitude": 0.393262, "max_overshoot": 0.000000, "divergence_count": 3, "pass": false},
     "gyro_sign_x": {"rmse_attitude": null, "rmse_altitude": null, "max_overshoot": null, "divergence_count": 4, "pass": false},
     "gyro_sign_y": {"rmse_attitude": null, "rmse_altitude": null, "max_overshoot": null, "divergence_count": 4, "pass": false},
     "gyro_sign_z": {"rmse_attitude": null, "rmse_altitude": null, "max_overshoot": null, "divergence_count": 4, "pass": false},
-    "nominal_hover": {"rmse_attitude": 2.431138, "rmse_altitude": 0.246554, "max_overshoot": 0.000000, "divergence_count": 0, "pass": false}
+    "nominal_hover": {"rmse_attitude": 2.453446, "rmse_altitude": 0.247828, "max_overshoot": 0.000000, "divergence_count": 0, "pass": false}
   }
 }

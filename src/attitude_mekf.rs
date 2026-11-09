@@ -162,6 +162,14 @@ pub fn rotate_body_to_current(v: [f32; 3], q_then: [f32; 4], q_now: [f32; 4]) ->
 /// accel_sign_z 6.7 -> 2.7..3.0 deg); 0.03 over-trusts the lagged GPS figure.
 pub const THRUST_AID_SIGMA: f32 = 0.3;
 
+/// Thrust-axis aiding σ alongside a VALID accel update: a weak second tilt
+/// reference. During manoeuvres the accelerometer reads the thrust axis and
+/// says little about tilt; the GPS-implied axis does not share that blind
+/// spot. Weak because in hover it is the worse reference (drag bias, GPS
+/// lag). Measured in sim-eval: airmode_transitions 4.77 -> 3.86 deg RMS
+/// (held-out seeds -4 %); 1.0 and 1.5 cost nominal hover >1 %, 2.0 ~0.5 %.
+pub const THRUST_AID_SIGMA_VALID: f32 = 2.0;
+
 pub fn thrust_axis_nav(accel_ned: [f32; 2]) -> [f32; 3] {
     let v = [-accel_ned[0], -accel_ned[1], G_MPS2];
     let n = libm::sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);

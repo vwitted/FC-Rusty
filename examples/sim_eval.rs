@@ -185,6 +185,7 @@ fn apply_param(p: &mut EstParams, k: &str, v: &Val) -> bool {
         "est.r_k_rate" => p.r_k_rate = x(),
         "est.r_k_gacc" => p.r_k_gacc = x(),
         "est.thrust_aid_sigma" => p.thrust_aid_sigma = x(),
+        "est.thrust_aid_always_sigma" => p.thrust_aid_always_sigma = x(),
         _ => return false,
     }
     true
