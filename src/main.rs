@@ -1610,6 +1610,18 @@ async fn mekf_task() {
             } else {
                 updates_rejected = updates_rejected.wrapping_add(1);
             }
+            // With the accelerometer excluded, the GPS acceleration still
+            // fixes tilt through the thrust model: thrust is along body z,
+            // so R·e3 = (g·e3 - a)/|g·e3 - a|. Independent of the IMU.
+            // Measured in sim-eval: accel_saturation 6.7 -> 0.9 deg RMS,
+            // accel_sign_z 6.7 -> 2.8 deg. Biased by drag in wind.
+            if window_invalid && GPS_ACCEL_FRESH.load(core::sync::atomic::Ordering::Relaxed) {
+                mekf.update_vector(
+                    attitude_mekf::thrust_axis_nav(gps_accel_ned),
+                    [0.0, 0.0, 1.0],
+                    attitude_mekf::THRUST_AID_SIGMA,
+                );
+            }
         }
 
         // Magnetometer handling: try_take is non-blocking and runs on

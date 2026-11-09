@@ -169,6 +169,7 @@ fn apply_param(p: &mut EstParams, k: &str, v: &Val) -> bool {
         "imu.gyro_fc_hz" => p.imu_filter.gyro_fc_hz = x(),
         "imu.accel_fc_hz" => p.imu_filter.accel_fc_hz = x(),
         "est.accel_window_mean" => p.accel_window_mean = v.boolean(k),
+        "est.accel_window_mean_kf" => p.accel_window_mean_kf = v.boolean(k),
         "est.clip_skip_update" => p.clip_skip_update = v.boolean(k),
         "est.clip_kf_coast" => p.clip_kf_coast = v.boolean(k),
         "poskf.coast_sigma_a" => p.poskf.coast_sigma_a = x(),
@@ -177,6 +178,13 @@ fn apply_param(p: &mut EstParams, k: &str, v: &Val) -> bool {
         "est.sf_invariant_check" => p.sf_invariant_check = v.boolean(k),
         "est.sf_invariant_persist" => p.sf_invariant_persist = x() as u32,
         "est.clip_holdoff_windows" => p.clip_holdoff_windows = x() as u32,
+        "est.accel_comp_delay_windows" => p.accel_comp_delay_windows = x() as u32,
+        "poskf.gps_vel_sigma" => p.gps_vel_sigma = x(),
+        "est.bias_watchdog_dps" => p.bias_watchdog_dps = x(),
+        "est.r_k_norm" => p.r_k_norm = x(),
+        "est.r_k_rate" => p.r_k_rate = x(),
+        "est.r_k_gacc" => p.r_k_gacc = x(),
+        "est.thrust_aid_sigma" => p.thrust_aid_sigma = x(),
         _ => return false,
     }
     true
@@ -364,7 +372,7 @@ fn run_scenario(s: &Scenario, detail: bool) -> Score {
         for (seed, r) in s.seeds.iter().zip(&runs) {
             eprintln!(
                 "{:<22} seed {seed}: fail={:?} est_div={} tilt_max={:.2}deg alt_max={:.2}m \
-                 horiz_max={:.2}m clipped={} implausible={}/{} gps_dropped={} acc_upd={}/{} rail={:.1}% bias_err={:.3}dps",
+                 horiz_max={:.2}m clipped={} implausible={}/{} gps_dropped={} acc_upd={}/{} rail={:.1}% bias_err={:.3}dps resets={}",
                 s.name,
                 r.failed,
                 r.est_diverged,
@@ -379,6 +387,7 @@ fn run_scenario(s: &Scenario, detail: bool) -> Score {
                 r.accel_updates_applied + r.accel_updates_rejected,
                 100.0 * r.rail_steps as f64 / r.steps.max(1) as f64,
                 r.bias_err_dps,
+                r.mekf_resets,
             );
         }
     }

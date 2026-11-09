@@ -88,6 +88,86 @@ pub fn specific_force_implausible(mean_accel_g: [f32; 3]) -> bool {
     mean_accel_g[2] > SF_Z_MAX_G
 }
 
+/// Accel-update history for delay-matched GPS compensation.
+///
+/// The GPS-derived acceleration describes the aircraft some time ago (half
+/// a fix interval of finite difference plus the low-pass lag), but it is
+/// subtracted from the CURRENT specific force -- during any manoeuvre the
+/// two disagree and the difference is injected as tilt. Storing the
+/// specific force and attitude per update lets the caller compensate the
+/// sample the GPS figure actually describes, then rotate the result into
+/// the current body frame (`rotate_body_to_current`) for the update.
+pub const ACCEL_HISTORY_LEN: usize = 64;
+
+#[derive(Debug, Clone, Copy)]
+pub struct AccelHistory {
+    accel_g: [[f32; 3]; ACCEL_HISTORY_LEN],
+    q: [[f32; 4]; ACCEL_HISTORY_LEN],
+    head: usize,
+    len: usize,
+}
+
+impl AccelHistory {
+    pub const fn new() -> Self {
+        Self {
+            accel_g: [[0.0; 3]; ACCEL_HISTORY_LEN],
+            q: [[1.0, 0.0, 0.0, 0.0]; ACCEL_HISTORY_LEN],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    /// Record the current update window's specific force and attitude.
+    pub fn push(&mut self, accel_g: [f32; 3], q: [f32; 4]) {
+        self.head = (self.head + 1) % ACCEL_HISTORY_LEN;
+        self.accel_g[self.head] = accel_g;
+        self.q[self.head] = q;
+        self.len = (self.len + 1).min(ACCEL_HISTORY_LEN);
+    }
+
+    /// The entry `back` pushes ago (0 = latest), clamped to the oldest held.
+    pub fn get(&self, back: usize) -> Option<([f32; 3], [f32; 4])> {
+        if self.len == 0 {
+            return None;
+        }
+        let b = back.min(self.len - 1).min(ACCEL_HISTORY_LEN - 1);
+        let i = (self.head + ACCEL_HISTORY_LEN - b) % ACCEL_HISTORY_LEN;
+        Some((self.accel_g[i], self.q[i]))
+    }
+}
+
+impl Default for AccelHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Express a body-frame vector measured at attitude `q_then` in the body
+/// frame of `q_now` (both body -> nav): v_now = R(q_now)^T R(q_then) v.
+pub fn rotate_body_to_current(v: [f32; 3], q_then: [f32; 4], q_now: [f32; 4]) -> [f32; 3] {
+    let v = Vector3::new(v[0], v[1], v[2]);
+    let n = r_bn_mul(&q_then, &v);
+    let o = r_nb_mul(&q_now, &n);
+    [o[0], o[1], o[2]]
+}
+
+/// World (NED) direction of the body +z axis implied by a multirotor's
+/// thrust model and a GPS-derived acceleration: m·a = thrust + m·g with
+/// thrust along body -z, so R·e3 = (g·e3 - a)/|g·e3 - a|. Independent of
+/// the accelerometer and of the attitude estimate. Biased by aerodynamic
+/// drag: holding station in wind needs tilt with a = 0, which this reads as
+/// level. `accel_ned` is horizontal GPS acceleration, m/s².
+/// Measurement σ (unit-vector scale) for thrust-axis aiding. Measured in
+/// sim-eval: 0.2..0.8 is a plateau (accel_saturation 6.7 -> 0.9..1.1 deg,
+/// accel_sign_z 6.7 -> 2.7..3.0 deg); 0.03 over-trusts the lagged GPS figure.
+pub const THRUST_AID_SIGMA: f32 = 0.3;
+
+pub fn thrust_axis_nav(accel_ned: [f32; 2]) -> [f32; 3] {
+    let v = [-accel_ned[0], -accel_ned[1], G_MPS2];
+    let n = libm::sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    [v[0] / n, v[1] / n, v[2] / n]
+}
+
 /// Mean of the accelerometer over one accel-update window.
 ///
 /// The accel update runs at 1/ACCEL_DECIMATION of the IMU rate. Taking
@@ -280,6 +360,23 @@ impl AttitudeMekf {
         self.q = euler_to_quat(roll, pitch, yaw);
         // Bias starts at zero; the filter learns it via predict/update.
         self.bias = Vector3::zeros();
+    }
+
+    /// Re-seed attitude from an accel reading and reset bias and covariance
+    /// to their initial values, keeping the magnetometer state. Recovery for
+    /// a filter whose state is no longer credible.
+    pub fn reinitialize_from_accel(&mut self, accel_body_g: [f32; 3]) {
+        let yaw = quat_to_euler(&self.q)[2];
+        self.initialize_from_accel(accel_body_g);
+        let e = quat_to_euler(&self.q);
+        self.q = euler_to_quat(e[0], e[1], yaw);
+        let p = self.params;
+        self.p = SMatrix::<f32, 6, 6>::zeros();
+        for i in 0..3 {
+            self.p[(i, i)] = p.init_sigma_att[i] * p.init_sigma_att[i];
+            self.p[(3 + i, 3 + i)] = p.init_sigma_bias * p.init_sigma_bias;
+        }
+        self.nis_rejected_run = 0;
     }
 
     /// Predict one step. `gyro_body` is measured gyro in rad/s (body NED).
@@ -586,6 +683,55 @@ impl AttitudeMekf {
         true
     }
 
+    /// Vector-reference update: `meas_body` (unit) is a body-frame direction
+    /// known to equal the nav-frame direction `ref_nav` (unit). Same model
+    /// as the mag update -- h = R(q)ᵀ·ref_nav, H = [[h]×, 0] -- with the
+    /// reference supplied per call. Returns false on a degenerate input.
+    ///
+    /// Used for thrust-axis aiding (`thrust_axis_nav`): the body z axis is
+    /// the thrust axis, and GPS acceleration gives its world direction.
+    pub fn update_vector(&mut self, ref_nav: [f32; 3], meas_body: [f32; 3], sigma: f32) -> bool {
+        let r = Vector3::new(ref_nav[0], ref_nav[1], ref_nav[2]);
+        let z = Vector3::new(meas_body[0], meas_body[1], meas_body[2]);
+        let (rn, zn) = (r.norm(), z.norm());
+        if rn < 1e-6 || zn < 1e-6 || !(sigma > 0.0) {
+            return false;
+        }
+        let r = r / rn;
+        let z = z / zn;
+        let h = r_nb_mul(&self.q, &r);
+        let y = z - h;
+        let hx = skew(&h);
+        let p_tt = self.p.fixed_view::<3, 3>(0, 0).into_owned();
+        let p_tb = self.p.fixed_view::<3, 3>(0, 3).into_owned();
+        let mut s = hx * p_tt * hx.transpose();
+        for i in 0..3 {
+            s[(i, i)] += sigma * sigma;
+        }
+        let Some(s_inv) = s.try_inverse() else { return false };
+        let k_top = p_tt * hx.transpose() * s_inv;
+        let k_bot = p_tb.transpose() * hx.transpose() * s_inv;
+        let d_theta = k_top * y;
+        let d_bias = k_bot * y;
+        let dq = [1.0, d_theta[0] * 0.5, d_theta[1] * 0.5, d_theta[2] * 0.5];
+        self.q = quat_mul(self.q, dq);
+        quat_normalize(&mut self.q);
+        self.bias += d_bias;
+        let kh_tt = k_top * hx;
+        let kh_bt = k_bot * hx;
+        let mut kh = SMatrix::<f32, 6, 6>::zeros();
+        for i in 0..3 {
+            for j in 0..3 {
+                kh[(i, j)] = kh_tt[(i, j)];
+                kh[(3 + i, j)] = kh_bt[(i, j)];
+            }
+        }
+        self.p = (SMatrix::<f32, 6, 6>::identity() - kh) * self.p;
+        let pt = self.p.transpose();
+        self.p = (self.p + pt) * 0.5;
+        true
+    }
+
     /// Scalar yaw measurement update (e.g. GPS course-over-ground used as
     /// a heading reference). `yaw_meas` and the internal yaw are both
     /// "angle from north, clockwise positive"; the innovation is wrapped
@@ -786,6 +932,45 @@ mod tests {
         assert!(!specific_force_implausible([0.3, -0.2, -2.5])); // pulling g
         assert!(!specific_force_implausible([0.0, 0.0, 0.0])); // free fall
         assert!(specific_force_implausible([0.0, 0.0, 1.0])); // z inverted
+    }
+
+    #[test]
+    fn history_returns_past_entries_and_rotation_is_consistent() {
+        let mut h = AccelHistory::new();
+        for k in 0..10 {
+            h.push([k as f32, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]);
+        }
+        assert_eq!(h.get(0).unwrap().0[0], 9.0);
+        assert_eq!(h.get(3).unwrap().0[0], 6.0);
+        assert_eq!(h.get(99).unwrap().0[0], 0.0); // clamped to oldest
+        // Same attitude: identity. 90 deg yaw between: x_then -> -y_now.
+        let q0 = [1.0, 0.0, 0.0, 0.0];
+        assert_eq!(rotate_body_to_current([1.0, 2.0, 3.0], q0, q0), [1.0, 2.0, 3.0]);
+        let s = core::f32::consts::FRAC_1_SQRT_2;
+        let qy = [s, 0.0, 0.0, s];
+        let v = rotate_body_to_current([1.0, 0.0, 0.0], q0, qy);
+        assert!(v[0].abs() < 1e-6 && (v[1] + 1.0).abs() < 1e-6, "{v:?}");
+    }
+
+    /// Thrust-axis aiding must pull a wrong estimate toward the truth when
+    /// the GPS acceleration is consistent with the true tilt.
+    #[test]
+    fn thrust_axis_update_corrects_tilt_from_gps_acceleration() {
+        // Truth: pitched -10 deg (nose down, NED), accelerating north at
+        // g*tan(10 deg) with no drag. Estimate: level.
+        let th = -10f32.to_radians();
+        let a_n = -G_MPS2 * libm::tanf(th);
+        let u = thrust_axis_nav([a_n, 0.0]);
+        let truth = euler_to_quat(0.0, th, 0.0);
+        let want = r_bn_mul(&truth, &Vector3::new(0.0, 0.0, 1.0));
+        for i in 0..3 {
+            assert!((u[i] - want[i]).abs() < 1e-5, "u {u:?} vs R e3 {want:?}");
+        }
+        let mut m = AttitudeMekf::new(MekfParams::default());
+        for _ in 0..200 {
+            m.update_vector(u, [0.0, 0.0, 1.0], 0.1);
+        }
+        assert!((m.euler()[1] - th).abs() < 0.5f32.to_radians(), "pitch {}", m.euler()[1]);
     }
 
     #[test]
