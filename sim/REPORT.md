@@ -27,6 +27,13 @@ accepted and committed. Every candidate is logged in sim/ITERATIONS.md.
 - **Acceptance.** A candidate needed at least one metric to improve, and no metric to regress against
   either the current best or the frozen `sim/baseline.json`. The noise floor was max(1 %, 0.002), fixed
   before the baseline was taken.
+  - "No regression" was implemented as **nothing worse than that floor**, not zero change. With
+    deterministic seeds every parameter change moves every metric slightly, so zero tolerance would accept
+    nothing.
+  - The fault-gated changes (iterations 3, 8 and 19) left every other scenario bit-identical. Iterations 20
+    and 21 moved other metrics within the floor.
+  - Iteration 20 in particular cost nominal hover +0.92 %. A literal zero-tolerance reading of your rule
+    would have rejected it.
 - **Held-out check.** From iteration 9 every candidate also had to survive seeds 5–12. It was rejected if
   its gains did not replicate there, if any divergence count rose, or if any scenario's survivor-matched
   median per-seed RMSE worsened by more than 5 %. This criterion was formalised at iteration 17 and
@@ -74,14 +81,26 @@ Held-out seeds 5–12, baseline-equivalent parameters → final:
 | Commit | Iteration | Change | Mechanism |
 |---|---|---|---|
 | 5a8cbd1 | 3 | Skip the accel update, and coast the PosKF at σ_a 16 m/s², on a window holding a clipped raw sample | Vibration riding on the 1 g offset clips asymmetrically, which biases the window mean |
-| d7f9dc6 | 8 | Exclude the accelerometer when the body-z specific force exceeds +0.5 g for 30 ms | Thrust is along body −z in every orientation, so a positive f_z is a sensor fault, not flight |
+| d7f9dc6 | 8 | Exclude the accelerometer when the body-z specific force exceeds +0.5 g for 30 ms, **while armed** | In powered flight thrust is along body −z in every attitude, so a positive f_z is a sensor fault |
 | 85a5c83 | 19 | While the accel is excluded, aid tilt with the GPS-implied thrust axis R·e₃ = (g·e₃ − a)/‖·‖ | A tilt reference independent of the IMU |
-| e910a3e | 20 | Fuse that axis weakly (σ 2.0) beside valid accel updates | In manoeuvres the accelerometer reads only the thrust axis |
+| e910a3e | 20 | Fuse that axis weakly (σ 2.0) beside valid accel updates, **while armed** | In manoeuvres the accelerometer reads only the thrust axis |
 | 58e7255 | 21 | Accel-update σ grows with body rate, gain 3 per rad/s | Rotation adds specific force that the gravity model lacks; the term is 0 in hover |
 | 4580b05 | — | Removed the firmware-compiled code of rejected iterations | No behaviour change |
+| (final) | — | Gated the invariant and both thrust-aid paths on armed (`ARMED_FLAG`, `accel_window_excluded`, `thrust_aid_sigma`) | Both models assume thrust; see below |
 
-The firmware raises a `defmt::warn!` when the specific-force invariant excludes the accelerometer, so a
-mis-mapped IMU axis is reported on the bench.
+**Armed gating (safety fix found in review).** "Thrust is along body −z" holds only in powered flight.
+On the bench, upside down, on its back, or during mag-cal rotation, the accelerometer correctly reads up to
++1 g on z. Ungated, the invariant would have excluded it and the thrust aid would have pulled the estimate
+toward level. Because `control/arming.rs` gates arming on MEKF tilt below 25°, that was a possible
+**arm-while-inverted** path. Both mechanisms now act only while armed. The decision lives in two
+host-tested helpers that main.rs and `est_eval` both call. The sim flies armed throughout, so the suite
+output is bit-identical.
+
+A residual edge remains. An armed craft lying on its back after a crash, with fresh GPS, would be excluded
+and aided toward level until it disarms.
+
+The firmware logs a `defmt::warn!` when the invariant excludes the accelerometer in flight, so a
+mis-mapped IMU axis is reported.
 
 ## Step 5: circularity audit of acceleration references
 
@@ -122,8 +141,8 @@ TRUE attitude (`sim.state.q`), has no clamp or stale handling, and closes altitu
   6.17°, while their divergences fall from 3/8 to 0 and from 1/8 to 0. Part of this is survivorship: seeds
   that used to diverge, and so were excluded, are now included. The survivor-matched median at acceptance
   was about +2 % for each, below the 5 % held-out bar.
-- **Nominal hover** carries about +0.5 % from iteration 20, inside the noise floor, which iteration 21 then
-  more than recovered (2.45 → 1.35°).
+- **Nominal hover** carried +0.92 % from iteration 20 (2.4311 → 2.4534°), inside the 1 % floor.
+  Iteration 21 then more than recovered it (2.45 → 1.35°).
 
 ## Blocked by the rule
 
@@ -181,10 +200,13 @@ estimator (iteration 21), it is still blocked by `accel_sign_x/y` alone. The sam
      future metric should score failed seeds rather than drop them.
    - The pass thresholds were set before the baseline and were not changed. No scenario passed at
      baseline; 2 pass now (accel_saturation, nominal_hover).
-7. **Not verified on hardware.**
-   - The firmware changes compile (`cargo build --release`), host tests pass (447) and sim-baseline is
-     unchanged.
-   - The clip flag, the invariant warning and the thrust-axis path have not run on the board.
+7. **Not verified on hardware, and not executed in Renode.**
+   - The firmware changes compile (`cargo build --release`) and host tests pass (448).
+   - The full Renode suite passes, 10/10, on freshly staged ELFs (`stage-firmware.sh`,
+     `tests/run-tests.sh`): boot-smoke, logger-uart, dshot-gpio, esc-model and sim-baseline.
+   - Under Renode the flight build logs only through "RC task started" and then stalls at IMU bring-up,
+     because SPI1 is a Tag. So `mekf_task`, and with it every new path, never runs there.
+   - The clip flag, the armed gate, the invariant warning and the thrust-axis aid are bench items.
    - The 16 g saturation test (`i16::MAX`/`MIN`) assumes the driver's ±16 g configuration
      (drivers/icm42688.rs).
 

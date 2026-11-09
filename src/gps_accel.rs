@@ -19,10 +19,17 @@
 //
 // The signal-to-noise looks unusable on paper -- 0.05 m/s of Doppler noise
 // at 10 Hz differentiates to ~0.7 m/s2, against the ~2.6 m/s2 a 15 deg tilt
-// produces. It works because the error being removed is QUASI-STATIC: a
-// sustained tilt holding against wind, or the sustained acceleration of an
-// upset. Both persist for seconds, so the estimate can be filtered hard and
-// the lag costs nothing. Measured in examples/sim_sweep.rs.
+// produces. The error being removed is largely QUASI-STATIC -- a sustained
+// tilt holding against wind, or the sustained acceleration of an upset --
+// so the estimate can be filtered hard.
+//
+// The lag is not free. sim_sweep's measurement rotated the compensation by
+// the TRUE attitude with no position loop closed on the estimate. In the
+// firmware-faithful closed loop (sim-eval, sim/REPORT.md) the position loop
+// produces real accelerations on the timescale of the filter, and a LONGER
+// tau is worse: 1.0 s took nominal-hover tilt RMS from 2.4 to 8.2 deg.
+// Shorter tau helps hover but costs the fault and manoeuvre scenarios, so
+// DEFAULT_TAU_S stays 0.5 (sim/ITERATIONS.md, iterations 11 and 22).
 
 /// Smoothing time constant, seconds. Chosen so ~5 fixes at 10 Hz are
 /// averaged: enough to halve the differentiation noise, short enough that

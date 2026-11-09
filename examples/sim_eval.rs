@@ -418,7 +418,8 @@ fn score_json(sc: &Score) -> String {
 //   - no (scenario, metric) REGRESSES against the frozen baseline (so
 //     sub-threshold drift cannot accumulate across iterations).
 // For the three continuous metrics, a change counts only beyond a noise
-// floor of max(REL_EPS * |old|, ABS_EPS[metric]). divergence_count is exact;
+// floor of max(REL_EPS * |old|, ABS_EPS[metric]) -- so "no regression" means
+// nothing worse than the floor, not zero change. divergence_count is exact;
 // pass going true -> false is a regression, false -> true an improvement.
 // null (every seed failed) is worse than any number.
 

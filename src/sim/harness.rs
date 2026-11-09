@@ -407,6 +407,13 @@ pub struct HarnessCfg {
     ///
     /// MEASURED, and it settles two design questions.
     ///
+    /// Caveat (2026-11-09): this path rotates the compensation into body
+    /// with the TRUE attitude (`sim.state.q`), has no clamp or staleness
+    /// handling, and closes altitude on truth; the firmware rotates with the
+    /// MEKF's own estimate. The figures below are therefore optimistic. The
+    /// firmware-faithful measurement is `sim-eval` (src/sim/est_eval.rs,
+    /// sim/REPORT.md).
+    ///
     /// Station-keeping in wind, att_rms: 2.775 deg with no compensation,
     /// 0.546 GPS-derived, 0.287 with exact acceleration. So the realistic
     /// path closes ~90% of the gap to the oracle.
