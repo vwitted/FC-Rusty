@@ -171,8 +171,11 @@ d`).
    rule: accel window mean, GPS-accel tau 0.35 s, MEKF sigma_a 0.3 (+5-10 %
    tilt RMS on a mirrored x/y accel axis). The invariant and the thrust aid act only
    while armed (they assume thrust). Bench-verify the clip flag, the armed
-   gate and the invariant warning; mekf_task does not run under Renode. Open: position hold has no GPS-staleness fallback (modes.rs);
-   gyro-sign faults are unrecoverable because the rate loop shares the
+   gate and the invariant warning; mekf_task does not run under Renode.
+   GPS staleness (control/modes.rs `GpsFreshness`): after 2.5 s without a
+   good fix PosHold degrades to AltHold, GpsHome is withdrawn, and the
+   RC-loss ladder takes FailsafeLand instead of GpsRescue; restored after
+   3 s of continuous fixes. Host-tested only. Open: gyro-sign faults are unrecoverable because the rate loop shares the
    signal. Full record: sim/REPORT.md, sim/ITERATIONS.md.
 
 ## ****Alpha Complete 03-05-2026****

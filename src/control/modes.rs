@@ -142,12 +142,66 @@ pub struct PosEstimate {
     /// True once a sufficiently good GPS fix has been captured as the home
     /// origin. Horizontal `position_ned` is meaningful only when true.
     pub home_latched: bool,
+    /// GPS position fixes are arriving now (`GpsFreshness`). `home_latched`
+    /// stays true through an outage; this does not.
+    pub gps_fresh: bool,
     /// Monotonic counter incremented each time the PosKF consumes the arm
     /// latch (re-anchors origins + zeros state). Used via `ArmOriginSync` to
     /// withhold target capture until the arm-time re-origin has actually
     /// landed — otherwise it would capture stale pre-zero targets and lurch
     /// on arm.
     pub arm_origin_seq: u32,
+}
+
+/// Seconds without a good, new GPS position fix after which the GPS
+/// modes are withdrawn. Covers a 1 Hz receiver that misses one fix.
+pub const GPS_STALE_AFTER_S: f32 = 2.5;
+/// Seconds of uninterrupted fixes before the GPS modes are offered again,
+/// so a marginal receiver cannot toggle the mode at its fix rate.
+pub const GPS_RECOVER_S: f32 = 3.0;
+
+/// Whether GPS position is current, for mode selection.
+///
+/// Without fixes the PosKF's horizontal position is dead-reckoned from the
+/// accelerometer and drifts without bound, so a position controller closed
+/// on it flies toward a point that is not there. Fresh means: the last
+/// good fix is no older than `GPS_STALE_AFTER_S`, and fixes have arrived
+/// without such a gap for at least `GPS_RECOVER_S`.
+#[derive(Clone, Copy, Debug)]
+pub struct GpsFreshness {
+    since_fix_s: f32,
+    run_s: f32,
+}
+
+impl GpsFreshness {
+    pub const fn new() -> Self {
+        Self { since_fix_s: f32::INFINITY, run_s: 0.0 }
+    }
+
+    /// Advance by `dt_s`. `fix`: a good fix with a new position arrived in
+    /// this interval.
+    pub fn tick(&mut self, dt_s: f32, fix: bool) {
+        self.since_fix_s += dt_s;
+        if fix {
+            if self.since_fix_s > GPS_STALE_AFTER_S {
+                self.run_s = 0.0;
+            }
+            self.since_fix_s = 0.0;
+        }
+        if self.since_fix_s <= GPS_STALE_AFTER_S {
+            self.run_s += dt_s;
+        } else {
+            self.run_s = 0.0;
+        }
+    }
+
+    pub fn is_fresh(&self) -> bool {
+        self.since_fix_s <= GPS_STALE_AFTER_S && self.run_s >= GPS_RECOVER_S
+    }
+}
+
+impl Default for GpsFreshness {
+    fn default() -> Self { Self::new() }
 }
 
 /// Altitude to climb to during GPS rescue (metres, positive-up).
@@ -267,6 +321,9 @@ pub struct ModeSelect {
     pub altitude_ready: bool,
     /// GPS home captured — gates NED-frame modes.
     pub home_latched: bool,
+    /// GPS fixes current (`GpsFreshness`) — also gates NED-frame modes and
+    /// PosHold.
+    pub gps_fresh: bool,
     /// AUX: return-to-home switch, microseconds.
     pub rescue_switch_us: u16,
     /// AUX: three-position mode switch, microseconds.
@@ -280,20 +337,25 @@ pub fn select_mode(s: &ModeSelect) -> FlightMode {
     if !s.armed {
         FlightMode::Acro
     } else if s.failsafe_active {
-        // Pick the best descent we can run with what's available.
-        if s.home_latched {
+        // Pick the best descent we can run with what's available. GPS
+        // rescue needs CURRENT fixes, not just a latched home: on a stale
+        // GPS it would hold a dead-reckoned position with no pilot to
+        // intervene. Baro descent is the better rung then.
+        if s.home_latched && s.gps_fresh {
             FlightMode::GpsRescue
         } else if s.altitude_ready {
             FlightMode::FailsafeLand
         } else {
             FlightMode::FailsafeBlind
         }
-    } else if s.rescue_switch_us > RESCUE_SWITCH_ON_US && s.home_latched {
+    } else if s.rescue_switch_us > RESCUE_SWITCH_ON_US && s.home_latched && s.gps_fresh {
         FlightMode::GpsHome
-    } else if s.mode_switch_us > MODE_SWITCH_POSHOLD_US && s.altitude_ready {
-        // PosHold: GPS home gives true position hold; without it, PosKF
-        // velocity-fusion damps DR drift and the controller does
-        // best-effort horizontal hold for tens of seconds.
+    } else if s.mode_switch_us > MODE_SWITCH_POSHOLD_US && s.altitude_ready && s.gps_fresh {
+        // PosHold: GPS home gives true position hold; without it, GPS
+        // velocity fusion damps DR drift and the controller does
+        // best-effort horizontal hold. With no fixes at all it falls to
+        // AltHold below: holding a purely dead-reckoned position steers
+        // toward the accumulated drift.
         FlightMode::PosHold
     } else if s.mode_switch_us > MODE_SWITCH_ALTHOLD_US && s.altitude_ready {
         FlightMode::AltHold
@@ -868,6 +930,7 @@ mod tests {
         PosEstimate {
             altitude_ready: true,
             home_latched: true,
+            gps_fresh: true,
             altitude_up: 10.0,
             ..PosEstimate::default()
         }
@@ -1176,6 +1239,7 @@ mod tests {
             failsafe_active: false,
             altitude_ready: true,
             home_latched: true,
+            gps_fresh: true,
             rescue_switch_us: 1000,
             mode_switch_us: 1000,
         }
@@ -1213,6 +1277,75 @@ mod tests {
             FlightMode::FailsafeBlind,
             "nothing left: open-loop blind descent"
         );
+    }
+
+    /// A latched home is not enough: with stale GPS the ladder takes the
+    /// baro descent rather than holding a dead-reckoned position.
+    #[test]
+    fn failsafe_with_stale_gps_descends_instead_of_rescuing() {
+        let s = ModeSelect { failsafe_active: true, gps_fresh: false, ..sel() };
+        assert_eq!(select_mode(&s), FlightMode::FailsafeLand);
+        assert_eq!(
+            select_mode(&ModeSelect { altitude_ready: false, ..s }),
+            FlightMode::FailsafeBlind
+        );
+    }
+
+    /// Stale GPS withdraws the GPS modes from the pilot's switches too:
+    /// PosHold degrades to AltHold, GpsHome to whatever the mode switch
+    /// selects.
+    #[test]
+    fn stale_gps_degrades_poshold_to_althold_and_withdraws_gps_home() {
+        let stale = ModeSelect { gps_fresh: false, ..sel() };
+        assert_eq!(
+            select_mode(&ModeSelect { mode_switch_us: 1700, ..stale }),
+            FlightMode::AltHold
+        );
+        assert_eq!(
+            select_mode(&ModeSelect { rescue_switch_us: 1900, mode_switch_us: 1700, ..stale }),
+            FlightMode::AltHold
+        );
+        assert_eq!(
+            select_mode(&ModeSelect { rescue_switch_us: 1900, ..stale }),
+            FlightMode::Acro
+        );
+    }
+
+    #[test]
+    fn gps_freshness_needs_a_sustained_run_and_drops_after_the_gap() {
+        let dt = 0.01;
+        let mut f = GpsFreshness::new();
+        assert!(!f.is_fresh(), "no fix yet");
+        // 10 Hz fixes (every 10th tick): fresh only after GPS_RECOVER_S.
+        let mut n: u32 = 0;
+        let mut run = |f: &mut GpsFreshness, ticks: u32, fixing: bool| {
+            for _ in 0..ticks {
+                f.tick(dt, fixing && n % 10 == 0);
+                n += 1;
+            }
+        };
+        run(&mut f, ((GPS_RECOVER_S - 0.2) / dt) as u32, true);
+        assert!(!f.is_fresh(), "run shorter than GPS_RECOVER_S");
+        run(&mut f, 50, true);
+        assert!(f.is_fresh());
+        // Fixes stop: still fresh inside the gap, stale after it.
+        run(&mut f, ((GPS_STALE_AFTER_S - 0.2) / dt) as u32, false);
+        assert!(f.is_fresh(), "a gap shorter than GPS_STALE_AFTER_S");
+        run(&mut f, 30, false);
+        assert!(!f.is_fresh());
+        // One fix after the outage does not restore it: a new run starts.
+        f.tick(dt, true);
+        assert!(!f.is_fresh());
+    }
+
+    /// A 1 Hz receiver is fresh, provided it misses no more than one fix.
+    #[test]
+    fn gps_freshness_tolerates_a_1hz_receiver() {
+        let mut f = GpsFreshness::new();
+        for i in 0..1000 {
+            f.tick(0.01, i % 100 == 0);
+        }
+        assert!(f.is_fresh());
     }
 
     /// Failsafe outranks every pilot switch. If this ever stopped holding,

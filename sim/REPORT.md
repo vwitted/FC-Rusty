@@ -190,9 +190,10 @@ Against iteration 21's estimator:
      reaches −10° roll / −19° pitch while the estimate reads about 0°.
    - Tilt is not observable from the IMU there. R inflation and zero-velocity aiding did not replicate
      (iterations 4 and 5).
-   - Separately, and on the control side: the firmware has **no GPS-staleness fallback for position
-     hold**. `home_latched` stays true through an outage, so the position loop keeps flying a
-     dead-reckoned estimate (control/modes.rs).
+   - Separately, on the control side: position hold had no GPS-staleness fallback, because
+     `home_latched` stays true through an outage. Since fixed in control/modes.rs (`GpsFreshness`):
+     after 2.5 s without a good fix, PosHold degrades to AltHold, the GPS-home switch is withdrawn, and
+     the RC-loss failsafe takes the baro descent instead of GPS rescue.
 4. **Sustained clipping without GPS.** Every window is excluded, the thrust-axis aid needs fresh GPS, and
    attitude falls back to gyro-only and drifts on residual bias.
 5. **Thrust-axis aiding is biased by drag.** Holding station in wind needs tilt with a = 0, which the model

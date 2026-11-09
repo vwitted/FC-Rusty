@@ -881,6 +881,7 @@ pub fn run_case(
                     vz_up,
                     altitude_ready: true,
                     home_latched: true,
+                    gps_fresh: true,
                     ..PosEstimate::default()
                 };
                 let out = nav_step(

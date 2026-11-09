@@ -1955,6 +1955,11 @@ async fn pos_kf_task() {
     let mut last_fused_course: f32 = f32::NAN;
     let mut gps_accel = gps_accel::GpsAccelEstimator::default();
     let mut last_vel_fix_at = Instant::now();
+    // Whether GPS is current, for mode selection (control::modes). Fed by
+    // every good-quality fix, deduplicated or not: a stationary receiver
+    // can repeat a position, and that is still a live fix.
+    let mut gps_freshness = control::modes::GpsFreshness::new();
+    let mut gps_was_fresh = false;
 
     let mut ticker = Ticker::every(Duration::from_millis(PERIOD_MS));
     let mut last_report = Instant::now();
@@ -1976,6 +1981,8 @@ async fn pos_kf_task() {
             gps_accel.is_fresh(),
             core::sync::atomic::Ordering::Relaxed,
         );
+
+        let mut gps_fix_now = false;
 
         // ---- Pull latest IMU for predict ----
         if let Some(imu) = IMU_DATA_FOR_KF.try_take() {
@@ -2022,6 +2029,7 @@ async fn pos_kf_task() {
             gps_signals_sec = gps_signals_sec.wrapping_add(1);
 
             let good_fix = gps.fix_quality_ok(MIN_SATS, HDOP_THRESH);
+            gps_fix_now = good_fix;
 
             let pos_fresh =
                 gps.latitude != last_fused_lat || gps.longitude != last_fused_lon;
@@ -2233,6 +2241,19 @@ async fn pos_kf_task() {
 
         // ---- Publish estimate ----
         let s = kf.state();
+        gps_freshness.tick(DT, gps_fix_now);
+        let gps_fresh = gps_freshness.is_fresh();
+        if gps_fresh != gps_was_fresh {
+            if gps_fresh {
+                defmt::info!("GPS fixes current: position modes available");
+            } else {
+                defmt::warn!(
+                    "GPS stale ({=f32} s without a good fix): PosHold -> AltHold, GPS rescue -> baro descent",
+                    control::modes::GPS_STALE_AFTER_S,
+                );
+            }
+            gps_was_fresh = gps_fresh;
+        }
         let est = PosEstimate {
             position_ned: [s[0], s[1], s[2]],
             velocity_ned: [s[3], s[4], s[5]],
@@ -2246,6 +2267,7 @@ async fn pos_kf_task() {
                 .unwrap_or(u32::MAX),
             altitude_ready,
             home_latched,
+            gps_fresh,
             arm_origin_seq,
         };
         POS_ESTIMATE.signal(est);
@@ -2830,12 +2852,14 @@ async fn navigation_task() {
         // the best descent strategy for what we still have.
         let altitude_ready = last_pos_est.map(|e| e.altitude_ready).unwrap_or(false);
         let home_latched = last_pos_est.map(|e| e.home_latched).unwrap_or(false);
+        let gps_fresh = last_pos_est.map(|e| e.gps_fresh).unwrap_or(false);
 
         flight_mode = control::modes::select_mode(&ModeSelect {
             armed,
             failsafe_active: arming.failsafe_active,
             altitude_ready,
             home_latched,
+            gps_fresh,
             rescue_switch_us: RcChannels::to_us(last_rc.channels[6]),
             mode_switch_us: RcChannels::to_us(last_rc.channels[5]),
         });
