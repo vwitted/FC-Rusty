@@ -182,7 +182,7 @@ fn apply_param(p: &mut EstParams, k: &str, v: &Val) -> bool {
         "poskf.gps_vel_sigma" => p.gps_vel_sigma = x(),
         "est.bias_watchdog_dps" => p.bias_watchdog_dps = x(),
         "est.r_k_norm" => p.r_k_norm = x(),
-        "est.r_k_rate" => p.r_k_rate = x(),
+        "mekf.accel_r_rate_gain" | "est.r_k_rate" => p.mekf.accel_r_rate_gain = x(),
         "est.r_k_gacc" => p.r_k_gacc = x(),
         "est.thrust_aid_sigma" => p.thrust_aid_sigma = x(),
         "est.thrust_aid_always_sigma" => p.thrust_aid_always_sigma = x(),

@@ -110,9 +110,9 @@ pub struct EstParams {
     /// estimate exceeds this, deg/s. 0 = off.
     pub bias_watchdog_dps: f32,
     /// Adaptive accel-update noise: σ = mekf.sigma_a * (1 + k_norm*| |a|-1 |
-    /// + k_rate*|ω| (rad/s) + k_gacc*|a_gps|/g). All 0 = constant σ.
+    /// + accel_r_rate_gain*|ω| (rad/s) + k_gacc*|a_gps|/g).
+    /// (The rate term is MekfParams::accel_r_rate_gain.)
     pub r_k_norm: f32,
-    pub r_k_rate: f32,
     pub r_k_gacc: f32,
     /// While the accelerometer window is excluded and the GPS acceleration is
     /// fresh, aid tilt with the thrust axis implied by GPS acceleration
@@ -143,7 +143,6 @@ impl EstParams {
             gps_vel_sigma: PosKf::SIGMA_GPS_VEL_DEFAULT,
             bias_watchdog_dps: 0.0,
             r_k_norm: 0.0,
-            r_k_rate: 0.0,
             r_k_gacc: 0.0,
             thrust_aid_sigma: crate::attitude_mekf::THRUST_AID_SIGMA,
             thrust_aid_always_sigma: crate::attitude_mekf::THRUST_AID_SIGMA_VALID,
@@ -494,7 +493,8 @@ pub fn run_traced(
             let w = libm::sqrtf(g_est[0] * g_est[0] + g_est[1] * g_est[1] + g_est[2] * g_est[2]);
             let ga = gps_accel.accel_ned();
             let gm = libm::sqrtf(ga[0] * ga[0] + ga[1] * ga[1]) / G_MPS2;
-            let sig = sig0 * (1.0 + p.r_k_norm * (an - 1.0).abs() + p.r_k_rate * w + p.r_k_gacc * gm);
+            let k_rate = p.mekf.accel_r_rate_gain;
+            let sig = sig0 * (1.0 + p.r_k_norm * (an - 1.0).abs() + k_rate * w + p.r_k_gacc * gm);
             last_applied = !skip && mekf.update_accel_sigma(a_c, sig);
             if skip && p.thrust_aid_sigma > 0.0 && gps_accel.is_fresh() {
                 mekf.update_vector(thrust_axis_nav(gps_accel.accel_ned()), [0.0, 0.0, 1.0], p.thrust_aid_sigma);

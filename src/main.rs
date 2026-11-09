@@ -1605,7 +1605,9 @@ async fn mekf_task() {
             }
             let window_invalid = clipped || sf_run >= attitude_mekf::SF_INVARIANT_PERSIST;
             KF_ACCEL_CLIPPED.store(window_invalid, core::sync::atomic::Ordering::Relaxed);
-            if !window_invalid && mekf.update_accel(accel_corrected) {
+            // σ grows with body rate (MekfParams::accel_r_rate_gain).
+            let sigma_a = mekf.accel_sigma(gyro_rad);
+            if !window_invalid && mekf.update_accel_sigma(accel_corrected, sigma_a) {
                 updates_applied = updates_applied.wrapping_add(1);
             } else {
                 updates_rejected = updates_rejected.wrapping_add(1);
