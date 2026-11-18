@@ -144,7 +144,11 @@ embassy-stm32 = { version = "0.4", optional = true, features = [
 embassy-time = { version = "0.5", optional = true, features = [
     "defmt",
     "defmt-timestamp-uptime",
-    "tick-hz-32_768",
+    # 1 MHz so 125 us is exactly 125 ticks. At 32_768 Hz, Duration rounds
+    # up to whole ticks: the "8 kHz" IMU ticker ran at 5 ticks = 6553.6 Hz,
+    # against filters and decimations designed for 8000 Hz. TIM5 at
+    # 240 MHz gives an exact prescaler of 240.
+    "tick-hz-1_000_000",
 ] }
 # Embassy sync
 embassy-sync = { version = "0.7", optional = true, features = ["defmt"] }

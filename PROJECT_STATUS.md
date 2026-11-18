@@ -178,6 +178,23 @@ d`).
    3 s of continuous fixes. Host-tested only. Open: gyro-sign faults are unrecoverable because the rate loop shares the
    signal. Full record: sim/REPORT.md, sim/ITERATIONS.md.
 
+5. **Interrupt-executor split (2026-11-18). Compiled; not bench-tested.**
+   The IMU read, `mekf_task` and `control_loop` run on an
+   `InterruptExecutor` (DCMI vector, P6), so the MPC solve in
+   `navigation_task` no longer holds them off. The defmt logger queues to
+   an 8 KB ring drained by a P15 USART6 interrupt rather than busy-waiting
+   inside a critical section. It still blocks when the ring is full, with
+   interrupts already masked (panic), and in `defmt::flush()`.
+   `tick-hz-1_000_000` replaces 32_768: the "8 kHz" ticker had been running
+   at 6553.6 Hz. Filter cutoffs, the accel-update rate, blackbox decimation
+   and the telemetry window move 1.22x toward their design values, and CPU
+   load rises by the same factor.
+   Still stalls the fast loop: blackbox flash writes, because embassy-stm32
+   programs flash inside a critical section. Verify on the bench with
+   `control loop N Hz measured ... missed M` and `MEKF ... (missed M)`, with
+   MPC on and off and while the blackbox records. Record and next stage:
+   docs/2026-11-10-interrupt-executor-split.md.
+
 ## ****Alpha Complete 03-05-2026****
 
 ### post-Alpha tweaks

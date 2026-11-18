@@ -429,10 +429,11 @@ mod tests {
 /// Fly the characterisation profile, capture the response to RAM, stop
 /// the motors, then dump.
 ///
-/// The three phases are separate on purpose. `logger::putc` busy-waits on
-/// USART6 TXE (~87 us/byte) inside a critical_section, so emitting a
-/// sample as it is taken would stall the DShot loop for milliseconds per
-/// line -- at 500 Hz that is not a measurement, it is a different
+/// The three phases are separate on purpose. The logger drains at
+/// 115200 baud (~87 us/byte); a sample per line at 500 Hz exceeds that,
+/// fills its ring buffer, and from then on every line busy-waits on
+/// USART6 TXE inside a critical_section, stalling the DShot loop for
+/// milliseconds -- that is not a measurement, it is a different
 /// experiment. Capture is a struct copy into RAM; nothing goes on the
 /// wire until the motors are stopped and the timing no longer matters.
 ///

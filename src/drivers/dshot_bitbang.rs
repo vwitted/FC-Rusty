@@ -415,8 +415,9 @@ impl<'d> DshotBitbang<'d> {
             }
         });
 
-        // Opt-in, and it must stay that way. `logger::putc` busy-waits on
-        // USART6 TXE at 115200 baud (~87 us/byte) inside a global
+        // Opt-in, and it must stay that way. The logger drains at 115200
+        // baud (~87 us/byte); output at this rate fills its ring buffer,
+        // after which it busy-waits on USART6 TXE inside a global
         // `critical_section`, so these lines hold interrupts off for
         // milliseconds. At 2 kHz on the bench that is harmless; in the armed
         // 8 kHz flight loop it would stall the inner loop for tens of

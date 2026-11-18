@@ -42,6 +42,12 @@
 
 use cortex_m::peripheral::scb::VectActive::Exception;
 use embassy_executor::Spawner;
+#[cfg(not(any(feature = "motor-test", feature = "mpc-bench")))]
+use embassy_executor::InterruptExecutor;
+#[cfg(not(any(feature = "motor-test", feature = "mpc-bench")))]
+use embassy_stm32::interrupt;
+#[cfg(not(any(feature = "motor-test", feature = "mpc-bench")))]
+use embassy_stm32::interrupt::{InterruptExt, Priority};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::usart::{self, Uart, UartRx, UartTx};
 use embassy_stm32::{bind_interrupts, peripherals};
@@ -214,6 +220,12 @@ static OUTER_CMD: Watch<CriticalSectionRawMutex, OuterLoopCommand, 2> = Watch::n
 /// as `0 samples/s, 0 errors/s` instead of no log at all.
 static ICM_SAMPLES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static ICM_ERRORS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Monotonic count of samples published to RAW_IMU. Never reset, unlike
+/// ICM_SAMPLES, so each consumer can difference it over its own window
+/// and report how many samples it missed. RAW_IMU and IMU_DATA are
+/// latest-value Signals: a consumer that falls behind loses samples
+/// without any other trace.
+static IMU_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Per-sensor diagnostic snapshots. Updated at ~1 Hz by the dual read
 /// task so the monitor can log individual IMU1 / IMU2 values alongside
@@ -357,6 +369,38 @@ static CAL_LED: Watch<CriticalSectionRawMutex, CalLed, 2> = Watch::new();
 // RC signals are defined in rc_task.rs:
 // rc_task::RC_CHANNELS, rc_task::RC_LINK, rc_task::RC_LAST_SEEN
 
+// ---- Fast (interrupt-driven) executor ----
+
+/// Runs the 8 kHz chain: IMU read, MEKF, rate loop, DShot.
+///
+/// The thread-mode executor is cooperative, so any task that computes
+/// without an `.await` (the MPC solve in `navigation_task`, flash writes
+/// in `persist_task`) used to hold this chain off for its whole duration.
+/// Tasks here preempt thread mode instead.
+///
+/// Priority P6 must be numerically higher (less urgent) than every
+/// interrupt these tasks wait on. embassy-stm32 leaves the DMA streams
+/// (`Config::dma_interrupt_priority`, default P0) and the TIM5 time
+/// driver (never set, so P0) at P0, which satisfies that.
+///
+/// Not a fix for code that masks ALL interrupts: flash programming and
+/// erase run inside `critical_section::with` in embassy-stm32, so a
+/// blackbox write still stalls this executor for the write's duration.
+#[cfg(not(any(feature = "motor-test", feature = "mpc-bench")))]
+static EXECUTOR_FAST: InterruptExecutor = InterruptExecutor::new();
+
+/// Interrupt vector borrowed to drive EXECUTOR_FAST. The DCMI peripheral
+/// is not pinned out on this board and is never enabled, so the vector
+/// fires only when the executor pends it.
+#[cfg(not(any(feature = "motor-test", feature = "mpc-bench")))]
+#[interrupt]
+unsafe fn DCMI() {
+    unsafe { EXECUTOR_FAST.on_interrupt() }
+}
+
+#[cfg(not(any(feature = "motor-test", feature = "mpc-bench")))]
+const FAST_EXECUTOR_PRIORITY: Priority = Priority::P6;
+
 // ---- Main entry point ----
 
 /// STM32H743 clock tree for the DAKEFPV (8 MHz HSE → 480 MHz SYSCLK).
@@ -445,11 +489,10 @@ async fn main(spawner: Spawner) {
     let mut core = cortex_m::Peripherals::take().unwrap();
     core.SCB.disable_dcache(&mut core.CPUID);
 
-    // DWT cycle counter, used by control_loop to measure its own interval.
-    // embassy-time is not usable for that: `tick-hz-32_768` means one tick is
-    // 30.5 µs, so an 8 kHz period reads as either 122 µs or 153 µs — ±22% on
-    // a quantity the rate PID divides by. DWT counts core cycles, so at
-    // 480 MHz it resolves 2.08 ns and costs no peripheral.
+    // DWT cycle counter, used by control_loop and mekf_task to measure their
+    // own intervals. The 1 µs embassy-time tick would be 0.8% of a 125 µs
+    // period; DWT counts core cycles, so at 480 MHz it resolves 2.08 ns and
+    // costs no peripheral read.
     core.DCB.enable_trace();
     core.DWT.enable_cycle_counter();
 
@@ -471,8 +514,9 @@ async fn main(spawner: Spawner) {
     );
     // ---- Blackbox dump ----
     // Before anything else is spawned. The dump writes tens of thousands
-    // of lines through a logger that busy-waits inside a critical
-    // section, so nothing else can usefully run during it -- and an
+    // of lines, far faster than 115200 baud drains them, so the logger's
+    // ring stays full and every line busy-waits inside a critical
+    // section; nothing else can usefully run during it -- and an
     // aircraft must not be armable while interrupts are held off for
     // minutes. It halts afterwards rather than continuing to boot.
     #[cfg(feature = "blackbox-dump")]
@@ -567,6 +611,12 @@ async fn main(spawner: Spawner) {
 
 
 
+    // ---- Fast executor ----
+    // Started before anything is spawned on it. The priority must be set
+    // before start(), which enables the vector.
+    interrupt::DCMI.set_priority(FAST_EXECUTOR_PRIORITY);
+    let fast = EXECUTOR_FAST.start(interrupt::DCMI);
+
     // ---- Dual ICM-42688P IMUs (timer-polled 8 kHz reads) ----
     // IMU1 on SPI1: SCK=PA5, MISO=PA6, MOSI=PA7, CS=PA4  (ROTATION_ROLL_180)
     // IMU2 on SPI4: SCK=PE12, MISO=PE13, MOSI=PE14, CS=PB1 (ROTATION_PITCH_180)
@@ -610,16 +660,19 @@ async fn main(spawner: Spawner) {
                 match drivers::icm42688::Icm42688::new(spi4, cs2, Orientation::Pitch180).await {
                     Ok(imu2) => {
                         defmt::info!("ICM-42688P IMU2 (SPI4, Pitch180) initialised OK");
-                        spawner.spawn(dual_icm_read_task(imu1, imu2)).unwrap();
+                        fast.spawn(dual_icm_read_task(imu1, imu2)).unwrap();
                     }
                     Err(e) => {
                         defmt::warn!("ICM-42688P IMU2 init failed: {:?} — running single-IMU", e);
-                        spawner.spawn(single_icm_read_task(imu1)).unwrap();
+                        fast.spawn(single_icm_read_task(imu1)).unwrap();
                     }
                 }
 
                 spawner.spawn(icm_monitor_task()).unwrap();
-                spawner.spawn(mekf_task()).unwrap();
+                // On the fast executor: control_loop waits on the IMU_DATA
+                // this task publishes, so the rate loop can run no faster
+                // or more reliably than the MEKF does.
+                fast.spawn(mekf_task()).unwrap();
             }
             Err(e) => {
                 defmt::error!("ICM-42688P IMU1 init failed: {:?} — NO IMU AVAILABLE", e);
@@ -688,11 +741,11 @@ async fn main(spawner: Spawner) {
     // ---- Run the 50 Hz outer loop as a spawned task ----
     spawner.spawn(navigation_task()).unwrap();
 
-    // ---- Run the fast 8 kHz inner loop on the main task ----
-    // This is deliberate: the control loop is the highest priority
-    // work, so it runs on the main executor rather than being
-    // spawned as a separate task.
-    control_loop(dshot).await;
+    // ---- Fast 8 kHz inner loop, on the interrupt executor ----
+    fast.spawn(control_loop(dshot)).unwrap();
+
+    // Everything is spawned; main has nothing left to do.
+    core::future::pending::<()>().await;
 }
 
 // ---- Heartbeat Task ----
@@ -1251,6 +1304,7 @@ async fn dual_icm_read_task(
                 };
                 RAW_IMU.signal(filtered);
                 ICM_SAMPLES.fetch_add(1, Ordering::Relaxed);
+                IMU_SEQ.fetch_add(1, Ordering::Relaxed);
 
                 // Snapshot per-sensor diagnostics at ~1 Hz. The
                 // a_fused / g_fused fields reflect the *filtered*
@@ -1291,6 +1345,7 @@ async fn dual_icm_read_task(
                 };
                 RAW_IMU.signal(filtered);
                 ICM_SAMPLES.fetch_add(1, Ordering::Relaxed);
+                IMU_SEQ.fetch_add(1, Ordering::Relaxed);
                 ICM_ERRORS.fetch_add(1, Ordering::Relaxed);
             }
             (Err(_), Ok(b)) => {
@@ -1310,6 +1365,7 @@ async fn dual_icm_read_task(
                 };
                 RAW_IMU.signal(filtered);
                 ICM_SAMPLES.fetch_add(1, Ordering::Relaxed);
+                IMU_SEQ.fetch_add(1, Ordering::Relaxed);
                 ICM_ERRORS.fetch_add(1, Ordering::Relaxed);
             }
             (Err(_), Err(_)) => {
@@ -1355,6 +1411,7 @@ async fn single_icm_read_task(
                 };
                 RAW_IMU.signal(filtered);
                 ICM_SAMPLES.fetch_add(1, Ordering::Relaxed);
+                IMU_SEQ.fetch_add(1, Ordering::Relaxed);
             }
             Err(_) => {
                 ICM_ERRORS.fetch_add(1, Ordering::Relaxed);
@@ -1481,6 +1538,7 @@ async fn mekf_task() {
     let mut last_predict_cyc = cortex_m::peripheral::DWT::cycle_count();
     let mut sample_count: u32 = 0;
     let mut last_report = Instant::now();
+    let mut report_seq = IMU_SEQ.load(core::sync::atomic::Ordering::Relaxed);
     let mut updates_applied: u32 = 0;
     let mut updates_rejected: u32 = 0;
     let mut mag_applied: u32 = 0;
@@ -1796,9 +1854,14 @@ async fn mekf_task() {
                     + (bias_rad[1] * RAD2DEG) * (bias_rad[1] * RAD2DEG)
                     + (bias_rad[2] * RAD2DEG) * (bias_rad[2] * RAD2DEG),
             );
+            // Samples published to RAW_IMU that this task never saw.
+            let seq = IMU_SEQ.load(core::sync::atomic::Ordering::Relaxed);
+            let missed = seq.wrapping_sub(report_seq).saturating_sub(sample_count);
+            report_seq = seq;
             defmt::info!(
-                "MEKF {} samples/s, accel_upd={}/{}rej, mag_upd={}/{}rej, euler=[{=f32},{=f32},{=f32}]deg, |bias|={=f32}dps",
+                "MEKF {} samples/s (missed {}), accel_upd={}/{}rej, mag_upd={}/{}rej, euler=[{=f32},{=f32},{=f32}]deg, |bias|={=f32}dps",
                 sample_count,
+                missed,
                 updates_applied,
                 updates_rejected,
                 mag_applied,
@@ -2644,15 +2707,13 @@ async fn baro_task(
 
 
 
-// ---- Control Loop ----
-// The heart of the flight controller. Reads sensor data and
-// RC input, computes control outputs, and drives the motors.
+// ---- Navigation (outer) loop, 100 Hz ----
+// Arming, mode selection, altitude/position control and the attitude
+// MPC; publishes rate setpoints and thrust to control_loop via OUTER_CMD.
 //
-// Architecture:
-//   200 Hz: PID rate inner loop + mixer + DShot output
-//    50 Hz: MPC attitude outer loop + altitude hold (every 4th cycle)
-//
-// This runs as the main task — it never returns.
+// Runs on the thread-mode executor. The MPC solve computes without
+// yielding, which is why the 8 kHz chain is on EXECUTOR_FAST: it
+// preempts this task instead of waiting for the solve to finish.
 
 #[embassy_executor::task]
 async fn navigation_task() {
@@ -3095,7 +3156,7 @@ async fn navigation_task() {
 }
 
 // ---- Fast Inner Loop (8 kHz) ----
-// Runs strictly synchronised to the MEKF output (which runs at 8 kHz).
+// Runs on EXECUTOR_FAST, one iteration per MEKF output (IMU_DATA).
 // Reads the latest target rates and thrust from the outer loop, runs
 // the rate PID, and pushes commands to the ESCs via DShot.
 
@@ -3117,6 +3178,7 @@ const BLACKBOX_DECIM: u32 = blackbox::decimation(8000, blackbox::DEFAULT_RATE_HZ
 #[cfg(feature = "firmware")]
 const TELEM_REPORT_FRAMES: u32 = 8000;
 
+#[embassy_executor::task]
 async fn control_loop(mut dshot: DshotBitbang<'static>) -> ! {
     defmt::info!("Fast inner loop started (8 kHz synced to IMU_DATA)");
 
@@ -3157,16 +3219,15 @@ async fn control_loop(mut dshot: DshotBitbang<'static>) -> ! {
     let mut telem_nosig = [0u32; 4];
     let mut telem_bad = [0u32; 4];
     let mut telem_last_period = [0u32; 4];
-    // Wall-clock start of the current report window, so the report can
-    // state the loop's MEASURED rate rather than its nominal one.
-    //
-    // This exists because the blackbox writes flash from persist_task,
-    // and embassy's executor is cooperative and single-threaded: this
-    // loop is awaited on the same executor, so every flash program blocks
-    // it for the duration of the write. Whether that matters is a
-    // question about real hardware timing, and the honest way to answer
-    // it is to print the number and look.
-    let mut telem_window_start = Instant::now();
+    // Loop-rate and missed-sample report, armed or not, once per second of
+    // DWT time. The loop is on the fast executor, but it can still lose
+    // samples: flash programming in persist_task masks all interrupts,
+    // and the chain IMU read -> MEKF -> this loop -> DShot frame may not
+    // fit in one IMU period. `missed` is IMU samples published minus
+    // iterations run; it should read 0.
+    let mut rate_iters: u32 = 0;
+    let mut rate_window_cyc = last_cyc;
+    let mut rate_window_seq = IMU_SEQ.load(core::sync::atomic::Ordering::Relaxed);
 
     loop {
         // Wait for the next 8 kHz IMU sample
@@ -3182,6 +3243,23 @@ async fn control_loop(mut dshot: DshotBitbang<'static>) -> ! {
         let now_cyc = cortex_m::peripheral::DWT::cycle_count();
         let dt = ((now_cyc.wrapping_sub(last_cyc) as f32) / CORE_HZ).clamp(50.0e-6, 2.0e-3);
         last_cyc = now_cyc;
+
+        rate_iters = rate_iters.wrapping_add(1);
+        let window_cyc = now_cyc.wrapping_sub(rate_window_cyc);
+        if window_cyc >= CORE_HZ as u32 {
+            let seq = IMU_SEQ.load(core::sync::atomic::Ordering::Relaxed);
+            let published = seq.wrapping_sub(rate_window_seq);
+            let window_s = window_cyc as f32 / CORE_HZ;
+            defmt::info!(
+                "control loop {=u32} Hz measured (nominal 8000), IMU {=u32} Hz, missed {=u32}",
+                (rate_iters as f32 / window_s) as u32,
+                (published as f32 / window_s) as u32,
+                published.saturating_sub(rate_iters),
+            );
+            rate_iters = 0;
+            rate_window_cyc = now_cyc;
+            rate_window_seq = seq;
+        }
 
         // Get the latest commands from the outer loop
         // We use try_get() so it never blocks the fast loop
@@ -3229,14 +3307,13 @@ async fn control_loop(mut dshot: DshotBitbang<'static>) -> ! {
                 // Aggregate, once a second, not four raw enums ten times a
                 // second.
                 //
-                // Two reasons. The logger busy-waits on USART6 TXE
-                // (~87 us/byte) inside a critical_section, so every line
-                // here masks interrupts for milliseconds -- in the 8 kHz
-                // loop that drops ~20 iterations, and IMU_DATA is a
-                // latest-value Signal, so the gyro samples produced during
-                // the stall are gone. dshot_bitbang.rs carries this warning
-                // about its bench RX probe; the same arithmetic applied here
-                // and to the flight path.
+                // Two reasons. The logger drains at 115200 baud
+                // (~87 us/byte); output above that fills its ring buffer,
+                // after which every line busy-waits on TXE inside a
+                // critical_section and masks interrupts for milliseconds --
+                // in the 8 kHz loop that drops ~20 iterations, and IMU_DATA
+                // is a latest-value Signal, so the gyro samples produced
+                // during the stall are gone.
                 //
                 // And a 10 Hz spot sample of four enums answers a worse
                 // question than a rate does. "M4 InvalidCrc" once tells you
@@ -3298,13 +3375,6 @@ async fn control_loop(mut dshot: DshotBitbang<'static>) -> ! {
                 }
 
                 if telem_frames >= TELEM_REPORT_FRAMES {
-                    let window_us = (Instant::now() - telem_window_start).as_micros().max(1);
-                    let loop_hz = (telem_frames as u64 * 1_000_000 / window_us) as u32;
-                    telem_window_start = Instant::now();
-                    defmt::info!(
-                        "control loop {=u32} Hz measured (nominal 8000)",
-                        loop_hz,
-                    );
                     defmt::info!(
                         "DShot RX {=u32} frames: ok[{=u32},{=u32},{=u32},{=u32}] nosig[{=u32},{=u32},{=u32},{=u32}] bad[{=u32},{=u32},{=u32},{=u32}] period_us[{=u32},{=u32},{=u32},{=u32}]",
                         telem_frames,

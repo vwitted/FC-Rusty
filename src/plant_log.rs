@@ -8,8 +8,9 @@
 //! drift apart:
 //!
 //!   - RAM, for a bench capture that is dumped over defmt after the run.
-//!     The logger busy-waits on USART6 TXE inside a critical_section, so
-//!     logging a sample as it is taken would stall the DShot loop for
+//!     A sample stream logged as it is taken exceeds the logger's 115200
+//!     baud drain, fills its ring buffer, and then busy-waits on USART6
+//!     TXE inside a critical_section, stalling the DShot loop for
 //!     milliseconds; capture has to be a memcpy and the transmission has
 //!     to happen when nothing is spinning.
 //!   - Flash, for anything involving flight, where the wire is not

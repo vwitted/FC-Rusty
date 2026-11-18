@@ -2,10 +2,11 @@
 //!
 //! # Why flash, and why bank 2
 //!
-//! The wire is not available in flight. `logger::putc` busy-waits on
-//! USART6 TXE inside a `critical_section`, so a sample logged as it is
-//! taken stalls the 8 kHz loop for milliseconds -- and there is nobody
-//! holding a serial cable anyway.
+//! The wire is not available in flight. The logger drains at 115200 baud
+//! (~11.5 KB/s); a sample stream logged as it is taken exceeds that, fills
+//! its ring buffer, and falls back to busy-waiting on USART6 TXE inside a
+//! `critical_section`, stalling the 8 kHz loop for milliseconds -- and
+//! there is nobody holding a serial cable anyway.
 //!
 //! Bank 2 is chosen for two independent reasons, both load-bearing:
 //!

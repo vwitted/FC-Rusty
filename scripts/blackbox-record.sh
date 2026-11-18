@@ -20,10 +20,11 @@
 #
 # Two things to watch in the log once it is running:
 #
-#   "control loop NNNN Hz measured"  -- the flash writes happen on the
-#       same cooperative executor as the 8 kHz control loop, so they
-#       block it for the duration of each write. This number is how you
-#       find out whether that matters; it was never measured on hardware.
+#   "control loop NNNN Hz measured ... missed N"  -- the control loop is
+#       on an interrupt executor, but embassy-stm32 programs flash inside
+#       a critical section, which masks it too. A nonzero `missed` while
+#       recording is IMU samples lost to that; it was never measured on
+#       hardware.
 #
 #   "blackbox: N samples dropped"    -- the staging channel overflowed,
 #       meaning flash is not keeping up. The log has holes in it.
