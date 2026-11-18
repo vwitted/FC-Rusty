@@ -60,6 +60,18 @@ Each major subsystem runs as an independent async task. Tasks communicate
 via Embassy's `Channel` (MPSC) or `Signal` (latest-value-wins) primitives.
 No shared mutable state, no mutexes in the hot path.
 
+**Executors (2026-11-18).** Two executors. `EXECUTOR_FAST`, an
+`InterruptExecutor` on the DCMI vector at P6, runs the 8 kHz chain:
+`dual_icm_read_task` / `single_icm_read_task`, `mekf_task` and
+`control_loop`. Everything else (`navigation_task` with the MPC solve,
+`pos_kf_task`, GPS, baro/mag, RC, persist, monitor, blink) stays on the
+thread-mode executor and is preempted by the fast chain. DMA and the TIM5
+time driver interrupts are at P0, above the fast executor; the defmt drain
+(USART6) is at P15, below it. Code that masks all interrupts still stalls
+the fast chain: flash program/erase in embassy-stm32, and the logger when
+its ring is full. Every shared static uses `CriticalSectionRawMutex` or an
+atomic, as tasks on different executors require.
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        SPAWNED TASKS                        │

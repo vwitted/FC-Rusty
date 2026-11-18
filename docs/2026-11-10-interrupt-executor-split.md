@@ -163,9 +163,20 @@ Branch `interrupt-executor-split`.
   falls back to the old blocking path when the ring is full, so the dump
   CSV loses no bytes. It also blocks when interrupts were masked before
   the log call (panic-probe disables them) and in `flush()`.
-- `tick-hz-1_000_000`. The TIM5 prescaler is exactly 240. Short timer
-  waits now take their nominal length: the I2C bus-recovery bitbang
-  half-period drops from 30.5 us to 5 us (100 kHz, open-drain).
+- `tick-hz-8_000`, in its own commit, not the drafted 1 MHz. embassy-stm32's
+  time driver treats TIM5 as a 16-bit counter with a 2^15-tick period
+  (`calc_now`). If interrupts stay masked for longer than about one
+  period, `now()` can step backward, and `Instant::duration_since`
+  panics on its `checked_sub`. A flash sector erase (the disarmed mag-cal
+  save, persist-selftest, the blackbox dump) masks interrupts for the
+  whole erase. The period is 33 ms at 1 MHz, 1.0 s at 32 768 Hz (already
+  marginal, before this change) and 4.1 s at 8 kHz. The H743 erase time
+  was not checked against the datasheet. At 8 kHz, 125 us is exactly one
+  tick, but `Instant` resolves only 125 us, so the navigation-loop and
+  MPC timings moved to DWT. Short waits round up to one tick: the I2C
+  bus-recovery half-period goes from 30.5 us to 125 us.
+  The motor-test loop rate also changes. `LOOP_KHZ` of 2, 4 and 8 are
+  now exact; other values round up.
 - `IMU_SEQ`, a monotonic sample counter. `control_loop` reports
   `control loop N Hz measured, IMU N Hz, missed N` once per second, armed
   or not, and `mekf_task` reports `(missed N)`.

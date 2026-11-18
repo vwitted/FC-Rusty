@@ -144,7 +144,18 @@ embassy-stm32 = { version = "0.4", optional = true, features = [
 embassy-time = { version = "0.5", optional = true, features = [
     "defmt",
     "defmt-timestamp-uptime",
-    "tick-hz-32_768",
+    # 8 kHz: one tick is exactly the 125 us IMU period. At 32_768 Hz,
+    # Duration::from_micros rounds up to whole ticks, so the "8 kHz" IMU
+    # ticker ran at 5 ticks = 6553.6 Hz against filters and decimations
+    # designed for 8000 Hz.
+    #
+    # Not faster: embassy-stm32's time driver runs TIM5 as a 16-bit counter
+    # with a 2^15-tick period and loses time if interrupts stay masked for
+    # longer than one period. Flash erase masks them for the whole erase.
+    # The period is 4.1 s here, 1.0 s at 32_768 Hz and 33 ms at 1 MHz.
+    # Instant therefore resolves only 125 us; time anything shorter with
+    # the DWT cycle counter.
+    "tick-hz-8_000",
 ] }
 # Embassy sync
 embassy-sync = { version = "0.7", optional = true, features = ["defmt"] }

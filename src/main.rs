@@ -445,6 +445,14 @@ fn board_config() -> embassy_stm32::Config {
 #[cfg(feature = "firmware")]
 const CORE_HZ: f32 = 480_000_000.0;
 
+/// Microseconds since `start`, a DWT cycle count. Wraps after 8.9 s, so
+/// only for short intervals. Wall time: on thread-mode tasks it includes
+/// any time EXECUTOR_FAST preempted them.
+#[cfg(feature = "firmware")]
+fn dwt_elapsed_us(start: u32) -> u32 {
+    cortex_m::peripheral::DWT::cycle_count().wrapping_sub(start) / (CORE_HZ as u32 / 1_000_000)
+}
+
 /// Bench motor-test entry point — drives DShot directly, no flight stack.
 #[cfg(feature = "motor-test")]
 #[embassy_executor::main]
@@ -489,10 +497,11 @@ async fn main(spawner: Spawner) {
     let mut core = cortex_m::Peripherals::take().unwrap();
     core.SCB.disable_dcache(&mut core.CPUID);
 
-    // DWT cycle counter, used by control_loop and mekf_task to measure their
-    // own intervals. The 1 µs embassy-time tick would be 0.8% of a 125 µs
-    // period; DWT counts core cycles, so at 480 MHz it resolves 2.08 ns and
-    // costs no peripheral read.
+    // DWT cycle counter, used for every interval shorter than a few ms:
+    // control_loop and mekf_task dt, and the MPC and navigation-loop
+    // timings. embassy-time ticks at 8 kHz (see Cargo.toml), so Instant
+    // resolves only 125 µs. DWT counts core cycles, so at 480 MHz it
+    // resolves 2.08 ns and costs no peripheral read.
     core.DCB.enable_trace();
     core.DWT.enable_cycle_counter();
 
@@ -2800,11 +2809,11 @@ async fn navigation_task() {
     // `mpc_max` start counting from a representative value instead of
     // a pathological first-call spike.
     {
-        let warmup_start = Instant::now();
+        let warmup_start = cortex_m::peripheral::DWT::cycle_count();
         mpc.set_reference([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
         let _ = mpc.solve([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
         mpc.reset();
-        let warmup_us = warmup_start.elapsed().as_micros() as u32;
+        let warmup_us = dwt_elapsed_us(warmup_start);
         defmt::info!("MPC warm-up solve completed in {}us", warmup_us);
     }
 
@@ -2813,7 +2822,7 @@ async fn navigation_task() {
     loop {
         ticker.next().await;
         cycle_count = cycle_count.wrapping_add(1);
-        let loop_start = Instant::now();
+        let loop_start = cortex_m::peripheral::DWT::cycle_count();
 
         // ---- 1. Read latest sensor data ----
         if let Some(imu) = IMU_DATA_FOR_NAV.try_take() {
@@ -3062,9 +3071,9 @@ async fn navigation_task() {
                     [0.0, 0.0, yaw_rate_dps * DEG2RAD],
                 );
 
-                let mpc_start = Instant::now();
+                let mpc_start = cortex_m::peripheral::DWT::cycle_count();
                 let mpc_out = mpc.solve(angles_rad, rates_rad);
-                mpc_time_us_last = mpc_start.elapsed().as_micros() as u32;
+                mpc_time_us_last = dwt_elapsed_us(mpc_start);
                 if mpc_time_us_last > mpc_time_us_max {
                     mpc_time_us_max = mpc_time_us_last;
                 }
@@ -3102,7 +3111,7 @@ async fn navigation_task() {
         }
 
         // ---- 6. Loop timing ----
-        let loop_us = loop_start.elapsed().as_micros() as u32;
+        let loop_us = dwt_elapsed_us(loop_start);
         loop_time_us_sum += loop_us;
         timing_sample_count += 1;
         if loop_us > loop_time_us_max {

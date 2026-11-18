@@ -185,7 +185,7 @@ d`).
    an 8 KB ring drained by a P15 USART6 interrupt rather than busy-waiting
    inside a critical section. It still blocks when the ring is full, with
    interrupts already masked (panic), and in `defmt::flush()`.
-   `tick-hz-1_000_000` replaces 32_768: the "8 kHz" ticker had been running
+   `tick-hz-8_000` replaces 32_768: the "8 kHz" ticker had been running
    at 6553.6 Hz. Filter cutoffs, the accel-update rate, blackbox decimation
    and the telemetry window move 1.22x toward their design values, and CPU
    load rises by the same factor.
