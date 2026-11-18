@@ -1,0 +1,22 @@
+// local-icm42688.repl — fixed-value ICM-42688-P models on both IMU buses.
+//
+// Board wiring (src/main.rs, IMU bring-up):
+//   IMU1  SPI1  CS = PA4   mounted ROTATION_ROLL_180
+//   IMU2  SPI4  CS = PB1   mounted ROTATION_PITCH_180
+// Same part, different mounting. The model emits CHIP-frame values; the
+// firmware applies the rotation. See ICM42688P.cs for units and conventions.
+//
+// Requires local-overlay.resc first (SPI1 model, DMA completion). Loaded,
+// with the model compiled, by local-imu.resc.
+
+icm1: Sensors.ICM42688P @ spi1
+
+icm2: Sensors.ICM42688P @ spi4
+
+// CS lines. PA4 has no stock connection. PB1 has one (timer inputs), so it
+// is restated in full with the model appended.
+gpioPortA:
+    4 -> icm1@0
+
+gpioPortB:
+    1 -> timer1@02 | timer3@03 | timer8@02 | icm2@0

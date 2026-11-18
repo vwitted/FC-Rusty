@@ -7,7 +7,7 @@ rem Locates Git Bash and hands off, so the build-and-copy logic exists in
 rem ONE place. What gets duplicated here is only the Git Bash discovery,
 rem which is about where Git happens to be installed and does not change;
 rem the build steps, which do change, are not duplicated. Same split as
-rem test-host.cmd and the workspace's run-tests.cmd.
+rem test-host.cmd and renodeun-tests.cmd.
 rem
 rem `bash` on PATH under PowerShell is WSL (C:\WINDOWS\system32\bash.exe),
 rem a separate Linux environment with no Rust toolchain and no Renode.

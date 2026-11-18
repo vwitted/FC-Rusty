@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # stage-firmware.sh — build both firmware variants and put them where the
-# Renode harness reads them.
+# Renode harness reads them (target/renode/, gitignored with target/).
 #
-# Four of the five Renode checks need a staged ELF and none of them build
-# it, so this was a manual build-and-copy repeated on every firmware
-# change. It is exactly the step that gets skipped: on 2026-09-08 the
-# staged motor-test ELF was two weeks old, so both DShot checks had been
-# passing against a build that predated the plant-capture work entirely.
+# Five of the Renode checks need a staged ELF and none of them build it.
+# It is exactly the step that gets skipped: on 2026-09-08 the staged
+# motor-test ELF was two weeks old, so both DShot checks had been passing
+# against a build that predated the plant-capture work entirely.
 #
 # A stale ELF does not fail. It reports on the wrong firmware — the same
 # hazard FC_BUILD_STAMP exists to catch on the bench.
+#
+# Staged copies rather than cargo's own output path, because both variants
+# write that path: a later `cargo build --features motor-test` would
+# otherwise silently replace the flight ELF under test.
 #
 #   scripts/stage-firmware.sh
 #
@@ -21,25 +24,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
-WORKSPACE="$(cd "$REPO/.." && pwd)"
 OUT="$REPO/target/thumbv7em-none-eabihf/release/fc-firmware"
-DEST="$WORKSPACE/target/thumbv7em-none-eabihf/release"
-
-if [ ! -d "$DEST" ]; then
-    echo "!! Renode harness staging directory not found:"
-    echo "   $DEST"
-    echo "   These builds are only needed by the Renode checks, which live in"
-    echo "   the workspace containing this checkout and are not part of this"
-    echo "   repository. Nothing to stage."
-    exit 2
-fi
+DEST="$REPO/target/renode"
 
 cd "$REPO"
+mkdir -p "$DEST"
 
-# Order matters. Both variants write the same cargo output path, so
-# motor-test is built FIRST and flight SECOND: finishing on flight leaves
-# the repo's own target/ holding the build someone is most likely to copy
-# by hand.
+# Motor-test first and flight second, so cargo's own output path is left
+# holding the flight build, the one most likely to be flashed by hand.
 echo "==> building motor-test firmware"
 cargo build --release --features motor-test
 cp "$OUT" "$DEST/fc-firmware-motortest"
@@ -48,11 +40,6 @@ echo "==> building flight firmware"
 cargo build --release
 cp "$OUT" "$DEST/fc-firmware"
 
-# The workspace root keeps a second copy of the flight ELF and its
-# CLAUDE.md states the two are byte-identical. Keep that true here rather
-# than leaving it to be noticed later.
-cp "$OUT" "$WORKSPACE/fc-firmware"
-
 echo
-echo "staged: fc-firmware (flight), fc-firmware-motortest (bench)"
-echo "run the checks with scripts/test-<name>.sh, or tests/run-tests.sh"
+echo "staged in target/renode/: fc-firmware (flight), fc-firmware-motortest (bench)"
+echo "run the checks with scripts/test-<name>.sh, or renode/run-tests.sh"

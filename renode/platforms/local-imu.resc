@@ -1,0 +1,13 @@
+# local-imu.resc — fixed-value ICM-42688-P on SPI1 (IMU1) and SPI4 (IMU2).
+#
+# Include AFTER local-overlay.resc, from the repo root:
+#   include @renode/platforms/local-overlay.resc
+#   include @renode/platforms/local-imu.resc
+#
+# Default is level rest: chip (0, 0, +1) g, zero rate, 25 degC on both
+# chips. Change values from the Monitor, in the chip frame:
+#   sysbus.spi1.icm1 AngularRateZ 10.0
+#   sysbus.spi4.icm2 AccelerationX 0.34
+
+include @renode/platforms/ICM42688P.cs
+machine LoadPlatformDescription @renode/platforms/local-icm42688.repl

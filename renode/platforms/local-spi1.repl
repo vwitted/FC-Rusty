@@ -1,0 +1,20 @@
+// local-spi1.repl — promotes SPI1 from a Tag to SPI.STM32H7_SPI.
+//
+// Upstream's stm32h7.repl leaves SPI1 as `Tag <0x40013000,...> "SPI1_/_I2S1"`
+// while modelling spi4 with this same peripheral. Under the Tag, SPI_SR reads
+// 0, so TXC never sets and the firmware cannot finish a transfer.
+//
+// The model alone is not enough: SPI transfers are DMA-backed and also need
+// local-dma.repl. Load both through local-overlay.resc.
+//
+// STM32H7_SPI exposes both IRQ and DMARecieve, so the interrupt must be named
+// explicitly -- a bare `-> nvic@35` is "Error E15: Ambiguous choice".
+// DMARecieve is DMAMUX1 request 37 (SPI1_RX; the firmware programs 38, SPI1_TX, for the TX stream); without it
+// the RX stream of transfer_in_place is never serviced. TX needs no request
+// line: Renode's DMA runs memory-to-peripheral streams on enable.
+spi1: SPI.STM32H7_SPI @ {
+        sysbus 0x40013000;
+        rcc RegistrationPeripheralAlias.SPI1
+    }
+    IRQ -> nvic@35
+    DMARecieve -> dmamux1@37

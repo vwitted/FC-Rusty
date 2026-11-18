@@ -5,6 +5,6 @@
 # not merely that the PC is somewhere in flash) and that the PC is in
 # the flash window. Needs the flight ELF staged: scripts/stage-firmware.sh
 #
-# Tier: fast.  Included in tests/run-tests.sh --quick.
+# Tier: fast.  Included in renode/run-tests.sh --quick.
 
 exec bash "$(dirname "${BASH_SOURCE[0]}")/renode-check.sh" boot-smoke

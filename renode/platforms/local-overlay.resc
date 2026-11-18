@@ -1,0 +1,21 @@
+# local-overlay.resc — local fixes on top of the stock H743 platform.
+#
+# Include AFTER `machine LoadPlatformDescription @platforms/cpus/stm32h743.repl`,
+# with the repo root as the CWD:
+#   include @renode/platforms/local-overlay.resc
+#
+#  1. DMA1/DMA2 become STM32DMA_ClearsEnable, so DMA-backed awaits complete
+#     (local-dma.repl). A typed peripheral cannot be redeclared, so the
+#     stock instances are unregistered first.
+#  2. SPI1 becomes a real STM32H7_SPI with its RX DMA request (local-spi1.repl).
+#
+# @-paths try the Renode install first and fall back to the CWD (renode/README.md,
+# ".renode-root"). The install has no renode/ directory, so
+# these file names cannot be shadowed. Neither $CWD nor $ORIGIN is expanded
+# inside an @-path in 1.16.1.
+
+include @renode/platforms/STM32DMA_ClearsEnable.cs
+machine UnregisterFromParent sysbus.dma1
+machine UnregisterFromParent sysbus.dma2
+machine LoadPlatformDescription @renode/platforms/local-dma.repl
+machine LoadPlatformDescription @renode/platforms/local-spi1.repl

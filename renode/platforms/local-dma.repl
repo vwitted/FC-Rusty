@@ -1,0 +1,25 @@
+// local-dma.repl — DMA1/DMA2 replaced by STM32DMA_ClearsEnable.
+//
+// Upstream STM32DMA never clears SxCR.EN when a transfer completes, and
+// embassy-stm32 (dma_bdma.rs, Transfer::is_running) waits on EN, not TCIF.
+// Every DMA-backed await therefore stays Pending after the data has moved:
+// the flight firmware stalls on its first SPI1 write in Icm42688::new.
+// See STM32DMA_ClearsEnable.cs for the one-line change.
+//
+// Do not load this directly. The stock instances must be unregistered first
+// and the model compiled; local-overlay.resc does both in the right order.
+//
+// No `rcc RegistrationPeripheralAlias` here: the RCC model keeps the stock
+// instances' DMA1/DMA2 aliases after unregistration and rejects duplicates.
+// The cost is that DMA clock gating is not modelled.
+
+dma2: DMA.STM32DMA_ClearsEnable @ sysbus 0x40020400
+    [0-7] -> nvic@[56-60, 68-70]
+
+dma1: DMA.STM32DMA_ClearsEnable @ sysbus 0x40020000
+    [0-7] -> nvic@[11-17, 47]
+
+// The stock dmamux1 outputs were bound to the unregistered instances.
+dmamux1:
+    [0-7] -> dma1@[0-7]
+    [8-15] -> dma2@[0-7]

@@ -5,6 +5,6 @@
 # value: if the clock tree changes underneath it the log silently becomes
 # garbage at the wrong baud. Needs the flight ELF staged.
 #
-# Tier: fast.  Included in tests/run-tests.sh --quick.
+# Tier: fast.  Included in renode/run-tests.sh --quick.
 
 exec bash "$(dirname "${BASH_SOURCE[0]}")/renode-check.sh" logger-uart

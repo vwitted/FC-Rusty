@@ -1,0 +1,19 @@
+# boot-smoke.resc — does the flight firmware survive H743 bring-up?
+#
+# Guards the clock tree and early init. If the PWR/FMC Python peripherals in
+# the .repl stop satisfying embassy_stm32::init(), or a change faults during
+# boot, the CPU never leaves the reset path and this catches it in seconds.
+#
+# Run from the repo root: @-paths resolve against the CWD.
+
+mach create "FC"
+machine LoadPlatformDescription @platforms/cpus/stm32h743.repl
+showAnalyzer sysbus.usart6 Antmicro.Renode.Analyzers.LoggingUartAnalyzer
+sysbus LoadELF @target/renode/fc-firmware
+
+emulation RunFor "0.05"
+
+echo "RESULT-BEGIN"
+sysbus.cpu PC
+echo "RESULT-END"
+quit

@@ -1,0 +1,24 @@
+# logger-uart.resc — is defmt's UART still set up for the clock tree it assumes?
+#
+# logger.rs bit-bangs USART6 directly and hard-codes APB2 = 120 MHz to compute
+# BRR. Nothing enforces that: if the clock tree is retuned, the logger keeps
+# "working" but emits bytes at the wrong baud, so defmt output becomes garbage
+# with no error anywhere. That is a nasty failure to debug from a terminal.
+#
+# USART6 @ 0x40011400: BRR at +0x0C, CR1 at +0x00.
+#   BRR = round(120e6 / 115200) = 1042 = 0x412
+#   CR1 = UE (bit 0) | TE (bit 3) = 0x9   -- transmit only, by design
+#
+# Fast: the logger is up within the first few ms of boot.
+
+mach create "FC"
+machine LoadPlatformDescription @platforms/cpus/stm32h743.repl
+sysbus LoadELF @target/renode/fc-firmware
+
+emulation RunFor "0.05"
+
+echo "RESULT-BEGIN"
+sysbus ReadDoubleWord 0x4001140C
+sysbus ReadDoubleWord 0x40011400
+echo "RESULT-END"
+quit

@@ -1,0 +1,27 @@
+# flight.resc — interactive session on the flight firmware.
+#
+# From the repo root, after scripts/stage-firmware.sh:
+#   renode renode/flight.resc              GUI
+#   renode --console renode/flight.resc    Monitor in the terminal
+#
+# Stock platform, the local overlay (DMA completion, real SPI1) and the
+# fixed-value IMUs, so the firmware gets through sensor bring-up. Set IMU
+# values from the Monitor in the CHIP frame, e.g.
+#   sysbus.spi1.icm1 AngularRateZ 10.0
+#
+# USART6 carries defmt-framed BINARY. The analyzer shows it lossily; for
+# readable logs add a file backend and decode it:
+#   sysbus.usart6 CreateFileBackend @C:/tmp/uart.bin true
+#   defmt-print -e target/renode/fc-firmware < C:/tmp/uart.bin
+
+mach create "FC"
+machine LoadPlatformDescription @platforms/cpus/stm32h743.repl
+include @renode/platforms/local-overlay.resc
+include @renode/platforms/local-imu.resc
+
+showAnalyzer sysbus.usart6
+machine StartGdbServer 3333
+
+sysbus LoadELF @target/renode/fc-firmware
+
+start

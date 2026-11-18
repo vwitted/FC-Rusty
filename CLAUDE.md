@@ -94,6 +94,9 @@ Disable it (`--no-default-features`) when building on the host.
 details for unit tests and sim tests can be found at HOST_RUNNABLES.md when needed. 
 ```
 
+Renode emulation checks live in `renode/` (see `renode/README.md`). Per
+commit: `scripts/stage-firmware.sh`, then `renode/run-tests.sh --quick`.
+
 ## Plant calibration and the flight log
 
 see TUNING_DETAILS.md for information when pertinant to the task. 

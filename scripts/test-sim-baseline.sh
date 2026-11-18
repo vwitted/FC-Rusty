@@ -6,8 +6,8 @@
 # controllers -- a 17% change to motor_tau moves 252 values.
 #
 # When a change IS intended, accept it in the same commit with:
-#     BLESS=1 tests/run-tests.sh sim-baseline
+#     BLESS=1 renode/run-tests.sh sim-baseline
 #
-# Tier: fast.  Included in tests/run-tests.sh --quick.
+# Tier: fast.  Included in renode/run-tests.sh --quick.
 
 exec bash "$(dirname "${BASH_SOURCE[0]}")/renode-check.sh" sim-baseline

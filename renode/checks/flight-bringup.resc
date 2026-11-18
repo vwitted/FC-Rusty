@@ -1,0 +1,32 @@
+# flight-bringup.resc — does the flight firmware get through sensor bring-up?
+#
+# boot-smoke only proves the clock tree came up: it passes even when main()
+# is parked forever on a DMA await, because the executor's WFE loop is in
+# flash. This check runs on the local overlay (DMA completion, real SPI1)
+# plus fixed-value ICM-42688-P models on both IMU buses at level rest, and
+# the runner decodes defmt to assert both IMUs initialise, the MEKF seeds
+# level, and the control loop starts.
+#
+# The level seed is the convention guard: chip (0,0,+1) g maps to body
+# (0,0,-1) g only if the mounting rotations in orientation.rs are right. A
+# flipped Z would seed at +-180 deg roll.
+#
+# Run from the repo root, with $uart set to an absolute output path:
+#   renode --console -e '$uart=@C:/tmp/u.bin; include @renode/checks/flight-bringup.resc'
+#
+# 0.15 s virtual: the IMUs finish init at ~0.106 s. Beyond that the 8 kHz
+# chain costs ~2 min of host time per virtual second.
+
+mach create "FC"
+machine LoadPlatformDescription @platforms/cpus/stm32h743.repl
+include @renode/platforms/local-overlay.resc
+include @renode/platforms/local-imu.resc
+sysbus.usart6 CreateFileBackend $uart true
+sysbus LoadELF @target/renode/fc-firmware
+
+emulation RunFor "0.15"
+
+echo "RESULT-BEGIN"
+sysbus.cpu PC
+echo "RESULT-END"
+quit

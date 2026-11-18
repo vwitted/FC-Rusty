@@ -1,0 +1,30 @@
+# dshot-gpio.resc — is the DShot driver programming PA0..PA3 correctly?
+#
+# Runs the motor-test firmware far enough to get through DshotBitbang::new
+# (~2.5 s of firmware time: the bench countdown runs first), then reads GPIOA
+# back. This checks the real init path against real registers — the pin
+# configuration is load-bearing for bidirectional DShot and is otherwise only
+# verifiable by eye or on a bench.
+#
+# Expected for bidir, pins 0..3:
+#   MODER   01 each -> 0x55   OUTPUT
+#   OTYPER   0 each -> 0x00   PUSH_PULL
+#   OSPEEDR 00 each -> 0x00   LOW_SPEED (ArduPilot/BF: below MID2 for bidir)
+#   PUPDR   01 each -> 0x55   PULL_UP   (bidir idles HIGH)
+#
+# Slow by design: ~3 min wall for 3 s of firmware time.
+
+mach create "FC"
+machine LoadPlatformDescription @platforms/cpus/stm32h743.repl
+showAnalyzer sysbus.usart6 Antmicro.Renode.Analyzers.LoggingUartAnalyzer
+sysbus LoadELF @target/renode/fc-firmware-motortest
+
+emulation RunFor "3"
+
+echo "RESULT-BEGIN"
+sysbus ReadDoubleWord 0x58020000
+sysbus ReadDoubleWord 0x58020004
+sysbus ReadDoubleWord 0x58020008
+sysbus ReadDoubleWord 0x5802000C
+echo "RESULT-END"
+quit

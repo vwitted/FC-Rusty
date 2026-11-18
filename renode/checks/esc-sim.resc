@@ -1,0 +1,18 @@
+# esc-sim.resc — attach the ESC model to the motor pads and see what arrives.
+#
+# Hooks every GPIOA register write. BSRR is offset 0x18: that is the register
+# the DShot DMA writes, one word per pacer state, and it is the whole of the
+# motor waveform. Anything the firmware puts on PA0..PA3 passes through here.
+
+mach create "FC"
+machine LoadPlatformDescription @platforms/cpus/stm32h743.repl
+sysbus LoadELF @target/renode/fc-firmware-motortest
+
+sysbus SetHookBeforePeripheralWrite sysbus.gpioPortA "self.WarningLog('GPIOA-WRITE off=0x%x val=0x%x' % (offset, value))"
+
+emulation RunFor "2.7"
+
+echo "RESULT-BEGIN"
+echo "(writes listed above as GPIOA-WRITE lines)"
+echo "RESULT-END"
+quit

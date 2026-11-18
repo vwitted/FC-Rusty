@@ -1,8 +1,7 @@
 # Renode: peripheral models and future directions
 
-Status as of 2026-11-18. The harness lives in the Renode workspace that
-contains this checkout (not version-controlled); file paths below are
-relative to that workspace root unless prefixed `FC-Rusty-Code/`.
+Status as of 2026-11-18. The harness is `renode/` (see `renode/README.md`);
+paths below are repo-relative.
 
 ## Current state
 
@@ -10,11 +9,11 @@ Loaded on top of the stock platform (`@platforms/cpus/stm32h743.repl`):
 
 | File | Effect |
 |---|---|
-| `platforms/local-overlay.resc` | Applies the two entries below. |
-| `platforms/STM32DMA_ClearsEnable.cs`, `local-dma.repl` | DMA1/DMA2 clear `SxCR.EN` when a non-circular transfer completes. |
-| `platforms/local-spi1.repl` | SPI1 is a real `STM32H7_SPI` with RX DMA request 37. |
-| `platforms/local-imu.resc` | Fixed-value ICM-42688-P on SPI1 (IMU1) and SPI4 (IMU2). |
-| `platforms/ICM42688P.cs`, `local-icm42688.repl` | The IMU model and its bus/CS wiring. |
+| `renode/platforms/local-overlay.resc` | Applies the two entries below. |
+| `renode/platforms/STM32DMA_ClearsEnable.cs`, `local-dma.repl` | DMA1/DMA2 clear `SxCR.EN` when a non-circular transfer completes. |
+| `renode/platforms/local-spi1.repl` | SPI1 is a real `STM32H7_SPI` with RX DMA request 37. |
+| `renode/platforms/local-imu.resc` | Fixed-value ICM-42688-P on SPI1 (IMU1) and SPI4 (IMU2). |
+| `renode/platforms/ICM42688P.cs`, `local-icm42688.repl` | The IMU model and its bus/CS wiring. |
 
 The DMA change is the load-bearing one. Upstream `STM32DMA` sets TCIF but
 never clears `EN`; embassy-stm32 0.4.0 `Transfer::is_running()` polls `EN`
@@ -25,7 +24,7 @@ regression from the interrupt-executor or 8 kHz tick work.
 
 With the overlay and IMU models, the flight build initialises both IMUs,
 seeds the MEKF, and starts GPS, DShot, the fast inner loop, the control loop
-and PosKF. `tests/run-tests.sh flight-bringup` (fast tier) asserts this,
+and PosKF. `renode/run-tests.sh flight-bringup` (fast tier) asserts this,
 including a level MEKF seed; a flipped chip Z was verified to seed at 180 deg
 roll and fail it.
 
@@ -76,7 +75,7 @@ Set values from the Monitor, e.g. `sysbus.spi4.icm2 AngularRateZ 10.0`.
 3. **Sensor error model.** Noise, bias and scale per axis, matching the
    host sim's sensor model so the two do not drift apart.
 4. **Closed loop.** Decode motor commands (the order-based decoder in
-   `tests/esc_model.py` already works), step physics, feed the IMU. Needs a
+   `renode/checks/esc_model.py` already works), step physics, feed the IMU. Needs a
    co-simulation channel (Renode's external-control or socket interfaces)
    or a C# plugin. Useful for mode logic and failsafe sequencing; not for
    inner-loop tuning, given the timing limits above.

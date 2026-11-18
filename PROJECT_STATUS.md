@@ -198,8 +198,8 @@ d`).
 6. **Renode reaches past sensor bring-up (2026-11-18).** On the stock
    platform the flight build parked in `Icm42688::new`: Renode's STM32DMA
    never clears `SxCR.EN` on completion and embassy waits on `EN`. The
-   workspace overlay (`platforms/local-overlay.resc`) patches the DMA model
-   and promotes SPI1; `platforms/local-imu.resc` adds fixed-value
+   overlay (`renode/platforms/local-overlay.resc`) patches the DMA model
+   and promotes SPI1; `renode/platforms/local-imu.resc` adds fixed-value
    ICM-42688-P models on SPI1 and SPI4. Both IMUs initialise, the MEKF
    seeds level, and the control loop starts; the fast-tier check
    `flight-bringup` (scripts/test-flight-bringup.*) asserts it. Timing in
