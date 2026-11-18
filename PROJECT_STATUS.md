@@ -171,7 +171,8 @@ d`).
    rule: accel window mean, GPS-accel tau 0.35 s, MEKF sigma_a 0.3 (+5-10 %
    tilt RMS on a mirrored x/y accel axis). The invariant and the thrust aid act only
    while armed (they assume thrust). Bench-verify the clip flag, the armed
-   gate and the invariant warning; mekf_task does not run under Renode.
+   gate and the invariant warning. Under Renode mekf_task runs only on the
+   local overlay with the fixed-value IMU models (item 6).
    GPS staleness (control/modes.rs `GpsFreshness`): after 2.5 s without a
    good fix PosHold degrades to AltHold, GpsHome is withdrawn, and the
    RC-loss ladder takes FailsafeLand instead of GpsRescue; restored after
@@ -194,6 +195,15 @@ d`).
    `control loop N Hz measured ... missed M` and `MEKF ... (missed M)`, with
    MPC on and off and while the blackbox records. Record and next stage:
    docs/2026-11-10-interrupt-executor-split.md.
+6. **Renode reaches past sensor bring-up (2026-11-18).** On the stock
+   platform the flight build parked in `Icm42688::new`: Renode's STM32DMA
+   never clears `SxCR.EN` on completion and embassy waits on `EN`. The
+   workspace overlay (`platforms/local-overlay.resc`) patches the DMA model
+   and promotes SPI1; `platforms/local-imu.resc` adds fixed-value
+   ICM-42688-P models on SPI1 and SPI4. Both IMUs initialise, the MEKF
+   seeds level, and the control loop starts; the fast-tier check
+   `flight-bringup` (scripts/test-flight-bringup.*) asserts it. Timing in
+   sim is not representative. Directions: docs/renode-sim-directions.md.
 
 ## ****Alpha Complete 03-05-2026****
 

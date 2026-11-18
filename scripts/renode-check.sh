@@ -22,7 +22,7 @@ set -uo pipefail
 
 if [ $# -lt 1 ]; then
     echo "usage: renode-check.sh <check-name>"
-    echo "  boot-smoke  logger-uart  sim-baseline  dshot-gpio  esc-model"
+    echo "  boot-smoke  logger-uart  flight-bringup  sim-baseline  dshot-gpio  esc-model"
     exit 2
 fi
 

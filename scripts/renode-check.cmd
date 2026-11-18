@@ -17,7 +17,7 @@ rem "file not found" from somewhere three scripts deep.
 
 if "%~1"=="" (
     echo usage: renode-check.cmd ^<check-name^>
-    echo   boot-smoke  logger-uart  sim-baseline  dshot-gpio  esc-model
+    echo   boot-smoke  logger-uart  flight-bringup  sim-baseline  dshot-gpio  esc-model
     exit /b 2
 )
 
